@@ -7094,12 +7094,16 @@ nochange:
 
 			/* Visit directory */
 			if (pent->flags & DIR_OR_DIRLNK) {
+        DPRINTF_STR("TriPham 0 SEL_NAV_IN");
+        DPRINTF_S(session);
 				if (chdir(newpath) == -1) {
 					printwarn(&presel);
 					goto nochange;
 				}
 
 				cdprep(lastdir, lastname, path, newpath) ? (presel = FILTER) : (watch = TRUE);
+        DPRINTF_STR("TriPham 0 SEL_NAV_IN save_session then goto begin");
+        save_session(session, NULL);
 				goto begin;
 			}
 
@@ -7157,6 +7161,9 @@ nochange:
 			}
 
 			if (sel == SEL_NAV_IN) {
+        DPRINTF_STR("TriPham 1 SEL_NAV_IN");
+        DPRINTF_S(session);
+
 				/* If in listing dir, go to target on `l` or Right on symlink */
 				if (listpath && S_ISLNK(pent->mode)
 				    && is_prefix(path, listpath, xstrlen(listpath))) {
@@ -7167,6 +7174,7 @@ nochange:
 
 					xdirname(newpath);
 
+          DPRINTF_S(newpath);
 					if (chdir(newpath) == -1) {
 						printwarn(&presel);
 						goto nochange;
@@ -7175,6 +7183,8 @@ nochange:
 					cdprep(lastdir, NULL, path, newpath)
 					       ? (presel = FILTER) : (watch = TRUE);
 					xstrsncpy(lastname, pent->name, NAME_MAX + 1);
+          DPRINTF_STR("TriPham 1 SEL_NAV_IN save_session then goto begin");
+          save_session(session, NULL);
 					goto begin;
 				}
 
