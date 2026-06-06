@@ -1209,3 +1209,698 @@ label and the `cd = TRUE;` reset survived all 263 upstream commits unmoved.
   back/cd/bookmark/context/session-load navigation), carries leftover debug
   lines, and -- decisively -- does not build on current upstream; it should be
   replaced by the single hook after rebasing.
+
+---
+
+## Part II -- FileZilla-Style Copy/Move Conflict Resolution
+
+### II.0 Goal Statement
+
+Reproduce FileZilla's overwrite-handling experience for nnn's copy/move, driven
+entirely from the existing keys, with this workflow:
+
+1. Select files with `Space`.
+2. Navigate to the destination directory.
+3. Press `p` to **copy here**, or `v` to **move here**.
+4. On a conflict (target already exists) present a per-file menu:
+   overwrite, newer only, different size only, different size or newer, resume,
+   rename (keep both), skip.
+5. After each decision, ask whether to **apply the same decision to all remaining
+   conflicts**; keep asking until the user accepts.
+
+```
+ASCII Table II.0: FileZilla options mapped to this feature
++-------------------------------------------+------------------------------------+
+| FileZilla option                          | This feature's menu entry          |
++-------------------------------------------+------------------------------------+
+| Overwrite                                 | 1) overwrite                       |
+| Overwrite if source newer                 | 2) newer only                      |
+| Overwrite if different size               | 3) different size only             |
+| Overwrite if different size or source new | 4) different size or newer         |
+| (FileZilla "resume" of interrupted xfer)  | 5) resume                          |
+| Rename                                    | 6) rename (keep both)              |
+| Skip                                      | 7) skip                            |
+| "Apply to all" checkbox                   | repeated "apply to ALL?" prompt    |
++-------------------------------------------+------------------------------------+
+```
+
+As in Part I, the change must be **small and surgical** so the fork keeps pulling
+`origin-old/master` with the least merge friction -- ideally a **single line** of
+C, with the behaviour-heavy logic living outside `nnn.c`.
+
+> A candidate implementation already exists in
+> [my_patches/nnn-pv-cpmv.patch](../my_patches/nnn-pv-cpmv.patch) and
+> [my_patches/nnn-cpmv](../my_patches/nnn-cpmv). It is evaluated here as **one
+> candidate among several** (Approach A), not as the assumed answer.
+
+---
+
+### II.1 How Copy/Move Works Today (Ground Truth from the Source)
+
+All line numbers refer to `origin-old/master` at `ecf6d9a8`.
+
+#### II.1.1 The keys and the single chokepoint
+
+```
+ASCII Table II.1: Copy/move key bindings (src/nnn.h)
++----------------------+-------------+----------------------------------------+
+| Key(s)               | Action      | Path through the code                  |
++----------------------+-------------+----------------------------------------+
+| p / Ctrl-P (h:232)   | SEL_CP      | cpmvrm_selection() -> opstr(g_buf, cp) |
+| v / Ctrl-V (h:235)   | SEL_MV      | cpmvrm_selection() -> opstr(g_buf, mv) |
+| w / Ctrl-W (h:238)   | SEL_CPMVAS  | cpmv_rename()  (separate "as" path)    |
++----------------------+-------------+----------------------------------------+
+```
+
+`p` and `v` both reach **`opstr()`** ([src/nnn.c:2737](../src/nnn.c#L2737)) -- the
+one function that builds the shell command for a "copy/move here". `w` (copy/move
+*as*) is a different path (`cpmv_rename()`) and is out of scope for this feature.
+
+```c
+/* src/nnn.c:2737 -- the entire function; the chokepoint */
+static void opstr(char *buf, char *op)
+{
+    snprintf(buf, CMD_LEN_MAX,
+        "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < '%s'", op, selpath);
+}
+```
+
+#### II.1.2 What that command actually does
+
+```mermaid
+%% Stock copy/move data flow on pressing p or v
+flowchart LR
+    Keys["press p / v"] --> CMR["cpmvrm_selection()"]
+    CMR --> OP["opstr(g_buf, cp|mv)"]
+    OP --> CMD["xargs -0 sh -c<br/>OP files . (stdin=/dev/tty)<br/>reads selpath"]
+    CMD --> SPAWN["spawn(sh -c, F_CLI)"]
+    SPAWN --> COREUTILS["cp -iRp -- f1 f2 .<br/>(dest = '.' = cwd)"]
+    COREUTILS --> Prompt["per-file y/n overwrite<br/>(cp -i) on /dev/tty"]
+```
+
+Key facts the design depends on:
+
+```
+ASCII Table II.2: Invariants of the stock path
++-----------------------------+-----------------------------------------------+
+| Invariant                   | Detail (src ref)                              |
++-----------------------------+-----------------------------------------------+
+| op string                   | cp = "cp -iRp --", mv = "mv -i --"            |
+|                             | (src/nnn.c:812-813)                            |
+| advcpmv (progress bars)     | with the -r flag, cp/mv become "cpg -giRp --" |
+|                             | / "mvg -gi --" (src/nnn.c:810-811,10378). See |
+|                             | Part I Table 12 -- that is what CLI -r does.   |
+| selection file (selpath)    | NUL-separated absolute paths (xargs -0)        |
+| destination                 | passed literally as "." -- nnn's cwd IS the    |
+|                             | browse dir (it chdir'd at begin:)              |
+| stdin                       | redirected to /dev/tty so prompts work         |
+| executor                    | spawn(UTIL_SH_EXEC=sh -c, ..., F_CLI|F_CHKRTN) |
+|                             | (src/nnn.c:2892) -- foreground, restores TUI   |
+| CMD_LEN_MAX                 | PATH_MAX + 2*(NAME_MAX+1) (src/nnn.c:190)      |
++-----------------------------+-----------------------------------------------+
+```
+
+#### II.1.3 The gap
+
+The only conflict handling stock nnn offers is `cp -i` / `mv -i`: a per-file
+**y/n overwrite** prompt. There is no "newer only", "different size", "different
+size or newer", "resume", "rename/keep-both", or "apply to all remaining". That
+entire matrix is what this feature adds.
+
+```mermaid
+%% What exists vs what is wanted
+flowchart TB
+    subgraph Now["Stock nnn (cp -i / mv -i)"]
+        S1["conflict?"] --> S2["overwrite? y/N"]
+    end
+    subgraph Want["FileZilla-style"]
+        W1["conflict?"] --> W2["overwrite / newer / diff-size /<br/>diff-size-or-newer / resume /<br/>rename / skip"]
+        W2 --> W3["apply to ALL remaining? keep asking"]
+    end
+```
+
+#### II.1.4 Design-critical observation
+
+`opstr()` is to copy/move what `begin:` was to navigation in Part I: a **single
+convergence point** that both relevant actions pass through. Anything injected
+there covers `p` and `v` together, with no duplication -- which is exactly what
+makes a one-line change possible.
+
+---
+
+### II.2 Brainstorm of Approaches
+
+Five candidates, scored on the same axes as Part I plus two that matter here:
+"keeps the p/v keys" and "logic lives outside nnn.c" (nnn's delegate-to-shell
+philosophy).
+
+#### Approach A -- External helper via a one-line `opstr()` rewrite (THE my_patches SOLUTION)
+
+Rewrite the single `snprintf` in `opstr()` to invoke an external helper that
+implements the menu, and ship that helper.
+
+```c
+/* opstr() after the change */
+snprintf(buf, CMD_LEN_MAX, "nnn-cpmv %s '%s' . < /dev/tty", op, selpath);
+```
+
+The helper ([my_patches/nnn-cpmv](../my_patches/nnn-cpmv)) reads the NUL-separated
+selection, detects conflicts, shows the 7-option menu, supports apply-to-all, and
+shells out to cp/mv/rsync (and cpg/mvg for progress).
+
+```mermaid
+%% Approach A data flow
+flowchart LR
+    Keys["p / v"] --> OP["opstr() (1 line changed)"]
+    OP --> H["nnn-cpmv cp|mv selpath ."]
+    H --> Loop{"for each selected item"}
+    Loop -->|"no conflict"| Copy["cp/mv it"]
+    Loop -->|"conflict"| Menu["7-option menu<br/>+ apply-to-all"]
+    Menu --> Tools["cp -f / cp -u /<br/>rsync --size-only / --update /<br/>--append-verify / rename / skip"]
+```
+
+```
+ASCII Table II.3: Approach A (my_patches)
++-----------+----------------------------------------------------------------+
+| Pros      | - opstr() is the single chokepoint: one line covers p AND v.   |
+|           | - Minimal C change (1 line; see II.3 for exactly 1).           |
+|           | - All behaviour in shell -- matches nnn's delegate-to-shell     |
+|           |   design; iterate on the script with no recompile.             |
+|           | - Keeps the native p / v keys and the Space-select workflow.   |
+|           | - Reuses nnn's selection file and /dev/tty prompt plumbing.    |
++-----------+----------------------------------------------------------------+
+| Cons      | - Requires the helper installed (PATH or plugins dir).         |
+|           | - Edits upstream code (tiny, but non-zero rebase surface).     |
+|           | - Replaces nnn's native cp -i path; advcpmv must be re-added   |
+|           |   inside the helper (the script does this).                    |
+|           | - Conflict granularity is per selected TOP-LEVEL item, not     |
+|           |   per nested file (FileZilla is per file). See II.4.6.         |
+|           | - Size/resume modes need rsync; degrade without it.           |
+|           | - The committed script has a data-loss bug + portability gaps  |
+|           |   (II.4.7) that must be fixed before shipping.                 |
++-----------+----------------------------------------------------------------+
+```
+
+#### Approach B -- Pure nnn plugin (ZERO C change)
+
+Do not touch `nnn.c` at all. Ship the same logic as an nnn **plugin** in
+`plugins/`, invoked via the plugin runner (`;` + a key, or an `NNN_PLUG`
+mapping such as `c:cpmv`). Plugins already run with cwd = the browse dir and get
+the selection via `$NNN_SEL` / the default selection file.
+
+```mermaid
+%% Approach B: plugin, no nnn.c change
+flowchart LR
+    Key["#59; then c<br/>(NNN_PLUG 'c:cpmv')"] --> Plug["plugins/cpmv"]
+    Plug --> Sel["read $NNN_SEL selection"]
+    Plug --> Menu["same 7-option menu<br/>+ apply-to-all"]
+    Menu --> Tools["cp / mv / rsync"]
+```
+
+```
+ASCII Table II.4: Approach B (plugin)
++-----------+----------------------------------------------------------------+
+| Pros      | - ZERO nnn.c change -> nothing to rebase, perfectly upstream-   |
+|           |   clean; survives every `git rebase origin-old/master`.        |
+|           | - Uses nnn's official, documented extension mechanism.         |
+|           | - Distributable independently of any fork.                     |
++-----------+----------------------------------------------------------------+
+| Cons      | - Does NOT use p / v -- the user's stated workflow requires     |
+|           |   those exact keys. A plugin is reached via `;c` (or a chosen   |
+|           |   NNN_PLUG key), so the muscle memory differs.                  |
+|           | - "copy/move here" semantics must be reconstructed in the      |
+|           |   plugin (dest = $PWD; that is fine, plugins run in the dir).   |
++-----------+----------------------------------------------------------------+
+```
+
+#### Approach C -- Redefine the `cp` / `mv` command globals to a wrapper
+
+Leave `opstr()` alone; instead point the `cp`/`mv` globals (or the advcpmv
+swap, or a new build define) at a wrapper binary that accepts the
+xargs-expanded `<files...> .` argument list.
+
+```
+ASCII Table II.5: Approach C (swap the cp/mv globals)
++-----------+----------------------------------------------------------------+
+| Pros      | - opstr() string untouched.                                    |
++-----------+----------------------------------------------------------------+
+| Cons      | - opstr wraps op as `OP "$0" "$@" . < /dev/tty`; the wrapper   |
+|           |   must accept "dest is the LAST arg" -- awkward and fragile.   |
+|           | - The "-iRp --" suffix is baked into the global; you fight     |
+|           |   the existing flags or must blank them (still a C edit).      |
+|           | - No cleaner than A, and less readable. Rejected.             |
++-----------+----------------------------------------------------------------+
+```
+
+#### Approach D -- A single rsync command (no custom menu)
+
+Replace the `opstr()` command with one `rsync` invocation implementing **one**
+fixed policy (e.g. `--update` for "newer only").
+
+```
+ASCII Table II.6: Approach D (one static rsync policy)
++-----------+----------------------------------------------------------------+
+| Pros      | - One line, no script, no helper to install.                   |
++-----------+----------------------------------------------------------------+
+| Cons      | - rsync cannot present an interactive per-conflict MENU with    |
+|           |   "apply to all"; it applies ONE policy to everything.         |
+|           | - Fails requirements 4 and 5 outright. rsync is only useful    |
+|           |   here as a BUILDING BLOCK inside Approach A/B. Rejected as a   |
+|           |   standalone solution.                                          |
++-----------+----------------------------------------------------------------+
+```
+
+#### Approach E -- Implement the menu natively in C inside nnn
+
+Add conflict detection, the 7-option prompt, apply-to-all state, and the
+cp/rsync invocations directly in `cpmvrm_selection()` / `opstr()`.
+
+```
+ASCII Table II.7: Approach E (native C)
++-----------+----------------------------------------------------------------+
+| Pros      | - Self-contained; no external helper to install.               |
+|           | - Could reuse nnn's prompt/status UI.                           |
++-----------+----------------------------------------------------------------+
+| Cons      | - Large C addition against nnn's delegate-to-shell philosophy.  |
+|           | - Must reimplement stat-compare, rename-collision, resume,     |
+|           |   directory recursion -- hundreds of lines, high bug surface.  |
+|           | - Largest possible merge surface; the OPPOSITE of least-change.|
+|           | - Upstream is very unlikely to accept it. Rejected.           |
++-----------+----------------------------------------------------------------+
+```
+
+#### Scorecard
+
+```
+ASCII Table II.8: Approach comparison (5 = best)
++-----------------------------+-----+-----+-----+-----+-----+
+| Criterion                   |  A  |  B  |  C  |  D  |  E  |
++-----------------------------+-----+-----+-----+-----+-----+
+| Meets full requirement      |  5  |  5  |  3  |  1  |  5  |
+| Keeps the p / v keys        |  5  |  1  |  5  |  5  |  5  |
+| Logic outside nnn.c         |  5  |  5  |  5  |  5  |  1  |
+| Least C change / friction   |  5  |  5  |  3  |  5  |  1  |
+| Upstream-rebase cleanliness |  4  |  5  |  3  |  4  |  1  |
+| Maintainability             |  5  |  5  |  2  |  3  |  2  |
++-----------------------------+-----+-----+-----+-----+-----+
+| TOTAL                       | 29  | 26  | 21  | 23  | 15  |
++-----------------------------+-----+-----+-----+-----+-----+
+```
+
+**Winner: Approach A** -- the one-line `opstr()` rewrite plus an external helper.
+It is the only option that meets the full requirement *and* keeps the `p`/`v`
+keys *and* stays nearly upstream-clean. Approach B is the close runner-up and is
+the better choice if the fork is willing to use a plugin key instead of `p`/`v`
+(it is the only truly zero-rebase option).
+
+---
+
+### II.3 The "Least Change" / One-Line Variants
+
+`opstr()` is the single chokepoint, so every variant is a one-line edit there.
+
+#### Variant A0 -- Truly one line, keep passing the cp/mv globals
+
+```c
+/* opstr(): op is still the cp/mv global ("cp -iRp --" etc.) */
+snprintf(buf, CMD_LEN_MAX, "nnn-cpmv %s '%s' . < /dev/tty", op, selpath);
+```
+
+- Exactly **one** changed line. The helper receives `op` = `"cp -iRp --"` (or the
+  mv/advcpmv variant) as its first argument and detects cp-vs-mv from the first
+  token. No other edit is required.
+
+#### Variant A1 -- my_patches form (1 line in opstr + 2 cleanup lines)
+
+The committed patch additionally changes the two call sites in
+`cpmvrm_selection()` to pass the literal strings `"cp"`/`"mv"` instead of the
+globals, so the helper's argument is a clean `cp` or `mv`:
+
+```c
+case SEL_CP: opstr(g_buf, "cp"); break;   /* was: opstr(g_buf, cp); */
+case SEL_MV: opstr(g_buf, "mv"); break;   /* was: opstr(g_buf, mv); */
+```
+
+- 3 changed lines total. Slightly cleaner helper parsing, but it **discards the
+  advcpmv (cpg/mvg) selection** that the globals encode -- the helper must
+  re-detect cpg/mvg itself (the script does). A0 keeps that information.
+
+#### Variant A2 -- Gated behind a build flag (RECOMMENDED, mirrors Part I's B4)
+
+```c
+/* opstr() */
+#ifdef FZ_CPMV
+    snprintf(buf, CMD_LEN_MAX, "nnn-cpmv %s '%s' . < /dev/tty", op, selpath);
+#else
+    snprintf(buf, CMD_LEN_MAX,
+        "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < '%s'", op, selpath);
+#endif
+```
+
+- The default build is **byte-for-byte upstream** (`xargs ... cp -i`); the fork
+  opts in with `-DFZ_CPMV` via an `O_FZ_CPMV` Makefile option (exactly like
+  `O_SSN_ON_CD` in Part I). Politest for upstreaming and cleanest for rebases.
+
+```
+ASCII Table II.9: One-line variant trade-offs
++---------+----------------+------------------+--------------------+-------------+
+| Variant | Lines in nnn.c | advcpmv kept?    | Upstream-default   | Needs helper|
+|         |                |                  | changed?           | in PATH?    |
++---------+----------------+------------------+--------------------+-------------+
+| A0      | 1              | yes (via op)     | yes                | yes         |
+| A1      | 3              | no (helper redet)| yes                | yes         |
+| A2      | 1 (+ifdef)     | yes (via op)     | no (flag off)      | yes (flag on)|
++---------+----------------+------------------+--------------------+-------------+
+```
+
+> Recommendation: ship **A2** (A0's one line, gated by `-DFZ_CPMV`) so the
+> default build matches upstream and rebases stay clean, while the fork's build
+> enables the FileZilla helper. Distribute the helper as an nnn **plugin**
+> (II.4.2) so nothing has to land in the user's `$PATH` by hand.
+
+#### Why one line at `opstr()` rebases cleanly
+
+```mermaid
+%% opstr() is small and rarely touched upstream -> trivial rebases
+flowchart LR
+    One["1 line in opstr()"] --> Tiny["tiny conflict surface"]
+    Tiny --> Clean["git rebase origin-old/master<br/>almost never conflicts"]
+    Native["Approach E: hundreds of C lines"] --> Big["large conflict surface"]
+    Big --> Pain["frequent manual resolution"]
+```
+
+---
+
+### II.4 Deep Dive: Recommended Design (Approach A2 + hardened helper)
+
+#### II.4.1 The two pieces
+
+```mermaid
+%% The whole feature is two small artifacts
+flowchart TB
+    subgraph C["nnn.c (1 line, gated)"]
+        OPSTR["opstr(): call nnn-cpmv when FZ_CPMV"]
+    end
+    subgraph SH["helper (shell, in plugins/)"]
+        PARSE["parse selection (NUL-safe)"]
+        DETECT["per-item conflict detection"]
+        MENU["7-option menu + apply-to-all"]
+        EXEC["cp / mv / rsync / cpg / mvg"]
+    end
+    OPSTR --> PARSE --> DETECT --> MENU --> EXEC
+```
+
+The contract between them is three positional arguments:
+
+```
+ASCII Table II.10: nnn -> helper contract
++----------+--------------------------------------------------------------+
+| Arg      | Value                                                        |
++----------+--------------------------------------------------------------+
+| $1 op    | "cp" or "mv" (A1), or the full op string "cp -iRp --" (A0)   |
+| $2 sel   | path to the NUL-separated selection file (nnn's selpath)     |
+| $3 dest  | "." -- the helper resolves it to $PWD (nnn's browse dir)     |
+| stdin    | /dev/tty (so read prompts work under spawn F_CLI)           |
++----------+--------------------------------------------------------------+
+```
+
+#### II.4.2 Packaging the helper as a plugin (best practice)
+
+Rather than requiring `nnn-cpmv` on the user's `$PATH`, place it in nnn's plugin
+directory and call it by absolute path from `opstr()`:
+
+```c
+#ifdef FZ_CPMV
+    snprintf(buf, CMD_LEN_MAX,
+        "\"${NNN_PLUG_DIR:-$HOME/.config/nnn/plugins}/cpmv\" %s '%s' . < /dev/tty",
+        op, selpath);
+#endif
+```
+
+- Keeps `$PATH` clean and ships the helper the nnn-idiomatic way (the plugins
+  dir is already part of every nnn install). This is the best-of-both-worlds with
+  Approach B: the C hook keeps `p`/`v`, the logic ships as a plugin file.
+
+#### II.4.3 The per-conflict decision logic
+
+```mermaid
+%% Per-item loop with apply-to-all short-circuit
+flowchart TD
+    Start["for each selected item src"] --> Tgt{"dest/basename<br/>exists?"}
+    Tgt -->|"no"| Just["copy/move it (no prompt)"]
+    Tgt -->|"yes"| Glob{"GLOBAL_MODE set?"}
+    Glob -->|"yes"| Apply["apply GLOBAL_MODE"]
+    Glob -->|"no"| Show["show sizes + mtimes<br/>show 7-option menu"]
+    Show --> Read["read choice 1-7"]
+    Read --> Do["apply choice"]
+    Do --> AskAll{"apply to ALL<br/>remaining? y/N"}
+    AskAll -->|"y"| SetG["GLOBAL_MODE = choice"]
+    AskAll -->|"n"| Next1["continue (ask again next time)"]
+    Apply --> Next2["next item"]
+    Just --> Next2
+    SetG --> Next2
+    Next1 --> Next2
+```
+
+#### II.4.4 The seven modes and their implementations
+
+```
+ASCII Table II.11: Mode -> tool mapping
++---+----------------------------+--------------------------------------------+
+| # | Menu entry                 | Implementation                             |
++---+----------------------------+--------------------------------------------+
+| 1 | overwrite                  | cp -f  /  mv -f   (or cpg/mvg)              |
+| 2 | newer only                 | cp -u  /  mv -u  (mtime: source newer)     |
+| 3 | different size only        | rsync -a --size-only                       |
+| 4 | different size or newer    | rsync -a --update (size+mtime quick check, |
+|   |                            | skip if dest newer) -- approximates FZ      |
+| 5 | resume (interrupted)       | rsync -a --partial --append-verify         |
+| 6 | rename (keep both)         | copy to "stem (n)ext" next free suffix      |
+| 7 | skip                       | do nothing                                 |
++---+----------------------------+--------------------------------------------+
+```
+
+For `mv`, the rsync-based modes (3/4/5) are an **emulated move**: rsync to the
+destination, then remove the source -- non-atomic and slower than a real `mv`
+(see the data-loss caveat in II.4.7).
+
+#### II.4.5 Apply-to-all as a tiny state machine
+
+```mermaid
+%% GLOBAL_MODE state
+stateDiagram-v2
+    [*] --> Asking
+    Asking --> Asking: "conflict -> menu -> 'all? n'"
+    Asking --> Locked: "conflict -> menu -> 'all? y'"
+    Locked --> Locked: "conflict -> reuse choice (no prompt)"
+    Asking --> [*]: "items exhausted"
+    Locked --> [*]: "items exhausted"
+```
+
+Once locked, every remaining conflict reuses the chosen mode with no further
+prompts -- FileZilla's "apply to all" checkbox, exactly as the workflow requires.
+
+#### II.4.6 Conflict granularity (an honest limitation)
+
+FileZilla resolves conflicts **per file**, descending into directory trees. This
+design resolves them **per selected top-level item**. For a selected directory,
+the chosen mode applies to the whole subtree:
+
+```
+ASCII Table II.12: Granularity comparison
++------------------------------+-----------------------------+------------------+
+| Scenario                     | FileZilla                   | This design      |
++------------------------------+-----------------------------+------------------+
+| select 3 files               | 3 per-file prompts          | 3 per-item       |
+|                              |                             | prompts (same)   |
+| select a dir with 100 files, | up to 100 nested prompts    | ONE prompt for   |
+|   some conflicting           |                             | the dir; rsync   |
+|                              |                             | rule applies to  |
+|                              |                             | the subtree      |
++------------------------------+-----------------------------+------------------+
+```
+
+This is usually acceptable (and faster), but it must be documented. A future
+enhancement could expand directories and prompt per nested conflict; that is
+explicitly out of scope for the least-change deliverable.
+
+#### II.4.7 Critique of the committed helper (fix before shipping)
+
+[my_patches/nnn-cpmv](../my_patches/nnn-cpmv) is a strong starting point
+(NUL-safe parsing, advcpmv detection, size/mtime display, apply-to-all, rename
+collision). Treating it as a candidate rather than the answer, these issues must
+be addressed:
+
+```
+ASCII Table II.13: Helper issues, severity-ordered
++----------+------------------------------------+------------------------------+
+| Severity | Issue                              | Fix                          |
++----------+------------------------------------+------------------------------+
+| CRITICAL | move modes 3/4/5 run `rsync ... ;  | use `&&`: only rm_src on     |
+|          | rm_src` with a SEMICOLON, so a     | rsync SUCCESS. As written, a |
+|          | failed rsync still deletes the     | failed transfer DELETES the  |
+|          | source -> DATA LOSS.               | source. (lines 61-63)        |
+| HIGH     | `stat -c` is GNU-only; breaks on   | detect BSD `stat -f` or fall |
+|          | BSD/macOS where nnn also runs.     | back to `wc -c` / `find`.    |
+| MEDIUM   | non-conflict path uses mode 1      | harmless but document; or    |
+|          | (overwrite -f) unconditionally     | use plain cp without -f.     |
+| MEDIUM   | cpg/mvg `-t`,`-f` flag support     | feature-test the flags, or   |
+|          | assumed; advcpmv variants differ.  | fall back to plain cp/mv.    |
+| LOW      | copying a file onto itself         | guard: skip if src -ef tgt.  |
+| LOW      | resume on a complete-but-different | acceptable; note that mode 5 |
+|          | file re-verifies (slow)            | assumes an interrupted xfer. |
++----------+------------------------------------+------------------------------+
+```
+
+```mermaid
+%% The critical move bug, visualized
+flowchart LR
+    R["rsync src -> dest"] -->|"current: #59;"| RM["rm -rf src ALWAYS"]
+    R -->|"fixed: &&"| RMok["rm -rf src ONLY if rsync ok"]
+    RM --> Loss["data loss on failure"]
+    RMok --> Safe["safe move"]
+```
+
+#### II.4.8 Edge cases
+
+```
+ASCII Table II.14: Edge cases and handling
++--------------------------------------+----------------------------------------+
+| Edge case                            | Handling                               |
++--------------------------------------+----------------------------------------+
+| empty selection                      | nnn already guards (isselfileempty);   |
+|                                      | helper also exits with a message.      |
+| filenames with spaces/newlines       | NUL-separated read -r -d '' (safe).    |
+| filename starting with '-'           | `--` and `-t dest` everywhere.         |
+| no rsync installed                   | modes 3/4/5 print "rsync missing" and  |
+|                                      | skip (do not silently overwrite).      |
+| dest == source dir (copy onto self)  | guard with `src -ef tgt`; skip.        |
+| sessions/advcpmv (-r) build          | op encodes cpg/mvg; helper uses it     |
+|                                      | (A0) or re-detects (A1).               |
+| FZ_CPMV not defined (default build)  | opstr() is upstream verbatim; feature  |
+|                                      | absent, zero risk.                     |
++--------------------------------------+----------------------------------------+
+```
+
+---
+
+### II.5 Step-by-Step Implementation Guidelines
+
+No timeline -- ordered steps only. Assumes the branch is already on
+`origin-old/master` (Part I, Step 0).
+
+#### Step 1 -- Add the gated one-line hook in `opstr()`
+
+Edit [src/nnn.c:2737](../src/nnn.c#L2737) to the A2 form (II.3 / II.4.2),
+preferably calling the helper by its plugin path:
+
+```c
+static void opstr(char *buf, char *op)
+{
+#ifdef FZ_CPMV
+    snprintf(buf, CMD_LEN_MAX,
+        "\"${NNN_PLUG_DIR:-$HOME/.config/nnn/plugins}/cpmv\" %s '%s' . < /dev/tty",
+        op, selpath);
+#else
+    snprintf(buf, CMD_LEN_MAX,
+        "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < '%s'", op, selpath);
+#endif
+}
+```
+
+#### Step 2 -- Add the `O_FZ_CPMV` build option
+
+Mirror `O_SSN_ON_CD` (Part I): add `O_FZ_CPMV := 0` near the other `O_*` options
+in `Makefile` (and `Makefile_debug`), and a block:
+
+```make
+ifeq ($(strip $(O_FZ_CPMV)),1)
+	CPPFLAGS += -DFZ_CPMV
+endif
+```
+
+Then append `O_FZ_CPMV=1` to `build.sh` / `build_debug.sh`.
+
+#### Step 3 -- Install the hardened helper as a plugin
+
+Place the helper at `~/.config/nnn/plugins/cpmv` (or ship it in the fork's
+`plugins/` dir), `chmod +x`. Start from
+[my_patches/nnn-cpmv](../my_patches/nnn-cpmv) and apply the II.4.7 fixes --
+**at minimum the CRITICAL `;` -> `&&` move fix** and the `stat` portability
+guard.
+
+#### Step 4 -- Build
+
+```
+ASCII Table II.15: Build matrix
++----------------------------+-------------------------------------------+
+| Build                      | What it verifies                          |
++----------------------------+-------------------------------------------+
+| make                       | Default build = upstream opstr (no flag). |
+| make O_FZ_CPMV=1           | Hook compiles; calls the plugin.          |
+| ./build.sh                 | Fork build with the feature enabled.      |
++----------------------------+-------------------------------------------+
+```
+
+#### Step 5 -- Manual verification
+
+```mermaid
+%% Verification flow mirroring the user's workflow
+sequenceDiagram
+    participant U as User
+    participant N as nnn (O_FZ_CPMV=1)
+    participant H as plugins/cpmv
+    U->>N: Space-select file(s)
+    U->>N: navigate to dest dir
+    U->>N: press p (copy here)
+    N->>H: cpmv cp selpath .
+    H-->>U: CONFLICT menu (1-7) for clashing item
+    U->>H: choose 3 (different size only)
+    H-->>U: apply to ALL remaining? y/N
+    U->>H: y
+    H->>H: reuse mode 3 for the rest, no prompts
+    H-->>U: Done. Press enter.
+```
+
+Concrete checks:
+1. Copy a non-conflicting file -> no prompt, file appears.
+2. Copy a conflicting file -> menu shows source/target size + mtime; pick each of
+   1-7 and confirm the documented behaviour.
+3. Pick a mode, answer "apply to all = y", and confirm remaining conflicts are
+   resolved without further prompts.
+4. **Move (v) with rsync modes 3/4/5**: interrupt/force an rsync failure and
+   confirm the **source is preserved** (validates the II.4.7 CRITICAL fix).
+5. Select a directory tree with mixed conflicts; confirm the per-item semantics
+   (II.4.6) match expectations.
+6. Default build (no `O_FZ_CPMV`): confirm `p`/`v` behave exactly as upstream.
+
+#### Step 6 -- Keep upstream-syncable
+
+`opstr()` is small and rarely touched upstream; the gated one-liner rebases
+cleanly. Periodically:
+
+```
+git fetch origin-old
+git rebase origin-old/master      # the gated opstr line rebases cleanly
+./build.sh && <run Step 5 checks>
+```
+
+---
+
+### II.6 Summary
+
+- `opstr()` ([src/nnn.c:2737](../src/nnn.c#L2737)) is the single chokepoint for
+  both `p` (SEL_CP) and `v` (SEL_MV) -- the cp/mv analog of Part I's `begin:`.
+  Stock nnn only offers `cp -i`/`mv -i` (y/n overwrite); everything else is the
+  gap to fill.
+- Recommended: **Approach A2** -- a **one-line**, build-flag-gated (`-DFZ_CPMV`)
+  rewrite of `opstr()` that calls an external helper, with the helper shipped as
+  an nnn **plugin**. Default build stays byte-for-byte upstream; the fork opts in.
+- The `my_patches` solution is essentially Approach A1 and is a sound starting
+  point, but (a) it changes 3 lines instead of 1 and drops the advcpmv info, and
+  (b) its helper has a **CRITICAL data-loss bug** (move modes run `rsync ... ;
+  rm` instead of `&&`) plus GNU-only `stat` -- both must be fixed before shipping.
+- Approach B (pure plugin, zero C change) is the most rebase-proof option and the
+  right choice if the fork accepts a plugin key (`;c`) instead of `p`/`v`.
+- Honest limitation: conflict resolution is per selected top-level item, not per
+  nested file as in FileZilla (II.4.6) -- acceptable and faster, but documented.
