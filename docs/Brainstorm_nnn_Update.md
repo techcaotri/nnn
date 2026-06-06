@@ -1632,7 +1632,7 @@ directory and call it by absolute path from `opstr()`:
 ```c
 #ifdef FZ_CPMV
     snprintf(buf, CMD_LEN_MAX,
-        "\"${NNN_PLUG_DIR:-$HOME/.config/nnn/plugins}/cpmv\" %s '%s' . < /dev/tty",
+        "\"${XDG_CONFIG_HOME:-$HOME/.config}/nnn/plugins/cpmv\" '%s' '%s' . < /dev/tty",
         op, selpath);
 #endif
 ```
@@ -1740,6 +1740,12 @@ ASCII Table II.13: Helper issues, severity-ordered
 |          | rm_src` with a SEMICOLON, so a     | rsync SUCCESS. As written, a |
 |          | failed rsync still deletes the     | failed transfer DELETES the  |
 |          | source -> DATA LOSS.               | source. (lines 61-63)        |
+| HIGH     | parse loop `read -r -d ''` drops   | add `|| [ -n "$f" ]` and reset|
+|          | the LAST field. nnn writes the     | f="" each pass, to process   |
+|          | selection with the trailing NUL    | the final unterminated path. |
+|          | TRUNCATED (writesel(buf,pos-1),    | Without this a SINGLE-file    |
+|          | src/nnn.c:2065), so the last/only  | selection yields 0 items and  |
+|          | path is not NUL-terminated.        | the copy/move silently no-ops.|
 | HIGH     | `stat -c` is GNU-only; breaks on   | detect BSD `stat -f` or fall |
 |          | BSD/macOS where nnn also runs.     | back to `wc -c` / `find`.    |
 | MEDIUM   | non-conflict path uses mode 1      | harmless but document; or    |
@@ -1799,7 +1805,7 @@ static void opstr(char *buf, char *op)
 {
 #ifdef FZ_CPMV
     snprintf(buf, CMD_LEN_MAX,
-        "\"${NNN_PLUG_DIR:-$HOME/.config/nnn/plugins}/cpmv\" %s '%s' . < /dev/tty",
+        "\"${XDG_CONFIG_HOME:-$HOME/.config}/nnn/plugins/cpmv\" '%s' '%s' . < /dev/tty",
         op, selpath);
 #else
     snprintf(buf, CMD_LEN_MAX,
