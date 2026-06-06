@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "nnn.h": "c",
+        "sstream": "c"
+    }
+}
