@@ -2736,7 +2736,16 @@ static bool plugscript(const char *plugin, uchar_t flags)
 
 static void opstr(char *buf, char *op)
 {
+#ifdef FZ_CPMV
+	/* FileZilla-style per-conflict copy/move via the cpmv plugin.
+	 * op is quoted so the helper receives it as a single argument and
+	 * derives cp/mv (and advcpmv) from its first token. */
+	snprintf(buf, CMD_LEN_MAX,
+		"\"${XDG_CONFIG_HOME:-$HOME/.config}/nnn/plugins/cpmv\" '%s' '%s' . < /dev/tty",
+		op, selpath);
+#else
 	snprintf(buf, CMD_LEN_MAX, "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < '%s'", op, selpath);
+#endif
 }
 
 static bool rmmulstr(char *buf, bool use_trash)
