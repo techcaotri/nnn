@@ -8538,6 +8538,18 @@ begin:
 		} else
 			cfgsort[cfg.curctx] = cfgsort[CTX_MAX];
 	}
+#ifndef NOSSN
+#ifdef SAVE_SESSION_ON_CD
+	/*
+	 * Auto-save the session on every real directory change (cd == TRUE).
+	 * Writes the active session (curssn) or falls back to the "@" auto-session
+	 * so even a flag-less `nnn` survives a crash. In-place refreshes set
+	 * cd = FALSE and are intentionally skipped.
+	 */
+	if (cd)
+		save_session(curssn[0] ? curssn : "@", NULL);
+#endif
+#endif
 	cd = TRUE;
 
 	populate(path, lastname);

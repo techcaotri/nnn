@@ -24,6 +24,7 @@ O_EMOJI := 0  # support emoji
 O_QSORT := 0  # use Alexey Tourbin's QSORT implementation
 O_BENCH := 0  # benchmark mode (stops at first user input)
 O_NOSSN := 0  # disable session support
+O_SSN_ON_CD := 0  # auto-save session on every directory change
 O_NOUG := 0  # disable user, group name in status bar
 O_NOX11 := 0  # disable X11 integration
 O_NOSORT := 0  # disable sorting entries on dir load
@@ -128,6 +129,10 @@ endif
 
 ifeq ($(strip $(O_NOSSN)),1)
 	CPPFLAGS += -DNOSSN
+endif
+
+ifeq ($(strip $(O_SSN_ON_CD)),1)
+	CPPFLAGS += -DSAVE_SESSION_ON_CD
 endif
 
 ifeq ($(strip $(O_NOUG)),1)
