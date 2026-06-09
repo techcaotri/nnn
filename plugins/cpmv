@@ -16,7 +16,10 @@
 # stdin is /dev/tty (nnn runs this under spawn F_CLI), so the prompts work.
 #
 # Reproduces FileZilla's overwrite options plus a "resume" mode, with an
-# "apply to ALL remaining conflicts" prompt that repeats until accepted.
+# "apply to ALL remaining conflicts" prompt shown only while items still remain.
+# Returns to nnn automatically (no keypress) when there is no conflict or only a
+# single item; pauses for review only after resolving conflicts across several
+# items.
 #
 # Requires: bash, coreutils. rsync is needed for the size-based and resume
 #           modes (3/4/5); without it those modes skip rather than guess.
@@ -122,9 +125,14 @@ show_conflict() {
 MENU
 }
 
-printf '%s -> %s   (%d item[s])\n' "$ACT" "$dest" "${#files[@]}"
+nfiles=${#files[@]}
+conflicts=0          # count of conflict menus actually shown to the user
+idx=0
+
+printf '%s -> %s   (%d item[s])\n' "$ACT" "$dest" "$nfiles"
 
 for src in "${files[@]}"; do
+    idx=$((idx + 1))
     target="$dest/$(basename -- "$src")"
 
     # Never copy/move an item onto itself.
@@ -136,6 +144,7 @@ for src in "${files[@]}"; do
     if [ ! -e "$target" ]; then do_one "$src" 1; continue; fi
     if [ -n "$GLOBAL_MODE" ]; then do_one "$src" "$GLOBAL_MODE"; continue; fi
 
+    conflicts=$((conflicts + 1))
     while :; do
         show_conflict "$src" "$target"
         printf '    choose [1-7]: '; read -r choice
@@ -143,10 +152,18 @@ for src in "${files[@]}"; do
     done
     do_one "$src" "$choice"
 
-    # FileZilla "apply to all" -- keep asking until the user accepts.
-    printf '    apply to ALL remaining conflicts? [y/N]: '; read -r yn
-    case "$yn" in y|Y|yes|YES) GLOBAL_MODE="$choice" ;; esac
+    # FileZilla "apply to all": only meaningful while items still remain to be
+    # processed. Skipped for the last/only item (so a single-file op never asks).
+    if [ "$idx" -lt "$nfiles" ]; then
+        printf '    apply to ALL remaining conflicts? [y/N]: '; read -r yn
+        case "$yn" in y|Y|yes|YES) GLOBAL_MODE="$choice" ;; esac
+    fi
 done
 
-printf '\nDone. Press enter.'; read -r _
+# Return to nnn without a keypress, EXCEPT when conflicts were resolved across
+# multiple items (then pause so the user can review the outcome). No conflict,
+# or a single item -> exit immediately.
+if [ "$conflicts" -gt 0 ] && [ "$nfiles" -gt 1 ]; then
+    printf '\nDone. Press enter.'; read -r _
+fi
 exit 0

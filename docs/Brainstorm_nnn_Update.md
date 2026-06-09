@@ -1653,14 +1653,30 @@ flowchart TD
     Glob -->|"no"| Show["show sizes + mtimes<br/>show 7-option menu"]
     Show --> Read["read choice 1-7"]
     Read --> Do["apply choice"]
-    Do --> AskAll{"apply to ALL<br/>remaining? y/N"}
+    Do --> Rem{"items still<br/>remaining?"}
+    Rem -->|"yes"| AskAll{"apply to ALL<br/>remaining? y/N"}
+    Rem -->|"no (last/only item)"| Next2
     AskAll -->|"y"| SetG["GLOBAL_MODE = choice"]
     AskAll -->|"n"| Next1["continue (ask again next time)"]
     Apply --> Next2["next item"]
     Just --> Next2
     SetG --> Next2
     Next1 --> Next2
+    Next2 --> Done{"loop finished?"}
+    Done -->|"more items"| Start
+    Done -->|"done"| Exit{"conflicts shown AND<br/>multiple items?"}
+    Exit -->|"yes"| Pause["pause: 'Done. Press enter.'"]
+    Exit -->|"no"| Auto["auto-return to nnn<br/>(no keypress)"]
 ```
+
+**Two UX rules at the tail of the loop.** (1) The *apply to ALL* question is only
+meaningful while items remain, so it is **skipped for the last/only item** -- a
+single-file operation therefore never asks it. (2) The helper **returns to nnn
+without a keypress** in the common cases (no conflict at all, or a single item);
+it pauses with `Done. Press enter.` only after the user resolved conflicts across
+**multiple** items, where a moment to review the outcome is useful. Because the
+helper always `exit 0`s, nnn's own `F_CHKRTN` "Press ENTER" pause is never
+triggered either.
 
 #### II.4.4 The seven modes and their implementations
 
@@ -1862,11 +1878,22 @@ sequenceDiagram
     N->>H: cpmv cp selpath .
     H-->>U: CONFLICT menu (1-7) for clashing item
     U->>H: choose 3 (different size only)
+    Note over H,U: ask "apply to ALL?" only if items remain
     H-->>U: apply to ALL remaining? y/N
     U->>H: y
     H->>H: reuse mode 3 for the rest, no prompts
-    H-->>U: Done. Press enter.
+    alt conflicts resolved across multiple items
+        H-->>U: Done. Press enter.
+    else no conflict OR single item
+        H-->>N: exit 0 (auto-return, no keypress)
+    end
 ```
+
+Concrete checks (add to the originals):
+
+0. Copy/move with **no conflict**, and with a **single file** (conflict or not):
+   confirm the console returns to nnn **immediately, without a keypress**, and
+   that a single-file op **never** shows the "apply to ALL" prompt.
 
 Concrete checks:
 1. Copy a non-conflicting file -> no prompt, file appears.
