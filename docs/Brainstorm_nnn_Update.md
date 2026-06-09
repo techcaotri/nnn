@@ -1650,7 +1650,11 @@ flowchart TD
     Tgt -->|"no"| Just["copy/move it (no prompt)"]
     Tgt -->|"yes"| Glob{"GLOBAL_MODE set?"}
     Glob -->|"yes"| Apply["apply GLOBAL_MODE"]
-    Glob -->|"no"| Show["show sizes + mtimes<br/>show 7-option menu"]
+    Glob -->|"no"| One{"single item<br/>(nfiles == 1)?"}
+    One -->|"yes"| YN["simple y/N:<br/>overwrite 'name'? (nnn original)"]
+    YN -->|"y"| Just
+    YN -->|"n"| Next2
+    One -->|"no (multiple)"| Show["show sizes + mtimes<br/>show 7-option menu"]
     Show --> Read["read choice 1-7"]
     Read --> Do["apply choice"]
     Do --> Rem{"items still<br/>remaining?"}
@@ -1669,11 +1673,13 @@ flowchart TD
     Exit -->|"no"| Auto["auto-return to nnn<br/>(no keypress)"]
 ```
 
-**Two UX rules at the tail of the loop.** (1) The *apply to ALL* question is only
-meaningful while items remain, so it is **skipped for the last/only item** -- a
-single-file operation therefore never asks it. (2) The helper **returns to nnn
-without a keypress** in the common cases (no conflict at all, or a single item);
-it pauses with `Done. Press enter.` only after the user resolved conflicts across
+**Three UX rules.** (1) A **single-item** conflict falls back to nnn's original
+**simple `y/N` overwrite** prompt rather than the 7-option menu -- the menu only
+pays off when batching several items. (2) The *apply to ALL* question is only
+meaningful while items remain, so it is **skipped for the last/only item** (and
+thus never appears for a single file). (3) The helper **returns to nnn without a
+keypress** in the common cases (no conflict at all, or a single item); it pauses
+with `Done. Press enter.` only after the user resolved conflicts across
 **multiple** items, where a moment to review the outcome is useful. Because the
 helper always `exit 0`s, nnn's own `F_CHKRTN` "Press ENTER" pause is never
 triggered either.
