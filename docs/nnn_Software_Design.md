@@ -876,7 +876,13 @@ parse variable-length names/paths. Part I's contribution is calling
 `save_session(curssn[0] ? curssn : "@", NULL)` from the `begin:` label so this
 snapshot is refreshed on every directory change, not only at clean exit.
 
-#### 3.5.8 Copy/Move with Conflict Resolution -- Sequence Diagram (Part II tie-in)
+#### 3.5.8 Copy/Move with Conflict Resolution (Part II tie-in)
+
+This is the most behaviour-rich fork feature, so it is documented in depth: the
+**invocation path** (C side), the **conflict-resolution policy** (plugin side),
+the **mode table**, the **behaviour matrix**, and the **helper hardening**.
+
+##### 3.5.8.1 Invocation Path -- Sequence Diagram
 
 ```mermaid
 %% Sequence: p/v -> opstr -> cpmv plugin (FileZilla-style)
@@ -887,31 +893,164 @@ sequenceDiagram
     participant CM as cpmvrm_selection
     participant OP as opstr (chokepoint)
     participant SP as Process Service (spawn)
-    participant PL as cpmv plugin
+    participant PL as cpmv plugin (plugins/cpmv)
 
     U->>L: press p (copy) or v (move)
     L->>CM: cpmvrm_selection(SEL_CP/MV)
-    CM->>CM: flush selection (writesel) #59; selsafe()
+    CM->>CM: flush selection (writesel) + selsafe()
     CM->>OP: opstr(g_buf, cp/mv)
-    Note over OP: FZ_CPMV build -> command calls the cpmv plugin
+    Note over OP: FZ_CPMV build -> command calls the cpmv plugin (quoted op)
     CM->>SP: spawn(sh -c g_buf, F_CLI|F_CHKRTN)
-    SP->>PL: run cpmv "op" selfile .
+    SP->>PL: run cpmv "op" selfile "."
+    PL->>PL: derive cp/mv from op #59; parse NUL selection
     loop each selected item
-        alt target exists
-            PL->>U: show 7-option conflict menu
-            U->>PL: choice + apply-to-all?
-        end
-        PL->>PL: cp/mv/rsync per chosen mode
+        PL->>PL: apply per-item policy (see 3.5.8.2)
     end
-    PL-->>SP: exit 0
+    PL-->>SP: exit 0 (always)
+    Note over SP,PL: exit 0 -> nnn's F_CHKRTN "Press ENTER" never fires
     SP-->>L: refresh listing
 ```
 
 **Explanation.** `opstr()` ([src/nnn.c:2737](../src/nnn.c#L2737)) is the single
-chokepoint both `p` and `v` pass through; Part II rewrites its one command line
-(under `-DFZ_CPMV`) to invoke the `cpmv` plugin, which implements the per-file
-menu and the "apply to all" loop. Everything still flows through the standard
-`spawn()` path, so terminal handling and return-code checking are unchanged.
+chokepoint both `p` (SEL_CP) and `v` (SEL_MV) pass through; under `-DFZ_CPMV` it
+rewrites its one command line to invoke the `cpmv` plugin, passing nnn's `op`
+string (e.g. `cp -iRp --`) **quoted** so the helper receives it as one argument
+and derives cp-vs-mv (and advcpmv `cpg`/`mvg`) from its first token. Everything
+still flows through the standard `spawn()` path with `F_CLI | F_CHKRTN`, so
+terminal hand-off and return-code checking are unchanged. Because the helper
+**always exits 0**, nnn's own "Press ENTER" pause (triggered by `F_CHKRTN` on a
+non-zero status) never fires -- the plugin alone decides whether to pause.
+
+##### 3.5.8.2 Conflict-Resolution Policy -- Flowchart
+
+The plugin processes each selected item independently. The prompt it shows
+depends on **how many items** there are and **whether the item is a file or a
+directory**; the tail of the loop decides whether to ask "apply to all" and
+whether to pause before returning to nnn.
+
+```mermaid
+%% Per-item conflict policy + exit decision in plugins/cpmv
+flowchart TD
+    Start["for each selected item src"] --> Exist{"target exists in dest?"}
+    Exist -->|"no"| Copy["copy/move it (no prompt)"]
+    Exist -->|"yes"| Same{"src is the same<br/>file as target?"}
+    Same -->|"yes"| SkipSame["skip (same file)"]
+    Same -->|"no"| Glob{"GLOBAL_MODE<br/>already set?"}
+    Glob -->|"yes"| Apply["apply GLOBAL_MODE"]
+    Glob -->|"no"| Kind{"single regular FILE?<br/>(nfiles == 1 and not a dir)"}
+    Kind -->|"yes"| YN["nnn-style simple prompt:<br/>overwrite 'name'? y/N"]
+    YN -->|"y"| Over["overwrite (mode 1)"]
+    YN -->|"n"| SkipYN["skip (mode 7)"]
+    Kind -->|"no (multi-item OR a directory)"| Menu["7-option FileZilla menu<br/>(overwrite / newer / size / ...)"]
+    Menu --> Do["apply chosen mode"]
+    Do --> Rem{"items still remaining?"}
+    Rem -->|"yes"| AskAll{"apply to ALL<br/>remaining? y/N"}
+    Rem -->|"no (last/only item)"| NextItem
+    AskAll -->|"y"| Lock["GLOBAL_MODE = choice"]
+    AskAll -->|"n"| NextItem["next item"]
+    Copy --> NextItem
+    SkipSame --> NextItem
+    Apply --> NextItem
+    Over --> NextItem
+    SkipYN --> NextItem
+    Lock --> NextItem
+    NextItem --> More{"more items?"}
+    More -->|"yes"| Start
+    More -->|"no"| Pause{"a 7-option menu was<br/>shown AND multiple items?"}
+    Pause -->|"yes"| Wait["pause: 'Done. Press enter.'"]
+    Pause -->|"no"| Auto["auto-return to nnn (no keypress)"]
+```
+
+**Explanation.** Three deliberate UX rules are encoded here:
+
+1. **Single regular file -> simple `y/N`.** A lone file conflict reproduces
+   nnn's original `cp -i`/`mv -i` feel (`overwrite 'name'? [y/N]`), not the rich
+   menu -- the menu's size/newer/resume modes add nothing for one file.
+2. **Single directory -> full menu.** A lone *directory* conflict is treated like
+   a multi-item conflict and gets the 7-option menu, because reconciling a tree
+   genuinely benefits from "different size", "newer only", "resume" and
+   "rename/keep-both".
+3. **Apply-to-all only while items remain; pause only for multi-item conflicts.**
+   The "apply to all" question is skipped for the last/only item (so a single
+   item never asks it), and the terminal **auto-returns to nnn with no keypress**
+   except after resolving conflicts across *several* items, where a moment to
+   review is useful.
+
+##### 3.5.8.3 The Seven Modes
+
+```
+ASCII Table 3.5.8a: Conflict mode -> implementation
++---+----------------------------+--------------------------------------------+
+| # | Menu entry                 | Implementation (cp/mv, or cpg/mvg, or rsync)|
++---+----------------------------+--------------------------------------------+
+| 1 | overwrite                  | cp -f  /  mv -f                            |
+| 2 | newer only                 | cp -u  /  mv -u   (source mtime newer)     |
+| 3 | different size only        | rsync -a --size-only                       |
+| 4 | different size or newer    | rsync -a --update                          |
+| 5 | resume (interrupted)       | rsync -a --partial --append-verify         |
+| 6 | rename (keep both)         | copy to "stem (n)ext" -- next free suffix  |
+| 7 | skip                       | do nothing                                 |
++---+----------------------------+--------------------------------------------+
+```
+
+For a **move**, the rsync-based modes (3/4/5) are an emulated move: rsync to the
+destination, then remove the source **only on a successful transfer** (see
+3.5.8.5). The simple `y/N` "yes" maps to mode 1, "no" to mode 7.
+
+##### 3.5.8.4 Behaviour Matrix
+
+```
+ASCII Table 3.5.8b: What the user sees, by selection shape and conflict
++--------------------------------+----------------------+-----------+-------------+
+| Scenario                       | Conflict prompt      | apply-to- | Return to   |
+|                                |                      | all asked | nnn         |
++--------------------------------+----------------------+-----------+-------------+
+| No conflict (any count)        | none                 | no        | auto (no key)|
+| Single regular file, conflict  | simple y/N overwrite | no        | auto (no key)|
+| Single directory, conflict     | 7-option menu        | no        | auto (no key)|
+| Multiple items, >= 1 conflict  | 7-option menu / item | while     | pause        |
+|                                |                      | items     | (Press enter)|
+|                                |                      | remain    |             |
++--------------------------------+----------------------+-----------+-------------+
+```
+
+##### 3.5.8.5 Helper Hardening and Correctness
+
+The plugin guards several subtle failure modes discovered while integrating with
+nnn's real selection format and cross-platform tools:
+
+```
+ASCII Table 3.5.8c: cpmv plugin correctness guards
++----------------------------+------------------------------------------------+
+| Concern                    | Handling in plugins/cpmv                        |
++----------------------------+------------------------------------------------+
+| NUL-truncated selection    | nnn writes the selection with the trailing NUL  |
+|                            | truncated (writesel(buf, selbufpos-1),         |
+|                            | src/nnn.c:2065), so the LAST path is not        |
+|                            | NUL-terminated. The parse loop uses             |
+|                            | `read -r -d '' f || [ -n "$f" ]` so the final   |
+|                            | unterminated path is not dropped (a single-file |
+|                            | selection would otherwise yield 0 items).      |
+| Move data-loss             | rsync MOVE modes run `rsync ... && rm_src`      |
+|                            | (never `;`) so the source is removed ONLY on a  |
+|                            | successful transfer.                           |
+| stat(1) portability        | GNU `stat -c` vs BSD `stat -f` are detected at  |
+|                            | startup (nnn runs on Linux and *BSD/macOS).    |
+| Copy onto self             | items where `src -ef target` are skipped.      |
+| rsync absent               | size/resume modes (3/4/5) skip with a message  |
+|                            | rather than silently overwriting.              |
+| Return code                | always `exit 0` so nnn's F_CHKRTN pause is not  |
+|                            | triggered -- the plugin owns the pause policy.  |
+| advcpmv progress           | uses cpg/mvg for a progress bar when present.   |
++----------------------------+------------------------------------------------+
+```
+
+**Explanation.** These guards are the difference between a demo script and a
+shippable plugin. The NUL-truncation and the `&&` move-fix in particular are
+non-obvious: the first is a quirk of how nnn flushes its in-memory selection to
+disk; the second prevents data loss if a transfer fails mid-move. All conflict
+logic lives in the plugin ([plugins/cpmv](../plugins/cpmv)), keeping the C change
+to the single gated line in `opstr()`.
 
 #### 3.5.9 Plugin Control Protocol -- Sequence Diagram
 
@@ -1404,7 +1543,8 @@ ASCII Table 3.6.10: Keystroke -> effect traces
 | l        | get_wch -> 'l' -> bindings[] -> SEL_NAV_IN -> switch: chdir +      |
 |          | cdprep -> goto begin -> populate + redraw. New listing shown.     |
 | p        | get_wch -> 'p' -> SEL_CP -> cpmvrm_selection -> opstr (chokepoint) |
-|          | -> spawn(sh -c, F_CLI) -> cp / cpmv plugin runs -> redraw.         |
+|          | -> spawn(sh -c, F_CLI) -> cpmv plugin: per-item policy (3.5.8.2)   |
+|          | -> auto-return or pause -> redraw.                                 |
 | / a b c  | '/' -> SEL_FLTR -> filterentries() sub-loop: each of a,b,c         |
 |          | recomputes visible_* matches live; Enter keeps filter (c_fltr),   |
 |          | ESC restores. Unique match may auto-descend.                      |
@@ -1494,9 +1634,12 @@ ASCII Table 5: How the fork features map onto this design
 | Part I   | Browser Event Loop (3.4.8, | One guarded line at the begin: label     |
 | auto-    | 3.5.2) + Session (3.5.7)    | calls save_session(curssn|"@") whenever  |
 | save ssn |                            | cd == TRUE (a real directory change).    |
-| Part II  | opstr() chokepoint (3.5.8) | One gated line rewrites the cp/mv command|
-| cpmv     | + Process Service (3.5.5)  | to invoke the cpmv plugin; conflict menu |
-|          | + Selection (3.4.5)        | + apply-to-all live in the plugin.       |
+| Part II  | opstr() chokepoint (3.5.8) | One gated line (-DFZ_CPMV) rewrites the  |
+| cpmv     | + Process Service (3.5.5)  | cp/mv command to invoke the cpmv plugin. |
+|          | + Selection (3.4.5)        | Policy lives in the plugin: single file  |
+|          |                            | -> simple y/N; single dir or multi-item  |
+|          |                            | -> 7-option menu + apply-to-all; auto-    |
+|          |                            | return unless multi-item conflicts.      |
 +----------+----------------------------+------------------------------------------+
 ```
 
