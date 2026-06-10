@@ -1650,11 +1650,11 @@ flowchart TD
     Tgt -->|"no"| Just["copy/move it (no prompt)"]
     Tgt -->|"yes"| Glob{"GLOBAL_MODE set?"}
     Glob -->|"yes"| Apply["apply GLOBAL_MODE"]
-    Glob -->|"no"| One{"single item<br/>(nfiles == 1)?"}
+    Glob -->|"no"| One{"single regular FILE?<br/>(nfiles == 1 and not a dir)"}
     One -->|"yes"| YN["simple y/N:<br/>overwrite 'name'? (nnn original)"]
     YN -->|"y"| Just
     YN -->|"n"| Next2
-    One -->|"no (multiple)"| Show["show sizes + mtimes<br/>show 7-option menu"]
+    One -->|"no (multi-item OR a directory)"| Show["show sizes + mtimes<br/>show 7-option menu"]
     Show --> Read["read choice 1-7"]
     Read --> Do["apply choice"]
     Do --> Rem{"items still<br/>remaining?"}
@@ -1673,9 +1673,11 @@ flowchart TD
     Exit -->|"no"| Auto["auto-return to nnn<br/>(no keypress)"]
 ```
 
-**Three UX rules.** (1) A **single-item** conflict falls back to nnn's original
-**simple `y/N` overwrite** prompt rather than the 7-option menu -- the menu only
-pays off when batching several items. (2) The *apply to ALL* question is only
+**Three UX rules.** (1) A conflict on a **single regular file** falls back to
+nnn's original **simple `y/N` overwrite** prompt; a conflict on a **single
+directory** (or any multi-item op) uses the full 7-option menu, where the
+size/newer/resume/rename modes are genuinely useful across a tree. (2) The
+*apply to ALL* question is only
 meaningful while items remain, so it is **skipped for the last/only item** (and
 thus never appears for a single file). (3) The helper **returns to nnn without a
 keypress** in the common cases (no conflict at all, or a single item); it pauses

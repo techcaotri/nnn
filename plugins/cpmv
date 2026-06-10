@@ -15,12 +15,13 @@
 #
 # stdin is /dev/tty (nnn runs this under spawn F_CLI), so the prompts work.
 #
-# For a SINGLE item, a conflict uses nnn's original simple y/N overwrite prompt.
-# For MULTIPLE items, a conflict shows FileZilla's overwrite options plus a
-# "resume" mode, with an "apply to ALL remaining conflicts" prompt shown only
-# while items still remain. Returns to nnn automatically (no keypress) when there
-# is no conflict or only a single item; pauses for review only after resolving
-# conflicts across several items.
+# For a single regular-FILE conflict, nnn's original simple y/N overwrite prompt
+# is used. For a single DIRECTORY conflict or any MULTIPLE-item conflict, the
+# full FileZilla overwrite options plus a "resume" mode are shown, with an
+# "apply to ALL remaining conflicts" prompt offered only while items still
+# remain. Returns to nnn automatically (no keypress) when there is no conflict or
+# only a single item; pauses for review only after resolving conflicts across
+# several items.
 #
 # Requires: bash, coreutils. rsync is needed for the size-based and resume
 #           modes (3/4/5); without it those modes skip rather than guess.
@@ -145,16 +146,17 @@ for src in "${files[@]}"; do
     if [ ! -e "$target" ]; then do_one "$src" 1; continue; fi
     if [ -n "$GLOBAL_MODE" ]; then do_one "$src" "$GLOBAL_MODE"; continue; fi
 
-    # Single-item conflict: keep nnn's original, simple y/N overwrite prompt
-    # (the full FileZilla menu only pays off when batching several items).
-    if [ "$nfiles" -eq 1 ]; then
+    # A single regular-FILE conflict keeps nnn's original simple y/N prompt.
+    # A single DIRECTORY (or any multi-item op) gets the full FileZilla menu,
+    # where the size / newer / resume / rename modes are useful across a tree.
+    if [ "$nfiles" -eq 1 ] && [ ! -d "$src" ]; then
         printf "overwrite '%s'? [y/N]: " "$(basename -- "$target")"
         read -r yn
         case "$yn" in y|Y|yes|YES) do_one "$src" 1 ;; *) do_one "$src" 7 ;; esac
         continue
     fi
 
-    # Multiple items: full FileZilla per-conflict menu + apply-to-all.
+    # Multiple items, or a single directory: full FileZilla per-conflict menu.
     conflicts=$((conflicts + 1))
     while :; do
         show_conflict "$src" "$target"
