@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+#
+# nnn-history: jump to ANY directory recorded in the shared visit log, across
+# all 8 contexts (tabs), all sessions and all running nnn instances (e.g. the
+# dual left/right TMUX panes).
+#
+# It reads the shared log written by nnn (built with O_HIST=1 and run with
+# NNN_HIST=global) at:
+#     ${XDG_CONFIG_HOME:-$HOME/.config}/nnn/.dirhistory
+# Each line is TSV:  ts_nanos \t instance_id \t session \t ctx \t path
+#
+# The plugin dedups by path (keeping the MOST RECENT visit), shows the list in
+# fzf with the most-recent at the BOTTOM (under the cursor, ready to jump), and
+# cd-s THIS instance to the chosen directory via the nnn control pipe
+# ($NNN_PIPE) -- the same mechanism the zoxide/autojump plugins use, so it works
+# cross-instance with no extra nnn code.
+#
+# Usage:
+#   nnn-history            interactive picker (bind to a key, e.g. ;h via NNN_PLUG)
+#   nnn-history --compact  bound the log to the last $NNN_HIST_CAP unique paths
+#
+# Requires: fzf, awk, coreutils (tac); flock for safe --compact.
+#
+# Authors: Tri Pham
+
+set -u
+
+HIST="${XDG_CONFIG_HOME:-$HOME/.config}/nnn/.dirhistory"
+LOCK="$HIST.lock"
+CAP="${NNN_HIST_CAP:-2000}"
+
+pause() { printf '\n%s' 'Press any key to continue...'; read -r _ </dev/tty 2>/dev/null; }
+
+# Most-recent record per path, newest-first, capped to CAP unique entries.
+dedup_newest_first() {
+    tac -- "$HIST" 2>/dev/null | awk -F'\t' '!seen[$5]++' | head -n "$CAP"
+}
+
+# --- compaction: rewrite the log to the last CAP unique paths (oldest..newest) ---
+if [ "${1:-}" = "--compact" ]; then
+    [ -f "$HIST" ] || exit 0
+    exec 9>"$LOCK" 2>/dev/null || exit 0
+    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null
+    dedup_newest_first | tac > "$HIST.tmp" && mv -f "$HIST.tmp" "$HIST"
+    exit 0
+fi
+
+command -v fzf >/dev/null 2>&1 || { echo "fzf not found in PATH."; pause; exit 1; }
+[ -s "$HIST" ] || { echo "No directory history yet ($HIST)."; pause; exit 0; }
+
+# Opportunistic compaction when the log has grown well past the cap.
+if [ "$(wc -l < "$HIST" 2>/dev/null || echo 0)" -gt $((CAP * 4)) ]; then
+    "$0" --compact 2>/dev/null
+fi
+
+# Build "[session pane ctxN]  /abs/path" lines, newest-first (so the newest lands
+# at the BOTTOM in fzf's default layout), excluding the directory we are already
+# in ($PWD). The label fields never contain '/', so the path is exactly the part
+# from the first '/' -- safe even when paths contain spaces.
+menu=$(dedup_newest_first \
+     | awk -F'\t' -v cur="$PWD" '$5 != cur { printf "[%s %s ctx%s]  %s\n", $3, $2, $4, $5 }')
+[ -z "$menu" ] && { echo "No other directories in history yet."; pause; exit 0; }
+
+chosen=$(printf '%s\n' "$menu" | fzf \
+    --prompt='history > ' \
+    --header=$'ENTER: jump   ESC: cancel   (most-recent at the bottom)' \
+    --preview='printf %s {}' \
+    --preview-window=down,2,wrap) || exit 0
+
+[ -z "$chosen" ] && exit 0
+
+# Extract the absolute path: everything from the first '/' (labels carry no '/').
+dir="/${chosen#*/}"
+
+[ -d "$dir" ] || { printf 'Directory no longer exists:\n  %s\n' "$dir"; pause; exit 1; }
+
+# Jump THIS instance to the chosen directory via the nnn control pipe.
+if [ -n "${NNN_PIPE:-}" ]; then
+    printf '%s' "0c$dir" > "$NNN_PIPE"
+else
+    echo "NNN_PIPE is not set (run this from inside nnn)."; pause; exit 1
+fi
