@@ -1106,6 +1106,115 @@ presentation: it reads `pdents[]`, `cur`, and `cfg`, and writes ncurses cells. I
 never mutates model state, which keeps rendering idempotent and cheap to call on
 every loop iteration.
 
+#### 3.5.11 Delete-to-Trash and Restore (plugin tie-in)
+
+This fork routes deletes to a **trash can** (via `NNN_TRASH`) and adds a
+fuzzy **restore** plugin. It reuses nnn's existing delete plumbing (3.4.6) and
+the plugin/process model -- no core C change is needed for either.
+
+##### 3.5.11.1 Delete -> Trash
+
+`NNN_TRASH=1` (set in the fork's `nnn_config.sh`) makes the `x` / `Ctrl-X`
+delete (`SEL_TRASH`) build its command through `rmmulstr()` /
+`xrm()` ([src/nnn.c:2742](../src/nnn.c#L2742)) using `trash-put` instead of
+`rm -rf`. (`NNN_TRASH=2` uses `gio trash`.) The uppercase `X` (`SEL_RM_RF`)
+remains a permanent `rm -rf` regardless.
+
+```
+ASCII Table 3.5.11: Delete keys under NNN_TRASH=1
++-----------+-------------+----------------------------------------------------+
+| Key       | Action      | Effect                                             |
++-----------+-------------+----------------------------------------------------+
+| x, Ctrl-X | SEL_TRASH   | trash-put -> MOVE into ~/.local/share/Trash/files/ |
+| X         | SEL_RM_RF   | permanent rm -rf (irreversible) -- unaffected      |
++-----------+-------------+----------------------------------------------------+
+```
+
+Key design fact: on the same filesystem, trashing is a **move (rename)** -- the
+inode is preserved and merely relocated under the Trash. This is what makes
+restore lossless, but it also creates a sharp pitfall (3.5.11.3).
+
+##### 3.5.11.2 Restore -- the `my_trash_restore` plugin
+
+[plugins/my_trash_restore](../plugins/my_trash_restore) (bound to `;r` / `Alt-r`)
+delegates entirely to trash-cli's own `trash-restore`, so restoring is 100%
+consistent with how trashing was done (correct `.trashinfo` cleanup, no manual
+inode juggling).
+
+```mermaid
+%% Sequence: fuzzy restore via the my_trash_restore plugin
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant N as nnn
+    participant PL as my_trash_restore
+    participant TR as trash-restore (trash-cli)
+    participant FZ as fzf
+
+    U->>N: press #59;r / Alt-r
+    N->>PL: run plugin
+    PL->>TR: trash-restore --sort=date / (empty stdin -> list only)
+    TR-->>PL: indexed candidates "idx date time path" (oldest..newest)
+    PL->>PL: tac -> newest-first (so newest lands at the BOTTOM in fzf)
+    PL->>FZ: show list (multi-select)
+    U->>FZ: pick item(s)
+    FZ-->>PL: chosen line(s)
+    PL->>PL: take field 1 (the index) of each chosen line
+    PL->>TR: trash-restore --sort=date / with index list
+    TR-->>U: file(s) moved back to original path(s)
+```
+
+**Why index-by-field-1 is robust.** trash-restore assigns each candidate an
+index *in its own sort order*; the plugin lists and restores with the **same**
+`--sort=date`, so the indices are stable across the two calls. Because the index
+travels with each line (field 1), the plugin can **re-order the display freely**
+without affecting which item is restored.
+
+##### Newest-deleted shown at the bottom
+
+`trash-restore --sort=date` lists **oldest -> newest**. fzf's **default layout**
+anchors the *first* input line at the **bottom** of the screen (with the cursor
+on it). To put the most-recently-deleted item there -- the one you most likely
+want to restore -- the plugin pipes the list through `tac` (reverse), making the
+newest the first line:
+
+```
+ASCII Table 3.5.11b: Ordering -> what fzf shows
++----------------------------+-------------------+----------------------------+
+| Plugin input order         | fzf default layout| Net effect                 |
++----------------------------+-------------------+----------------------------+
+| oldest..newest (raw)       | first line=bottom | oldest at bottom (cursor), |
+|                            |                   | newest at top -- BEFORE    |
+| newest..oldest (after tac) | first line=bottom | newest at bottom (cursor), |
+|                            |                   | oldest at top -- AFTER fix |
++----------------------------+-------------------+----------------------------+
+```
+
+##### 3.5.11.3 Pitfall -- a terminal's CWD follows a trashed directory
+
+Because trashing **moves** a directory, any *other* terminal whose working
+directory is inside it silently follows the inode into the Trash (CWD is an open
+inode handle, not a path). The shell builtin `pwd -P` keeps showing the
+(re-created) original path, masking it, so new files land in the Trash unnoticed.
+
+This is inherent Unix behaviour, not an nnn defect, and is fixed shell-side by a
+prompt hook (`cwd-guard`) that detects the inode mismatch and re-attaches. The
+full root-cause analysis, reproduction and fix are documented separately in
+[nnn_Problems_And_Solutions.md, Problem 1](nnn_Problems_And_Solutions.md).
+
+```mermaid
+%% The trashed-CWD pitfall and where the fix lives
+flowchart LR
+    Del["nnn x delete (NNN_TRASH=1)"] --> Mv["trash-put MOVES the dir (rename)"]
+    Mv --> Follow["other terminal's CWD inode<br/>follows it into the Trash"]
+    Follow --> Hidden["builtin pwd -P still shows original<br/>-> new files land in the Trash"]
+    Hidden --> Guard["cwd-guard prompt hook detects<br/>inode mismatch and re-attaches"]
+    Guard --> Fixed["fixed (see nnn_Problems_And_Solutions.md)"]
+```
+
+**Caveat (tooling).** The comma-separated multi-restore needs trash-cli
+`>= ~0.22`; this machine runs `0.24.5.26`, so single and multi restore both work.
+
 ---
 
 ### 3.6 Keyboard and Input Event Handling (Deep Dive)
@@ -1640,6 +1749,12 @@ ASCII Table 5: How the fork features map onto this design
 |          |                            | -> simple y/N; single dir or multi-item  |
 |          |                            | -> 7-option menu + apply-to-all; auto-    |
 |          |                            | return unless multi-item conflicts.      |
+| Trash +  | Delete plumbing (3.4.6) +  | NNN_TRASH=1 routes x/Ctrl-X to trash-put |
+| restore  | Plugins/Process (3.5.9,    | (no C change). my_trash_restore plugin   |
+|          | 3.5.11)                    | lists via trash-restore, fzf-picks, and  |
+|          |                            | restores by index; newest shown at the   |
+|          |                            | bottom (tac). Trashed-CWD pitfall fixed  |
+|          |                            | shell-side (see Problems doc).           |
 +----------+----------------------------+------------------------------------------+
 ```
 
