@@ -3631,10 +3631,28 @@ static size_t dnd_b64(const uchar_t *in, size_t len, char *out)
 
 /* Write one NUL-terminated OSC-72 sequence to the tty, wrapping it in tmux's
  * DCS passthrough (every ESC doubled) when running inside tmux. */
+/* write() all n bytes, retrying short/interrupted writes (a partial write
+ * here would truncate the base64 payload and make the terminal reject it). */
+static void dnd_full_write(const char *p, size_t n)
+{
+	while (n) {
+		ssize_t w = write(STDOUT_FILENO, p, n);
+
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (w == 0)
+			break;
+		p += w;
+		n -= (size_t)w;
+	}
+}
+
 static void dnd_osc72_write(const char *seq)
 {
 	size_t len = strlen(seq);
-	ssize_t wr;
 
 	if (dnd_in_tmux()) {
 		size_t cap = len * 2 + 16, o = 7, i;
@@ -3650,12 +3668,10 @@ static void dnd_osc72_write(const char *seq)
 		}
 		w[o++] = '\x1b';
 		w[o++] = '\\';
-		wr = write(STDOUT_FILENO, w, o);
+		dnd_full_write(w, o);
 		free(w);
 	} else
-		wr = write(STDOUT_FILENO, seq, len);
-
-	(void)wr;
+		dnd_full_write(seq, len);
 }
 
 /* Append a line to $NNN_DND_DEBUG (a file path, or /tmp/nnn-dnd.log if "1").
@@ -3779,36 +3795,90 @@ static bool dnd_prepare_data(void)
 	return (g_dnd_b64len > 0);
 }
 
-/* Send the prepared base64 data, chunked at 4096, with the given metadata
- * prefix ("t=p:x=0" to pre-send, "t=e:y=0" to answer a data request). */
-static void dnd_osc72_data(const char *prefix)
+/* Build the full offer response (agree + present + start) in ONE buffer and
+ * write it atomically. kitty needs these together to "build" the drag source,
+ * and a single tmux-passthrough wrap avoids inter-message races. */
+static void dnd_osc72_offer(void)
 {
-	size_t off = 0;
-	char end[64];
+	size_t chunks, cap, len = 0, off = 0;
+	char *b;
 
+	if (g_dnd_b64) { /* a drag is already being built/in flight */
+		dnd_log("offer ignored (drag already active)");
+		return;
+	}
+	if (!dnd_prepare_data()) {
+		dnd_log("offer -> nothing to drag");
+		return;
+	}
+
+	chunks = g_dnd_b64len / 4096 + 1;
+	cap = g_dnd_b64len + chunks * 48 + 256;
+	b = malloc(cap);
+	if (!b)
+		return;
+
+	/* agree-drag: copy or move, offering text/uri-list */
+	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=o:o=3;text/uri-list\x1b\\");
+	/* pre-send the data for MIME index 0, chunked at 4096 base64 bytes */
 	while (off < g_dnd_b64len) {
 		size_t n = g_dnd_b64len - off;
-		int more, p;
-		char *m;
+		int more;
 
 		if (n > 4096)
 			n = 4096;
 		more = (off + n < g_dnd_b64len);
-
-		m = malloc(strlen(prefix) + n + 48);
-		if (!m)
-			return;
-		p = snprintf(m, strlen(prefix) + 32, "\x1b]72;%s:m=%d;", prefix, more);
-		memcpy(m + p, g_dnd_b64 + off, n);
-		m[p + n] = '\x1b';
-		m[p + n + 1] = '\\';
-		m[p + n + 2] = '\0';
-		dnd_osc72_write(m);
-		free(m);
+		len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=p:x=0:m=%d;", more);
+		memcpy(b + len, g_dnd_b64 + off, n);
+		len += n;
+		b[len++] = '\x1b';
+		b[len++] = '\\';
 		off += n;
 	}
-	snprintf(end, sizeof end, "\x1b]72;%s:m=0\x1b\\", prefix); /* end: empty payload */
-	dnd_osc72_write(end);
+	/* end-of-data marker (no payload), then start the drag */
+	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=p:x=0\x1b\\");
+	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=P:x=-1\x1b\\");
+	b[len] = '\0';
+
+	dnd_osc72_write(b);
+	free(b);
+	dnd_log("offer -> agree + present + start (batched)");
+}
+
+/* Answer a t=e:x=5 data request with the prepared data, in one atomic write. */
+static void dnd_osc72_send_request(void)
+{
+	size_t chunks, cap, len = 0, off = 0;
+	char *b;
+
+	if (!g_dnd_b64)
+		return;
+	chunks = g_dnd_b64len / 4096 + 1;
+	cap = g_dnd_b64len + chunks * 48 + 64;
+	b = malloc(cap);
+	if (!b)
+		return;
+
+	while (off < g_dnd_b64len) {
+		size_t n = g_dnd_b64len - off;
+		int more;
+
+		if (n > 4096)
+			n = 4096;
+		more = (off + n < g_dnd_b64len);
+		len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=e:y=0:m=%d;", more);
+		memcpy(b + len, g_dnd_b64 + off, n);
+		len += n;
+		b[len++] = '\x1b';
+		b[len++] = '\\';
+		off += n;
+	}
+	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=e:y=0:m=0\x1b\\"); /* end */
+	b[len] = '\0';
+
+	dnd_osc72_write(b);
+	free(b);
+	dnd_log("data request -> sent (batched)");
 }
 
 /* Handle one inbound OSC-72 event body (the bytes after the leading "72;"). */
@@ -3832,20 +3902,13 @@ static void dnd_osc72_event(const char *body)
 	}
 
 	switch (t) {
-	case 'o': /* inbound drag offer -> agree, pre-send data, start */
-		if (dnd_prepare_data()) {
-			dnd_osc72_write("\x1b]72;t=o:o=3;text/uri-list\x1b\\");
-			dnd_osc72_data("t=p:x=0");
-			dnd_osc72_write("\x1b]72;t=P:x=-1\x1b\\");
-			dnd_log("offer -> agree + present + start");
-		} else
-			dnd_log("offer -> nothing to drag");
+	case 'o': /* inbound drag offer -> respond with one atomic batch */
+		dnd_osc72_offer();
 		break;
 	case 'e': /* drag status */
-		if (x == 5) { /* terminal requests the data */
-			dnd_osc72_data("t=e:y=0");
-			dnd_log("data request -> sent");
-		} else if (x == 4) { /* drag finished */
+		if (x == 5) /* terminal requests the data */
+			dnd_osc72_send_request();
+		else if (x == 4) { /* drag finished */
 			dnd_clear_data();
 			dnd_log("drag finished");
 		}
