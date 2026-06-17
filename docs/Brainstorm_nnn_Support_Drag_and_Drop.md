@@ -45,11 +45,23 @@
   - 3.12 Wayland Strategy (Optional)
   - 3.13 Security, Edge Cases, Error Handling
   - 3.14 Build and Packaging
-- 4. Step-by-Step Implementation Guidelines
-- 5. Summary and Traceability
+- 4. Step-by-Step Implementation Guidelines (Approach B)
+- 5. Deep Dive: The kitty OSC-72 Approach (with tmux passthrough)
+  - 5.1 How It Differs From the Helper Approach
+  - 5.2 The OSC-72 Escape Code
+  - 5.3 Drag-OUT Flow (Source)
+  - 5.4 Drop-IN Flow (Target)
+  - 5.5 tmux (and Multiplexer) Passthrough
+  - 5.6 Terminal Detection and Approach Selection
+  - 5.7 nnn Core Integration
+  - 5.8 Class / Function Summary
+  - 5.9 Limitations and Honest Caveats
+- 6. Step-by-Step Implementation Guidelines (kitty OSC-72 + tmux)
+- 7. Summary and Traceability
 - Appendix A: XDND Atom and Message Reference
 - Appendix B: `nnn-dnd` CLI Reference
 - Appendix C: Source Map (where each change lands)
+- Appendix D: kitty OSC-72 Metadata Reference
 
 ---
 
@@ -415,22 +427,28 @@ flowchart LR
 ```
 
 **Explanation.** Copy Yazi's 2026 native path: nnn writes OSC 72 escape codes and
-the terminal performs the DnD. Elegant and works over SSH -- but it is bound to a
-single emulator family (kitty today) and is **terminal-specific, not
-X11-specific**, so it does not serve the X11-first goal and silently does nothing
-on the user's actual terminals. Good as a *future optional enhancement*, not the
-baseline.
+the terminal performs the DnD. Elegant, dependency-free, and it works **over SSH**
+and **inside tmux** (via passthrough). It is bound to one emulator family (kitty
+today#59; Ghostty has accepted it), so it cannot be the sole baseline -- but it is an
+excellent **complement** to Approach B: when the terminal speaks OSC-72, nnn drags
+out with zero helper process and zero X11 link#59; otherwise it falls back to the
+helper. **This revision treats it as a first-class complementary path -- see the
+deep dive in Section 5 and the implementation guide in Section 6** (covering tmux
+`allow-passthrough` wrapping and the protocol's `i`-key multiplexer support).
 
 ```
 ASCII Table 2.4: Approach D
-+-------+----------------------------------------------------------------------+
-| Pros  | - Genuinely in-process #59; no helper, works over SSH.                |
-|       | - Tiny code (escape-sequence I/O).                                     |
-+-------+----------------------------------------------------------------------+
-| Cons  | - kitty-only today (Ghostty pending) #59; useless elsewhere.          |
-|       | - Not X11-aligned (it is emulator-aligned) -- misses C1.             |
-|       | - User would have to switch terminals to benefit.                     |
-+-------+----------------------------------------------------------------------+
++------+-----------------------------------------------------------------------+
+|      | Notes                                                                 |
++------+-----------------------------------------------------------------------+
+| Pros | - Genuinely in-process#59; no helper, no libX11, works over SSH.      |
+|      | - Works inside tmux (outbound) via passthrough#59; tiny code.         |
+|      | - Display-server agnostic (X11 or Wayland -- whatever kitty runs on). |
+| Cons | - kitty-only today (Ghostty accepted)#59; a no-op elsewhere.          |
+|      | - Inside tmux only drag-OUT works#59; drop-IN needs inbound events    |
+|      |   that tmux does not yet route to the pane.                           |
+|      | - Best as a complement to Approach B, not a replacement.              |
++------+-----------------------------------------------------------------------+
 ```
 
 ### 2.5 Approach E: In-TUI Mouse-Drag Gesture
@@ -490,6 +508,12 @@ keeps the default build dependency-free, is the most *native* of all options, an
 can **fall back to Approach A** (dragon/ripdrag) when the helper is not built and
 to **Approach C/D** as future options. B is therefore both the best fit and a
 superset architecture. The rest of this document deep-dives Approach B.
+
+**Update (this revision).** Approach D (kitty OSC-72) is promoted from "future
+option" to a **recommended complement**. On terminals that implement the protocol
+it is the lightest path and the only one that works over SSH, and it coexists with
+the helper (use OSC-72 when available, the helper otherwise). Its deep dive is
+Section 5 and its implementation guide is Section 6, including tmux passthrough.
 
 ---
 
@@ -1202,7 +1226,354 @@ maps to a single focused commit.
 
 ---
 
-## 5. Summary and Traceability
+## 5. Deep Dive: The kitty OSC-72 Approach (with tmux passthrough)
+
+Approach D, promoted to a first-class **complement** of the helper. Where Approach
+B puts a window-owning helper process next to nnn, the OSC-72 approach makes **nnn
+itself** the drag source: it writes escape codes to its own terminal and the
+**terminal emulator** performs the real windowing-system drag-and-drop. No helper
+process, no libX11, and -- crucially -- it works **over SSH** and **inside tmux**.
+The cost: it only works on terminals that implement kitty's Drag-and-Drop protocol
+(kitty >= 0.47.1 today#59; Ghostty has accepted it). It is verified ground truth
+from kitty's spec (`OSC 72 ; metadata ; payload ST`) and Yazi's implementation.
+
+
+### 5.1 How It Differs From the Helper Approach
+
+```
+ASCII Table 5.1: Helper (Approach B) vs kitty OSC-72 (this approach)
++----------------------+-----------------------------+--------------------------------+
+| Aspect               | Approach B (nnn-dnd helper) | kitty OSC-72 (this approach)   |
++----------------------+-----------------------------+--------------------------------+
+| Owns the DnD window  | the helper process (libX11) | the terminal emulator          |
+| Extra dependency     | libX11 (opt-in build)       | none (writes to the tty)       |
+| Works over SSH       | no (needs a local display)  | yes (rides the pty stream)     |
+| Terminal requirement | any X11 terminal            | kitty >= 0.47.1                |
+| Display server       | X11 (Wayland via XWayland)  | agnostic (whatever kitty uses) |
+| Inside tmux          | works (its own window)      | drag-OUT via passthrough       |
+| Drag OUT             | yes                         | yes                            |
+| Drop IN              | yes                         | yes (limited inside tmux)      |
+| Process model        | fork + detached window      | in-process escape writes       |
++----------------------+-----------------------------+--------------------------------+
+```
+
+```mermaid
+%% Who performs the real drag-and-drop in each approach
+flowchart LR
+    subgraph HelperWay["Approach B (window-owning helper)"]
+        Nnn1["nnn (TUI)"] -->|"spawn"| Helper["nnn-dnd window (libX11)"]
+        Helper -->|"XDND handshake"| App1["GUI app"]
+    end
+    subgraph OscWay["kitty OSC-72 (this approach)"]
+        Nnn2["nnn (TUI)"] -->|"OSC 72 escape codes on the tty"| Kitty["kitty terminal"]
+        Kitty -->|"real OS drag-and-drop"| App2["GUI app"]
+    end
+```
+
+**Explanation.** Both approaches still obey the iron rule of Section 1.2 -- a TUI
+owns no window -- they just delegate to a different window owner. Approach B
+delegates to a helper **process** it spawns#59; the OSC-72 approach delegates to the
+**terminal emulator** it is already talking to. The latter needs no new process and
+no display connection, which is why it alone survives an SSH hop, but it depends on
+the terminal implementing the protocol. They compose: prefer OSC-72 when available,
+fall back to the helper otherwise.
+
+
+### 5.2 The OSC-72 Escape Code
+
+```
+ASCII Table 5.2: OSC-72 escape-code structure
++-----------------+----------------------------------------------------------+
+| Part            | Value                                                    |
++-----------------+----------------------------------------------------------+
+| Full form       | OSC 72 ; metadata ; payload ST                           |
+| OSC             | ESC ] = bytes 0x1b 0x5d                                  |
+| ST (terminator) | ESC backslash = bytes 0x1b 0x5c                          |
+| metadata        | colon-separated key=value pairs, e.g. t=o:x=1:i=7        |
+| payload         | meaning depends on metadata; base64 when binary          |
+| size limit      | payload <= 4096 bytes (after base64)                     |
+| chunking        | larger payloads split; every non-final chunk carries m=1 |
++-----------------+----------------------------------------------------------+
+```
+
+**Explanation.** A single escape-code family carries the whole protocol. The `t`
+key selects the message (offer / accept / present / start / request)#59; `o`
+encodes the operation (copy/move/either)#59; `x` is an index or enable/disable flag#59;
+`m=1` marks a non-final chunk#59; and `i` is an id used for multiplexer routing
+(Section 5.5). The full key reference is in Appendix D.
+
+
+### 5.3 Drag-OUT Flow (Source)
+
+
+```mermaid
+%% Drag OUT via OSC-72: nnn emits escape codes, kitty performs the real drag
+sequenceDiagram
+    autonumber
+    participant N as nnn core (D key)
+    participant K as kitty terminal
+    participant G as GUI app (drop target)
+    Note over N: build text/uri-list of the selection #59; base64 encode
+    N->>K: enable drag offering (t=o:x=1)
+    N->>K: agree-drag copy or move (t=o:o=3) + text/uri-list
+    N->>K: present data (t=p:x=0) base64 uri-list
+    N->>K: start the drag (t=P:x=-1)
+    Note over K,G: user drags from the terminal window onto the app
+    K->>G: real OS drag-and-drop (XDND or Wayland)
+    K-->>N: drag end / status (optional inbound)
+```
+
+**Explanation.** nnn enables drag offering, advertises the operation and MIME type
+(`text/uri-list`), **presents the data up front**, then starts the drag. Presenting
+the data immediately (the same choice Yazi makes) means the terminal never has to
+ask nnn for it later, so the flow is essentially **outbound only** -- which is
+exactly what lets it traverse tmux (Section 5.5). The terminal then owns the pointer
+drag and the OS-level handshake#59; nnn does not block and owns no window.
+
+
+### 5.4 Drop-IN Flow (Target)
+
+
+```mermaid
+%% Drop IN via OSC-72: kitty sends inbound events with the dropped data
+sequenceDiagram
+    autonumber
+    participant G as GUI app (drag source)
+    participant K as kitty terminal
+    participant N as nnn core
+    N->>K: accept drops (t=a) text/uri-list
+    Note over G,K: user drags files onto the terminal window
+    K-->>N: DropEnter (x, y, op, mimes)
+    N->>K: agree-drop copy (t=m:o=1) text/uri-list
+    K-->>N: DropReady
+    N->>K: request dropped data (t=r:x=0)
+    K-->>N: DropArrive (idx, base64 data)
+    N->>K: finish copy (t=r:o=1)
+    Note over N: decode the uri-list, add to selection / list
+```
+
+**Explanation.** Drop-IN is inherently **bidirectional**: nnn must read inbound
+OSC-72 events (`DropEnter`, `DropReady`, `DropArrive`) from its own input stream and
+reply. That is straightforward on bare kitty, but it is the part that does **not**
+survive tmux today (Section 5.5), so the design keeps drop-IN on the helper/plugin
+path inside multiplexers.
+
+
+### 5.5 tmux (and Multiplexer) Passthrough
+
+
+```mermaid
+%% Outbound OSC-72 must be wrapped for tmux #59; inbound is not routed back
+flowchart LR
+    Seq["raw OSC 72 sequence<br/>ESC ] 72 then metadata then ST"] --> Q{"inside tmux?<br/>($TMUX is set)"}
+    Q -->|"no"| Direct["write the sequence straight to the tty"]
+    Q -->|"yes"| Dcs["wrap in tmux DCS passthrough<br/>double every ESC byte<br/>requires allow-passthrough on"]
+    Direct --> Term["kitty performs the drag"]
+    Dcs --> Term
+```
+
+```
+ASCII Table 5.5: tmux passthrough behaviour for OSC-72
++----------------------------+--------------------------------------+---------------------------------+
+| Direction                  | Mechanism                            | Works in tmux today?            |
++----------------------------+--------------------------------------+---------------------------------+
+| Outbound (nnn to terminal) | DCS passthrough wrapper, ESC doubled | yes, with allow-passthrough on  |
+| Inbound (terminal to nnn)  | tmux must route OSC-72 by the i key  | no (tmux has no OSC-72 routing) |
++----------------------------+--------------------------------------+---------------------------------+
+```
+
+**Explanation.** Two asymmetric facts decide what is possible inside a multiplexer.
+**Outbound**, tmux swallows raw escape codes, so nnn must wrap each OSC-72 sequence
+in tmux's Device Control String passthrough -- `ESC P tmux ;` then the payload with
+**every ESC byte doubled**, then `ST` -- and the user must set `allow-passthrough on`
+(tmux 3.3+). **Inbound**, tmux does not forward unknown OSC-72 events from the outer
+terminal to the pane. kitty's protocol anticipates this with the `i` (id) key: the
+app stamps `i=<id>` and the terminal echoes it on every reply so a multiplexer can
+route it to the right client -- but **tmux must implement that routing**, and it does
+not yet. Net result: **drag-OUT works in tmux** (outbound, data presented up front)#59;
+**drop-IN and the `t=q` detection query do not** -- those fall back to the helper.
+
+
+### 5.6 Terminal Detection and Approach Selection
+
+
+```mermaid
+%% Choose the drag-out mechanism at runtime
+flowchart TD
+    Start["D pressed: drag out"] --> InTmux{"inside tmux?"}
+    InTmux -->|"yes"| KT{"kitty underneath?<br/>(env hint or config)"}
+    InTmux -->|"no"| KD{"kitty?<br/>($KITTY_WINDOW_ID or TERM)"}
+    KT -->|"yes"| OscT["emit OSC-72 via tmux passthrough"]
+    KT -->|"no"| Help["use nnn-dnd helper (Approach B)"]
+    KD -->|"yes"| OscD["emit OSC-72 directly"]
+    KD -->|"no"| Help
+    Help -->|"absent"| Plug["dragdrop plugin / dragon"]
+```
+
+**Explanation.** Detection is **heuristic** because the reliable handshake (the
+`t=q` query and its reply) needs an inbound response that tmux will not deliver.
+On bare kitty, `$KITTY_WINDOW_ID` is set and `TERM` is usually `xterm-kitty`. Inside
+tmux, `TERM` is rewritten to `screen`/`tmux-256color`, so nnn relies on an explicit
+opt-in (an `NNN_DND_OSC72=1` env hint or config) plus `$TMUX`. When nothing
+indicates OSC-72 support, nnn simply uses the helper -- the feature degrades, it
+never breaks.
+
+
+### 5.7 nnn Core Integration
+
+
+```mermaid
+%% Where the OSC-72 path hooks into the existing core action
+flowchart TD
+    Case["case SEL_DRAGDROP"] --> Dir{"drag out or receive?"}
+    Dir -->|"drag out"| Pref{"OSC-72 terminal<br/>available?"}
+    Pref -->|"yes"| Emit["emit_osc72_drag(selection)<br/>in-process, no fork, no helper"]
+    Pref -->|"no"| Helper["spawn nnn-dnd helper (Approach B)"]
+    Dir -->|"receive"| Recv["dragdrop plugin via NNN_PIPE"]
+    Emit --> Done["return to the browse loop"]
+    Helper --> Done
+```
+
+**Explanation.** The OSC-72 path is a small branch added **before** the helper spawn
+inside the existing `SEL_DRAGDROP` handler: if the terminal is OSC-72 capable and
+the direction is drag-out, nnn emits the escape codes in-process and returns -- no
+fork, no helper window. Everything else (no support, or the receive direction) keeps
+the Section 3 behaviour. The change is additive and guarded, so non-kitty users are
+unaffected.
+
+
+### 5.8 Class / Function Summary
+
+```
+ASCII Table 5.8: New functions for the OSC-72 path (all in src/nnn.c)
++----------------------+----------------------------------------------------------+
+| Function             | Responsibility                                           |
++----------------------+----------------------------------------------------------+
+| dnd_osc72_capable()  | Heuristic: is the terminal OSC-72 capable (env hints)?   |
+| dnd_osc72_write()    | Write one OSC-72 sequence; wrap in tmux DCS if $TMUX set |
+| dnd_b64()            | base64-encode the uri-list payload                       |
+| dnd_build_uri_list() | selection / hovered file -> text/uri-list (file:// URIs) |
+| dnd_osc72_drag()     | emit enable + agree-drag + present + start (chunked)     |
++----------------------+----------------------------------------------------------+
+```
+
+**Explanation.** Unlike Approach B (a whole new file), the OSC-72 path is a handful
+of small static functions inside `src/nnn.c` -- it is just string building and
+`write()` to the tty. No new link dependency, so it can be **always compiled in**
+(it is inert unless the terminal supports the protocol).
+
+
+### 5.9 Limitations and Honest Caveats
+
+```
+ASCII Table 5.9: Limitations of the OSC-72 approach
++-------------------------+------------------------------------------------------------------+
+| Limitation              | Consequence / mitigation                                         |
++-------------------------+------------------------------------------------------------------+
+| kitty-only today        | Ghostty accepted but unshipped; no-op elsewhere -> fall back     |
+| tmux drop-IN            | inbound events are not routed -> drop-IN uses the helper in tmux |
+| detection is heuristic  | t=q reply cannot cross tmux -> rely on env hint / opt-in         |
+| writing while in curses | escape codes go to the tty; force a redraw afterwards            |
+| role                    | a complement to Approach B, never the sole baseline              |
++-------------------------+------------------------------------------------------------------+
+```
+
+**Explanation.** The honest summary: this is the **best** path when it is available
+(in-process, SSH-friendly, zero dependencies) and a **no-op** when it is not. Pairing
+it with Approach B gives the widest coverage: OSC-72 for kitty users (including over
+SSH and, for drag-out, inside tmux), the libX11 helper for every other X11 setup.
+
+
+---
+
+## 6. Step-by-Step Implementation Guidelines (kitty OSC-72 + tmux)
+
+No timeline -- an ordered, verifiable path. The whole feature lives in `src/nnn.c`
+(no new file, no new link dependency) and hooks into the existing `SEL_DRAGDROP`
+handler from Section 3.5. Each step ends with a check and maps to one focused commit.
+
+
+### Step 0: Branch and baseline
+- Build the current tree (`make O_DND=1`) to confirm a clean baseline.
+- **Check:** `./nnn -V` runs; the existing helper-based `D` key still works.
+
+
+### Step 1: Terminal and multiplexer detection
+- Add `static bool dnd_in_tmux(void)` -> `getenv("TMUX") != NULL`.
+- Add `static bool dnd_osc72_capable(void)`: true if `getenv("NNN_DND_OSC72")`
+  is set to `1`, OR `getenv("KITTY_WINDOW_ID")` is set, OR `TERM` contains
+  `kitty`. (Inside tmux, prefer the explicit `NNN_DND_OSC72=1` opt-in because
+  `TERM` is rewritten.)
+- **Check:** print the result behind a debug env var in kitty, kitty+tmux, xterm.
+
+
+### Step 2: The OSC-72 writer (with tmux passthrough)
+- Add `static void dnd_osc72_write(const char *seq, size_t len)`.
+  - Not in tmux: `write()` the bytes straight to the controlling tty.
+  - In tmux: emit `ESC P tmux ;`, then the payload with **every `0x1b` byte
+    doubled**, then `ESC backslash`. Document that `allow-passthrough on` is
+    required (tmux 3.3+).
+- Write to the terminal fd, then force an ncurses redraw so the UI is intact.
+- **Check:** in kitty, `printf` an `OSC 72 ; t=q ST` style probe via this writer
+  and confirm the bytes reach the terminal (e.g. `cat -v` a captured stream).
+
+
+### Step 3: base64 + uri-list builders
+- Add a small `dnd_b64()` (standard base64, no external dep).
+- Add `dnd_build_uri_list()`: for the selection (or the hovered file when none),
+  emit `file://` + percent-encoded absolute path + CRLF per entry -- the same
+  format the helper already uses (reuse the logic/tests from Approach B).
+- **Check:** unit-style print of the uri-list for a multi-file selection.
+
+
+### Step 4: The drag-OUT emitter
+- Add `static void dnd_osc72_drag(const char *uri_list, size_t len)` that emits,
+  in order, via `dnd_osc72_write()`:
+  1. enable drag offering: `OSC 72 ; t=o:x=1 ; <machine-id> ST`
+  2. agree-drag (either copy or move): `OSC 72 ; t=o:o=3 ; text/uri-list ST`
+  3. present data: `OSC 72 ; t=p:x=0 ; <base64 uri-list> ST` (chunk at 4096,
+     non-final chunks carry `m=1`)
+  4. start the drag: `OSC 72 ; t=P:x=-1 ST`
+- **Check:** on bare kitty, press the key and drag the terminal onto a file
+  manager -- the file copies. (Manual test -- see the matrix in Step 7.)
+
+
+### Step 5: Wire into the core SEL_DRAGDROP action
+- In the `case SEL_DRAGDROP` drag-out branch, **before** the helper spawn:
+  `if (dnd_osc72_capable()) { dnd_osc72_drag(...); statusbar(path); goto nochange; }`
+- Otherwise fall through to the Section 3.5 helper/plugin path unchanged.
+- Keep it always-compiled (no new dependency); it is inert on non-kitty terminals.
+- **Check:** `make`; on kitty the `D` key drags via OSC-72, on xterm it uses the
+  helper, with no behaviour change for the latter.
+
+
+### Step 6 (optional): Drop-IN via inbound OSC-72
+- Only attempt outside tmux. Send `OSC 72 ; t=a ; text/uri-list ST`, then parse
+  inbound `OSC 72` events (`DropEnter`/`DropReady`/`DropArrive`) from nnn's input,
+  reply with `t=m`/`t=r`, decode the uri-list, and feed it into the selection.
+- This is invasive (it taps the input stream); inside tmux keep drop-IN on the
+  helper/plugin. Defer unless bare-kitty drop-IN is required.
+- **Check:** on bare kitty, drag a file onto the terminal -> it enters the selection.
+
+
+### Step 7: Build and manual test matrix
+- Compile clean with nnn's flags (`-std=c11 -Wall -Wextra -Wshadow`).
+- Matrix to record: (a) bare kitty drag-OUT to a file manager / browser / editor;
+  (b) kitty + tmux with `allow-passthrough on` drag-OUT; (c) kitty + tmux WITHOUT
+  passthrough (must no-op gracefully or fall back); (d) non-kitty terminal (must
+  use the helper); (e) multi-file selection; (f) names with spaces / unicode.
+- **Check:** all rows behave as designed; failures captured with a debug trace.
+
+
+### Step 8: Docs and config
+- Document the OSC-72 path, the `NNN_DND_OSC72` hint, and the tmux
+  `set -g allow-passthrough on` requirement in the man page and help.
+- **Check:** docs read correctly and cross-reference Sections 5 and 6.
+
+
+---
+
+## 7. Summary and Traceability
 
 ```
 ASCII Table 5: Requirement -> design -> implementation traceability
@@ -1326,3 +1697,44 @@ ASCII Table C.1: Files touched
 all the protocol complexity, the core change is two lines of table plus one
 handler case, and the Makefile change is a single opt-in flag. This keeps the
 feature reviewable and keeps the default nnn exactly as it is today.
+
+## Appendix D: kitty OSC-72 Metadata Reference
+
+```
+ASCII Table D.1: OSC-72 metadata keys used by nnn
++-------+-------------------+--------------------------------------------------------------------------+
+| Key   | Meaning           | Example values                                                           |
++-------+-------------------+--------------------------------------------------------------------------+
+| t     | message type      | o offer, a accept, m drop-status, p present, P start, r request, q query |
+| x     | index or flag     | x=1 enable / x=2 disable / x=idx / x=-1 start                            |
+| o     | operation         | 1 copy, 2 move, 3 either, 0 reject (context dependent)                   |
+| m     | more chunks       | m=1 on every non-final chunk of a payload                                |
+| i     | id for routing    | echoed by the terminal so a multiplexer can route replies                |
+| y     | icon format       | used only with the drag-icon present message                             |
+| X / Y | icon width/height | used only with the drag-icon present message                             |
++-------+-------------------+--------------------------------------------------------------------------+
+```
+
+```
+ASCII Table D.2: Key outbound sequences (app -> terminal)
++-------------------+------------------------------------+
+| Purpose           | Sequence (between OSC 72 ; and ST) |
++-------------------+------------------------------------+
+| enable drag       | t=o:x=1 ; <machine-id>             |
+| agree-drag        | t=o:o=<1|2|3> ; <mime list>        |
+| present data      | t=p:x=<idx>[:m=1] ; <base64>       |
+| start drag        | t=P:x=-1                           |
+| accept drops      | t=a ; <mime list>                  |
+| agree-drop        | t=m:o=<0|1|2>[ ; <mime list>]      |
+| request drop data | t=r:x=<idx>                        |
+| finish drop       | t=r:o=<1|2>                        |
+| query support     | t=q[:i=<id>]                       |
++-------------------+------------------------------------+
+```
+
+**Explanation.** OSC is `ESC ]` and ST is `ESC backslash`. Metadata is a
+colon-separated list of `key=value` pairs; the payload follows the second `;`.
+Binary payloads are base64-encoded and chunked at 4096 bytes with `m=1` on every
+non-final chunk. Source: kitty's Drag-and-Drop protocol spec and Yazi's
+`yazi-term` emitter/parser. These are the exact forms nnn emits in Section 6.
+
