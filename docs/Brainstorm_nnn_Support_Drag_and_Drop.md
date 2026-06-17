@@ -1237,6 +1237,24 @@ The cost: it only works on terminals that implement kitty's Drag-and-Drop protoc
 (kitty >= 0.47.1 today#59; Ghostty has accepted it). It is verified ground truth
 from kitty's spec (`OSC 72 ; metadata ; payload ST`) and Yazi's implementation.
 
+> **Implementation status / correction (2026).** A first cut wired drag-out to
+> the `D` keypress and was reverted. kitty's drag-out is **mouse-gesture-driven
+> and bidirectional**, not app-initiated: the app only *declares* it can be a
+> source (`t=o:x=1`, once at startup); the **user's mouse drag** on the terminal
+> makes kitty send an inbound `t=o` *offer*, which the app must answer with
+> agree -> present -> start. A keypress `StartDrag` with no live gesture returns
+> `t=E ; EPERM` ("permission to start drag denied... user has already released"),
+> and unconsumed inbound events print as garbage. A correct implementation
+> therefore needs: (1) enable-offering at init, (2) an **inbound OSC-72 parser**
+> tapping nnn's ncurses input stream, and (3) event-driven responses. **Yazi
+> confirms this is the only way**: it sends `EnableDrag`/`EnableDrop` once at
+> startup (`yazi-tui/src/raterm.rs`), parses inbound OSC-72 in its own `yazi-term`
+> crate -- a `State::Osc72` parser it built by **replacing Crossterm** (issue
+> #3910) -- and calls `offer_uri_list` (agree+present+start) only in response to
+> an inbound offer (`components/current.lua`: `Current:drag(event)` when
+> `event.type == "offer"`). The diagrams in 5.3-5.4 below show this corrected,
+> mouse-driven flow. The libX11 helper (Approach B) already covers kitty
+> **locally**; OSC-72's unique benefit is **drag-out over SSH**.
 
 ### 5.1 How It Differs From the Helper Approach
 
@@ -1307,28 +1325,31 @@ encodes the operation (copy/move/either)#59; `x` is an index or enable/disable f
 
 
 ```mermaid
-%% Drag OUT via OSC-72: nnn emits escape codes, kitty performs the real drag
+%% Drag OUT via OSC-72 (corrected): gesture-driven and bidirectional
 sequenceDiagram
     autonumber
-    participant N as nnn core (D key)
+    participant N as nnn core
     participant K as kitty terminal
     participant G as GUI app (drop target)
-    Note over N: build text/uri-list of the selection #59; base64 encode
-    N->>K: enable drag offering (t=o:x=1)
+    Note over N: at startup -- enable offering (t=o:x=1)
+    Note over K: user holds the mouse and drags on the terminal
+    K-->>N: inbound offer (t=o with cell x, y)
+    Note over N: map cell to file row #59; build text/uri-list #59; base64
     N->>K: agree-drag copy or move (t=o:o=3) + text/uri-list
     N->>K: present data (t=p:x=0) base64 uri-list
     N->>K: start the drag (t=P:x=-1)
-    Note over K,G: user drags from the terminal window onto the app
+    K-->>N: status (t=e) or t=E (OK / EPERM)
     K->>G: real OS drag-and-drop (XDND or Wayland)
-    K-->>N: drag end / status (optional inbound)
 ```
 
-**Explanation.** nnn enables drag offering, advertises the operation and MIME type
-(`text/uri-list`), **presents the data up front**, then starts the drag. Presenting
-the data immediately (the same choice Yazi makes) means the terminal never has to
-ask nnn for it later, so the flow is essentially **outbound only** -- which is
-exactly what lets it traverse tmux (Section 5.5). The terminal then owns the pointer
-drag and the OS-level handshake#59; nnn does not block and owns no window.
+**Explanation (corrected).** The app cannot start a drag on its own. nnn enables
+offering **once at startup** (`t=o:x=1`). The drag is initiated by the **user's
+mouse gesture** on the terminal#59; kitty then sends nnn an **inbound `t=o` offer**
+carrying the start cell. Only then does nnn map that cell to the file row, build the
+`text/uri-list`, and reply agree -> present -> start. If the gesture has already
+ended, kitty answers `t=E ; EPERM`. Because the flow needs those **inbound** events,
+nnn must parse OSC-72 from its input stream (5.7), and inside tmux the inbound leg is
+the hard part (5.5). This is exactly how Yazi does it (see the status note above).
 
 
 ### 5.4 Drop-IN Flow (Target)
@@ -1382,16 +1403,20 @@ ASCII Table 5.5: tmux passthrough behaviour for OSC-72
 +----------------------------+--------------------------------------+---------------------------------+
 ```
 
-**Explanation.** Two asymmetric facts decide what is possible inside a multiplexer.
-**Outbound**, tmux swallows raw escape codes, so nnn must wrap each OSC-72 sequence
-in tmux's Device Control String passthrough -- `ESC P tmux ;` then the payload with
-**every ESC byte doubled**, then `ST` -- and the user must set `allow-passthrough on`
-(tmux 3.3+). **Inbound**, tmux does not forward unknown OSC-72 events from the outer
-terminal to the pane. kitty's protocol anticipates this with the `i` (id) key: the
-app stamps `i=<id>` and the terminal echoes it on every reply so a multiplexer can
-route it to the right client -- but **tmux must implement that routing**, and it does
-not yet. Net result: **drag-OUT works in tmux** (outbound, data presented up front)#59;
-**drop-IN and the `t=q` detection query do not** -- those fall back to the helper.
+**Explanation.** Two facts decide what is possible inside a multiplexer.
+**Outbound** (nnn -> terminal), tmux swallows raw escape codes, so nnn must wrap each
+OSC-72 sequence in tmux's Device Control String passthrough -- `ESC P tmux ;` then the
+payload with **every ESC byte doubled**, then `ST` -- and the user must set
+`allow-passthrough on` (tmux 3.3+). **Inbound** (terminal -> nnn) is the harder leg:
+kitty's protocol anticipates multiplexers with the `i` (id) key (the app stamps
+`i=<id>` and the terminal echoes it so tmux can route the reply to the right pane).
+Observed in testing: kitty's inbound OSC-72 events **did reach the nnn pane through
+tmux** (they appeared as the leaked garbage), which is encouraging -- but they must
+be consumed by an inbound parser (5.7) instead of being printed, and robust
+cross-pane routing still depends on tmux's `i`-key handling. Net: **outbound needs
+passthrough wrapping**, **inbound must be parsed** (it is at least delivered), and the
+gesture-driven drag-out in 5.3 needs *both* legs -- which is why it is a substantial
+change, not a one-line escape write.
 
 
 ### 5.6 Terminal Detection and Approach Selection
