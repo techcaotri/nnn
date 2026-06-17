@@ -3626,8 +3626,9 @@ static size_t dnd_b64(const uchar_t *in, size_t len, char *out)
 			v |= (uint_t)in[i + 1] << 8;
 		out[o++] = t[(v >> 18) & 63];
 		out[o++] = t[(v >> 12) & 63];
-		out[o++] = (rem == 2) ? t[(v >> 6) & 63] : '=';
-		out[o++] = '=';
+		if (rem == 2)
+			out[o++] = t[(v >> 6) & 63];
+		/* no '=' padding: kitty's OSC-72 decoder (like Yazi) expects unpadded */
 	}
 	return o;
 }
@@ -4005,18 +4006,6 @@ static void dnd_osc72_enable(void)
 	dnd_osc72_write(seq);
 	g_dnd_on = TRUE;
 	dnd_log("enable sent (drag offering on)");
-
-#ifndef NOMOUSE
-	/*
-	 * Hand the mouse entirely to the terminal. kitty's drag offers are driven
-	 * by EnableDrag (above), not by app mouse-reporting, so it keeps offering;
-	 * meanwhile nnn no longer receives mouse events and therefore emits no
-	 * redraw/FIFO bytes that would interleave with and corrupt the in-flight
-	 * OSC-72 drag stream. Trade-off: in-nnn mouse nav is off while DnD is on.
-	 */
-	mousemask(0, NULL);
-	dnd_log("mouse reporting disabled (terminal owns the mouse)");
-#endif
 }
 
 static void dnd_osc72_disable(void)
