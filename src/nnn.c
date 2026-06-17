@@ -4496,6 +4496,31 @@ try_quit:
 			return 0;
 		}
 
+		/* Diagnostic trace of raw input while a drag source is active (logs only
+		 * when NNN_DND_DEBUG is set). Reveals exactly how inbound OSC-72 events
+		 * are delivered/split so a leak can be pinpointed. */
+		if (g_dnd_on) {
+			char dbg[48];
+
+			snprintf(dbg, sizeof(dbg), "in: i=%d c=%d '%c'", i, (int)c,
+				 (c >= 32 && c < 127) ? (char)c : '.');
+			dnd_log(dbg);
+		}
+
+		/*
+		 * OSC-72 event whose ESC and ']' arrived in separate reads: a previous
+		 * pass saw a lone ESC (escaped) and this read is ']'. Consume it as an
+		 * OSC-72 event rather than letting the "72;t=..." body leak as keys.
+		 */
+		if (g_dnd_on && escaped && c == ']') {
+			escaped = FALSE;
+			dnd_osc72_consume();
+			settimeout();
+			if (g_dnd_drop_pending)
+				return 0;
+			goto try_quit;
+		}
+
 #ifdef KEY_RESIZE
 		if (c == KEY_RESIZE)
 			handle_key_resize();
@@ -4512,6 +4537,13 @@ try_quit:
 			 */
 			timeout(g_dnd_on ? 100 : 0);
 			i = get_wch(&c);
+			if (g_dnd_on) {
+				char dbg[48];
+
+				snprintf(dbg, sizeof(dbg), "esc-peek: i=%d c=%d '%c'", i, (int)c,
+					 (c >= 32 && c < 127) ? (char)c : '.');
+				dnd_log(dbg);
+			}
 			if (i != ERR) {
 				/* Inbound kitty OSC-72 drag-and-drop event (ESC ]) */
 				if (g_dnd_on && c == ']') {
