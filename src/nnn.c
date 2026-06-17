@@ -6305,6 +6305,7 @@ static void show_help(const char *path)
 	"0\n"
 	"1MISC\n"
 	      "8Alt ;  Select plugin%11=  Launch app\n"
+	       "cD  Drag and drop\n"
 	       "9! ^]  Shell%19]  Cmd prompt\n"
 		  "cc  Connect remote%10u  Unmount remote/archive\n"
 	       "9t ^T  Sort toggles%12s  Manage session\n"
