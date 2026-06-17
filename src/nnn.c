@@ -3995,15 +3995,15 @@ static void dnd_osc72_consume(void)
 
 static void dnd_osc72_enable(void)
 {
-	char host[256], seq[320];
-
 	if (g_dnd_on || !dnd_osc72_capable())
 		return;
-	if (gethostname(host, sizeof host) != 0)
-		host[0] = '\0';
-	host[sizeof host - 1] = '\0';
-	snprintf(seq, sizeof seq, "\x1b]72;t=o:x=1;%s\x1b\\", host);
-	dnd_osc72_write(seq);
+	/*
+	 * Empty machine id (like Yazi's EnableDrag("")): the terminal then treats
+	 * the drag as local and hands the drop target the file:// path directly,
+	 * instead of requesting the file contents via t=k -- which nnn does not
+	 * provide, so the drop would stall and the drag icon would never clear.
+	 */
+	dnd_osc72_write("\x1b]72;t=o:x=1;\x1b\\");
 	g_dnd_on = TRUE;
 	dnd_log("enable sent (drag offering on)");
 }
