@@ -3564,6 +3564,358 @@ static inline int handle_event(void)
 }
 
 /*
+ * ===== kitty OSC-72 drag-and-drop (mouse-gesture-driven, bidirectional) =====
+ *
+ * nnn declares itself a drag source once at startup (EnableDrag). When the user
+ * mouse-drags on a protocol-aware terminal (kitty >= 0.47.1), the terminal sends
+ * an inbound "t=o" offer, which nnn answers with agree -> present -> start; the
+ * terminal then performs the real OS drag. Inbound OSC-72 events are parsed out
+ * of the input stream in nextsel(). Opt-in via $NNN_DND_OSC72=1 (it changes the
+ * terminal's mouse-gesture handling). Works over SSH; inside tmux it needs
+ * `set -g allow-passthrough on`. This mirrors Yazi's design; see the design doc
+ * sections 5-6 and src/nnn-dnd.c (the libX11 helper used elsewhere).
+ */
+static bool g_dnd_on;        /* drag offering enabled with the terminal */
+static char *g_dnd_b64;      /* base64 text/uri-list for the in-flight drag */
+static size_t g_dnd_b64len;
+
+static bool dnd_in_tmux(void)
+{
+	char *t = getenv("TMUX");
+
+	return (t && *t);
+}
+
+/* Opt-in only: enabling alters terminal mouse gestures, so require NNN_DND_OSC72=1. */
+static bool dnd_osc72_capable(void)
+{
+	char *v = getenv("NNN_DND_OSC72");
+
+	return (v && *v == '1');
+}
+
+static int dnd_unreserved(uchar_t c)
+{
+	return ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		|| (c >= '0' && c <= '9')
+		|| c == '-' || c == '_' || c == '.' || c == '~' || c == '/');
+}
+
+/* Standard base64. out must hold at least 4 * ((len + 2) / 3) bytes. */
+static size_t dnd_b64(const uchar_t *in, size_t len, char *out)
+{
+	static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	size_t i, o = 0;
+
+	for (i = 0; i + 3 <= len; i += 3) {
+		uint_t v = ((uint_t)in[i] << 16) | ((uint_t)in[i + 1] << 8) | in[i + 2];
+
+		out[o++] = t[(v >> 18) & 63];
+		out[o++] = t[(v >> 12) & 63];
+		out[o++] = t[(v >> 6) & 63];
+		out[o++] = t[v & 63];
+	}
+	if (i < len) {
+		uint_t v = (uint_t)in[i] << 16;
+		int rem = (int)(len - i);
+
+		if (rem == 2)
+			v |= (uint_t)in[i + 1] << 8;
+		out[o++] = t[(v >> 18) & 63];
+		out[o++] = t[(v >> 12) & 63];
+		out[o++] = (rem == 2) ? t[(v >> 6) & 63] : '=';
+		out[o++] = '=';
+	}
+	return o;
+}
+
+/* Write one NUL-terminated OSC-72 sequence to the tty, wrapping it in tmux's
+ * DCS passthrough (every ESC doubled) when running inside tmux. */
+static void dnd_osc72_write(const char *seq)
+{
+	size_t len = strlen(seq);
+	ssize_t wr;
+
+	if (dnd_in_tmux()) {
+		size_t cap = len * 2 + 16, o = 7, i;
+		char *w = malloc(cap);
+
+		if (!w)
+			return;
+		memcpy(w, "\x1bPtmux;", 7);
+		for (i = 0; i < len; ++i) {
+			if (seq[i] == '\x1b')
+				w[o++] = '\x1b';
+			w[o++] = seq[i];
+		}
+		w[o++] = '\x1b';
+		w[o++] = '\\';
+		wr = write(STDOUT_FILENO, w, o);
+		free(w);
+	} else
+		wr = write(STDOUT_FILENO, seq, len);
+
+	(void)wr;
+}
+
+/* Append a line to $NNN_DND_DEBUG (a file path, or /tmp/nnn-dnd.log if "1").
+ * File-based so it never corrupts the curses screen. No-op when unset. */
+static void dnd_log(const char *msg)
+{
+	char *path = getenv("NNN_DND_DEBUG");
+	int fd;
+
+	if (!path || !*path)
+		return;
+	if (path[0] == '1' && !path[1])
+		path = "/tmp/nnn-dnd.log";
+	fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+	if (fd < 0)
+		return;
+	(void)!write(fd, msg, strlen(msg));
+	(void)!write(fd, "\n", 1);
+	close(fd);
+}
+
+static void dnd_clear_data(void)
+{
+	free(g_dnd_b64);
+	g_dnd_b64 = NULL;
+	g_dnd_b64len = 0;
+}
+
+/* Build a file:// text/uri-list (selection, or the hovered file when none) and
+ * base64 it into g_dnd_b64. Returns FALSE if there is nothing to drag. */
+static bool dnd_prepare_data(void)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	size_t cap = PATH_MAX, ulen = 0;
+	char *uris, hov[PATH_MAX];
+	char **paths = NULL;
+	int n = 0, i;
+
+	dnd_clear_data();
+
+	uris = malloc(cap);
+	if (!uris)
+		return FALSE;
+
+	if (nselected && pselbuf) {
+		char *p = pselbuf, *end = pselbuf + selbufpos;
+
+		while (p < end) {
+			size_t l = strlen(p);
+
+			if (l) {
+				char **np = realloc(paths, (size_t)(n + 1) * sizeof(char *));
+
+				if (!np) {
+					free(uris);
+					free(paths);
+					return FALSE;
+				}
+				paths = np;
+				paths[n++] = p;
+			}
+			p += l + 1;
+		}
+	}
+
+	if (n == 0) {
+		if (!ndents) {
+			free(uris);
+			free(paths);
+			return FALSE;
+		}
+		mkpath(g_ctx[cfg.curctx].c_path, pdents[cur].name, hov);
+		paths = malloc(sizeof(char *));
+		if (!paths) {
+			free(uris);
+			return FALSE;
+		}
+		paths[n++] = hov;
+	}
+
+	for (i = 0; i < n; ++i) {
+		const char *s = paths[i];
+		size_t need = 7 + strlen(s) * 3 + 2;
+
+		if (ulen + need + 1 > cap) {
+			char *nu = realloc(uris, (cap = (ulen + need + 1) * 2));
+
+			if (!nu) {
+				free(uris);
+				free(paths);
+				return FALSE;
+			}
+			uris = nu;
+		}
+		memcpy(uris + ulen, "file://", 7);
+		ulen += 7;
+		for (; *s; ++s) {
+			uchar_t c = (uchar_t)*s;
+
+			if (dnd_unreserved(c))
+				uris[ulen++] = (char)c;
+			else {
+				uris[ulen++] = '%';
+				uris[ulen++] = hex[c >> 4];
+				uris[ulen++] = hex[c & 15];
+			}
+		}
+		uris[ulen++] = '\r';
+		uris[ulen++] = '\n';
+	}
+	free(paths);
+
+	g_dnd_b64 = malloc(4 * ((ulen + 2) / 3) + 1);
+	if (!g_dnd_b64) {
+		free(uris);
+		return FALSE;
+	}
+	g_dnd_b64len = dnd_b64((uchar_t *)uris, ulen, g_dnd_b64);
+	g_dnd_b64[g_dnd_b64len] = '\0';
+	free(uris);
+	return (g_dnd_b64len > 0);
+}
+
+/* Send the prepared base64 data, chunked at 4096, with the given metadata
+ * prefix ("t=p:x=0" to pre-send, "t=e:y=0" to answer a data request). */
+static void dnd_osc72_data(const char *prefix)
+{
+	size_t off = 0;
+	char end[64];
+
+	while (off < g_dnd_b64len) {
+		size_t n = g_dnd_b64len - off;
+		int more, p;
+		char *m;
+
+		if (n > 4096)
+			n = 4096;
+		more = (off + n < g_dnd_b64len);
+
+		m = malloc(strlen(prefix) + n + 48);
+		if (!m)
+			return;
+		p = snprintf(m, strlen(prefix) + 32, "\x1b]72;%s:m=%d;", prefix, more);
+		memcpy(m + p, g_dnd_b64 + off, n);
+		m[p + n] = '\x1b';
+		m[p + n + 1] = '\\';
+		m[p + n + 2] = '\0';
+		dnd_osc72_write(m);
+		free(m);
+		off += n;
+	}
+	snprintf(end, sizeof end, "\x1b]72;%s:m=0\x1b\\", prefix); /* end: empty payload */
+	dnd_osc72_write(end);
+}
+
+/* Handle one inbound OSC-72 event body (the bytes after the leading "72;"). */
+static void dnd_osc72_event(const char *body)
+{
+	char t = 0;
+	int x = -1;
+	const char *p = body;
+
+	while (*p && *p != ';') { /* metadata: key=val pairs separated by ':' */
+		if (p[1] == '=') {
+			if (p[0] == 't')
+				t = p[2];
+			else if (p[0] == 'x')
+				x = atoi(p + 2);
+		}
+		while (*p && *p != ':' && *p != ';')
+			++p;
+		if (*p == ':')
+			++p;
+	}
+
+	switch (t) {
+	case 'o': /* inbound drag offer -> agree, pre-send data, start */
+		if (dnd_prepare_data()) {
+			dnd_osc72_write("\x1b]72;t=o:o=3;text/uri-list\x1b\\");
+			dnd_osc72_data("t=p:x=0");
+			dnd_osc72_write("\x1b]72;t=P:x=-1\x1b\\");
+			dnd_log("offer -> agree + present + start");
+		} else
+			dnd_log("offer -> nothing to drag");
+		break;
+	case 'e': /* drag status */
+		if (x == 5) { /* terminal requests the data */
+			dnd_osc72_data("t=e:y=0");
+			dnd_log("data request -> sent");
+		} else if (x == 4) { /* drag finished */
+			dnd_clear_data();
+			dnd_log("drag finished");
+		}
+		break;
+	case 'E': { /* OK (drag started) or an error such as EPERM */
+		const char *pl = strchr(body, ';');
+
+		if (!(pl && pl[1] == 'O' && pl[2] == 'K'))
+			dnd_clear_data();
+		dnd_log("status t=E (OK or error)");
+		break;
+	}
+	default:
+		break; /* other events consumed and ignored */
+	}
+}
+
+/* Called from nextsel() right after reading ESC ']'. Reads the rest of the OSC
+ * sequence (until ST or BEL) and dispatches it. Always consumes (never leaks). */
+static void dnd_osc72_consume(void)
+{
+	char buf[2048];
+	int n = 0;
+	wint_t ch;
+
+	timeout(120); /* tolerate small gaps within the burst */
+	while (n < (int)sizeof(buf) - 1) {
+		if (get_wch(&ch) == ERR)
+			break;
+		if (ch == 7) /* BEL terminator */
+			break;
+		if (ch == 27) { /* ESC: ST is ESC '\'; consume the trailing byte */
+			(void)get_wch(&ch);
+			break;
+		}
+		buf[n++] = (char)ch;
+	}
+	buf[n] = '\0';
+	settimeout();
+	dnd_log(buf);
+
+	if (n >= 3 && buf[0] == '7' && buf[1] == '2' && buf[2] == ';')
+		dnd_osc72_event(buf + 3);
+}
+
+static void dnd_osc72_enable(void)
+{
+	char host[256], seq[320];
+
+	if (g_dnd_on || !dnd_osc72_capable())
+		return;
+	if (gethostname(host, sizeof host) != 0)
+		host[0] = '\0';
+	host[sizeof host - 1] = '\0';
+	snprintf(seq, sizeof seq, "\x1b]72;t=o:x=1;%s\x1b\\", host);
+	dnd_osc72_write(seq);
+	g_dnd_on = TRUE;
+	dnd_log("enable sent (drag offering on)");
+}
+
+static void dnd_osc72_disable(void)
+{
+	if (!g_dnd_on)
+		return;
+	dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+	dnd_clear_data();
+	g_dnd_on = FALSE;
+}
+
+/*
  * Returns SEL_* if key is bound and 0 otherwise.
  * Also modifies the run and env pointers (used on SEL_{RUN,RUNARG}).
  * The next keyboard input can be simulated by presel.
@@ -3590,6 +3942,12 @@ try_quit:
 			timeout(0);
 			i = get_wch(&c);
 			if (i != ERR) {
+				/* Inbound kitty OSC-72 drag-and-drop event (ESC ]) */
+				if (g_dnd_on && c == ']') {
+					dnd_osc72_consume();
+					settimeout();
+					goto try_quit;
+				}
 				if (c == ESC)
 					c = 'q'; /* Quit context */
 				else {
@@ -8495,6 +8853,8 @@ static bool browse(char *ipath, int pkey)
 	bool watch = FALSE, cd = TRUE;
 	ino_t inode = 0;
 
+	dnd_osc72_enable(); /* declare nnn a kitty OSC-72 drag source (if opted in) */
+
 #ifndef NOMOUSE
 	MEVENT event = {0};
 	struct timespec mousetimings[2] = {{.tv_sec = 0, .tv_nsec = 0}, {.tv_sec = 0, .tv_nsec = 0}};
@@ -10351,6 +10711,7 @@ static bool set_tmp_path(void)
 
 static void cleanup(void)
 {
+	dnd_osc72_disable(); /* tell the terminal we are no longer a drag source */
 #ifndef NOX11
 	if (cfg.x11 && !g_state.picker) {
 		printf("\033[23;0t"); /* reset terminal window title */
