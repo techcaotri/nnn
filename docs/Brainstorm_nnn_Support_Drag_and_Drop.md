@@ -1237,24 +1237,28 @@ The cost: it only works on terminals that implement kitty's Drag-and-Drop protoc
 (kitty >= 0.47.1 today#59; Ghostty has accepted it). It is verified ground truth
 from kitty's spec (`OSC 72 ; metadata ; payload ST`) and Yazi's implementation.
 
-> **Implementation status / correction (2026).** A first cut wired drag-out to
-> the `D` keypress and was reverted. kitty's drag-out is **mouse-gesture-driven
+> **Implementation status (2026).** A first cut wired drag-out to the `D`
+> keypress and failed, then was reimplemented correctly. kitty's drag-out is **mouse-gesture-driven
 > and bidirectional**, not app-initiated: the app only *declares* it can be a
 > source (`t=o:x=1`, once at startup); the **user's mouse drag** on the terminal
 > makes kitty send an inbound `t=o` *offer*, which the app must answer with
 > agree -> present -> start. A keypress `StartDrag` with no live gesture returns
 > `t=E ; EPERM` ("permission to start drag denied... user has already released"),
-> and unconsumed inbound events print as garbage. A correct implementation
-> therefore needs: (1) enable-offering at init, (2) an **inbound OSC-72 parser**
-> tapping nnn's ncurses input stream, and (3) event-driven responses. **Yazi
+> and unconsumed inbound events print as garbage. nnn now **implements** the
+> correct design (opt-in via `NNN_DND_OSC72=1`): (1) enable-offering at init
+> (`dnd_osc72_enable` in `browse()`), (2) an **inbound OSC-72 parser** tapping the
+> ncurses input loop (`dnd_osc72_consume` in `nextsel()`, on `ESC ]`), and (3)
+> event-driven responses (`dnd_osc72_event`). **Yazi
 > confirms this is the only way**: it sends `EnableDrag`/`EnableDrop` once at
 > startup (`yazi-tui/src/raterm.rs`), parses inbound OSC-72 in its own `yazi-term`
 > crate -- a `State::Osc72` parser it built by **replacing Crossterm** (issue
 > #3910) -- and calls `offer_uri_list` (agree+present+start) only in response to
 > an inbound offer (`components/current.lua`: `Current:drag(event)` when
 > `event.type == "offer"`). The diagrams in 5.3-5.4 below show this corrected,
-> mouse-driven flow. The libX11 helper (Approach B) already covers kitty
-> **locally**; OSC-72's unique benefit is **drag-out over SSH**.
+> mouse-driven flow. It is opt-in because enabling alters the terminal's mouse
+> gestures; the libX11 helper (Approach B) covers kitty **locally**, so OSC-72's
+> unique benefit is **drag-out over SSH**. Drop-IN stays on the helper. Set
+> `NNN_DND_DEBUG=1` (or a file path) to trace inbound events to a log file.
 
 ### 5.1 How It Differs From the Helper Approach
 
