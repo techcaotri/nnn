@@ -342,7 +342,10 @@ static void create_window(struct app *ap)
 	const char *title = ap->o.target ? "nnn-dnd: drop here" : "nnn-dnd: drag out";
 
 	attr.background_pixel = bg;
+	/* PointerMotion/ButtonMotion are needed so the automatic button grab
+	 * (and our explicit XGrabPointer) deliver motion events while dragging. */
 	attr.event_mask = ExposureMask | ButtonPressMask | ButtonReleaseMask
+			| PointerMotionMask | ButtonMotionMask
 			| StructureNotifyMask | PropertyChangeMask;
 
 	ap->win = XCreateWindow(d, ap->root, 0, 0, 260, 90, 0,
