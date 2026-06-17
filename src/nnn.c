@@ -3580,6 +3580,8 @@ static char *g_dnd_b64;      /* base64 text/uri-list for the in-flight drag */
 static size_t g_dnd_b64len;
 static int g_dnd_count;      /* number of files in the in-flight drag */
 
+static void dnd_log(const char *msg); /* forward decl: used by dnd_osc72_write */
+
 static bool dnd_in_tmux(void)
 {
 	char *t = getenv("TMUX");
@@ -3654,6 +3656,27 @@ static void dnd_full_write(const char *p, size_t n)
 static void dnd_osc72_write(const char *seq)
 {
 	size_t len = strlen(seq);
+
+	if (getenv("NNN_DND_DEBUG")) { /* log exactly what we emit (ESC -> \e) */
+		char *s = malloc(len * 2 + 8);
+
+		if (s) {
+			size_t i, o = 0;
+
+			memcpy(s, "out: ", 5);
+			o = 5;
+			for (i = 0; i < len; ++i) {
+				if (seq[i] == 0x1b) {
+					s[o++] = '\\';
+					s[o++] = 'e';
+				} else
+					s[o++] = seq[i];
+			}
+			s[o] = '\0';
+			dnd_log(s);
+			free(s);
+		}
+	}
 
 	if (dnd_in_tmux()) {
 		size_t cap = len * 2 + 16, o = 7, i;
@@ -9122,6 +9145,14 @@ nochange:
 #ifndef NOMOUSE
 		case SEL_CLICK:
 			if (getmouse(&event) != OK)
+				goto nochange;
+
+			/*
+			 * With OSC-72 drag-and-drop enabled the terminal drives the
+			 * mouse gesture; consume the event but do not act on it, so nnn
+			 * does not redraw/move and delay the offer/agree exchange.
+			 */
+			if (g_dnd_on)
 				goto nochange;
 
 			/* Handle clicking on a context at the top */
