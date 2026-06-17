@@ -4005,6 +4005,18 @@ static void dnd_osc72_enable(void)
 	dnd_osc72_write(seq);
 	g_dnd_on = TRUE;
 	dnd_log("enable sent (drag offering on)");
+
+#ifndef NOMOUSE
+	/*
+	 * Hand the mouse entirely to the terminal. kitty's drag offers are driven
+	 * by EnableDrag (above), not by app mouse-reporting, so it keeps offering;
+	 * meanwhile nnn no longer receives mouse events and therefore emits no
+	 * redraw/FIFO bytes that would interleave with and corrupt the in-flight
+	 * OSC-72 drag stream. Trade-off: in-nnn mouse nav is off while DnD is on.
+	 */
+	mousemask(0, NULL);
+	dnd_log("mouse reporting disabled (terminal owns the mouse)");
+#endif
 }
 
 static void dnd_osc72_disable(void)
@@ -9145,14 +9157,6 @@ nochange:
 #ifndef NOMOUSE
 		case SEL_CLICK:
 			if (getmouse(&event) != OK)
-				goto nochange;
-
-			/*
-			 * With OSC-72 drag-and-drop enabled the terminal drives the
-			 * mouse gesture; consume the event but do not act on it, so nnn
-			 * does not redraw/move and delay the offer/agree exchange.
-			 */
-			if (g_dnd_on)
 				goto nochange;
 
 			/* Handle clicking on a context at the top */
