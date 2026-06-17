@@ -3590,6 +3590,7 @@ static bool g_dnd_on;        /* drag offering enabled with the terminal */
 static char *g_dnd_b64;      /* base64 text/uri-list for the in-flight drag */
 static size_t g_dnd_b64len;
 static int g_dnd_count;      /* number of files in the in-flight drag */
+static bool g_dnd_tmux_grabbed; /* tmux mouse turned off for an in-flight drag */
 
 static void dnd_log(const char *msg); /* forward decl: used by dnd_osc72_write */
 
@@ -3598,6 +3599,31 @@ static bool dnd_in_tmux(void)
 	char *t = getenv("TMUX");
 
 	return (t && *t);
+}
+
+/*
+ * While an OSC-72 drag is in flight, tmux's own mouse handling treats a drag
+ * across a pane border as a resize. Toggle tmux mouse off for the drag and
+ * back on when it ends. F_NOWAIT keeps curses up (no endwin), so this is safe
+ * mid-gesture. Restored on every drag-end path via dnd_clear_data() (and on the
+ * next subprocess resync) so an abnormal end cannot leave the mouse disabled.
+ */
+static void dnd_tmux_mouse(bool on)
+{
+	char cmd[32];
+
+	if (!dnd_in_tmux())
+		return;
+	snprintf(cmd, sizeof cmd, "tmux set -g mouse %s", on ? "on" : "off");
+	spawn(cmd, NULL, NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
+}
+
+static void dnd_release_tmux_mouse(void)
+{
+	if (g_dnd_tmux_grabbed) {
+		dnd_tmux_mouse(TRUE);
+		g_dnd_tmux_grabbed = FALSE;
+	}
 }
 
 /* Opt-in only: enabling alters terminal mouse gestures, so require NNN_DND_OSC72=1. */
@@ -3734,6 +3760,7 @@ static void dnd_clear_data(void)
 	free(g_dnd_b64);
 	g_dnd_b64 = NULL;
 	g_dnd_b64len = 0;
+	dnd_release_tmux_mouse(); /* every drag-end path runs through here */
 }
 
 /* Build a file:// text/uri-list (selection, or the hovered file when none) and
@@ -3892,6 +3919,11 @@ static void dnd_osc72_offer(void)
 
 	dnd_osc72_write(b);
 	free(b);
+	/* Drag is now in flight: stop tmux from resizing panes on border crossings. */
+	if (dnd_in_tmux() && !g_dnd_tmux_grabbed) {
+		dnd_tmux_mouse(FALSE);
+		g_dnd_tmux_grabbed = TRUE;
+	}
 	dnd_log("offer -> agree + present + start (batched)");
 }
 
