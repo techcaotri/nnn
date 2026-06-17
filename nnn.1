@@ -395,6 +395,28 @@ or
 .Ql ripdrag ) .
 Received files are added to the selection and shown as a list. It works on
 X11, and on Wayland via XWayland.
+.Pp
+On terminals that implement kitty's drag-and-drop protocol (kitty >= 0.47.1),
+the
+.Ql \fBD\fR
+key instead drags out
+.Em in-process
+by emitting
+.Ql OSC 72
+escape codes: no helper process is needed and it works over SSH. Inside
+.Xr tmux 1
+this requires
+.Ql set -g allow-passthrough on .
+Set
+.Ev NNN_DND_OSC72
+to
+.Ql 1
+to force this path or
+.Ql 0
+to disable it; otherwise it is auto-detected. When the terminal does not
+support the protocol, nnn falls back to the
+.Ql nnn-dnd
+helper.
 .Sh FIND AND LIST
 There are two ways to search and list:
 .Pp
