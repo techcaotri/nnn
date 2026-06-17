@@ -9679,6 +9679,72 @@ nochange:
 			if (g_state.runplugin == 1) /* Allow filtering in plugins directory */
 				presel = FILTER;
 			goto begin;
+		case SEL_DRAGDROP:
+		{
+			/*
+			 * Native drag-and-drop. Drag the selection (or, when none,
+			 * the hovered file) OUT to a GUI app via the bundled nnn-dnd
+			 * helper; or receive a drop via the dragdrop plugin (which
+			 * talks back through NNN_PIPE). See docs/Brainstorm_nnn_Support_
+			 * Drag_and_Drop.md and src/nnn-dnd.c.
+			 */
+			if (!ndents && !nselected) {
+				printwait("no file to drag", &presel);
+				goto nochange;
+			}
+
+			r = get_input("drag out (d) / receive (r) [default=d]");
+			if (r != 'd' && r != 'r' && r != '\r')
+				goto nochange;
+
+			endselection(FALSE);
+
+			/* Native drag-out path: use nnn-dnd if it is installed. */
+			if (r != 'r' && getutil("nnn-dnd")) {
+				if (selpath)
+					setenv("NNN_SEL", selpath, 1);
+
+				if (nselected)
+					spawn("nnn-dnd", "-x", "--nnn-sel", NULL,
+					      F_NOWAIT | F_NOTRACE);
+				else {
+					mkpath(path, pdents[cur].name, newpath);
+					spawn("nnn-dnd", "-x", newpath, NULL,
+					      F_NOWAIT | F_NOTRACE);
+				}
+
+				statusbar(path);
+				goto nochange;
+			}
+
+			/*
+			 * Fallback / receive path: delegate to the dragdrop plugin,
+			 * which handles dragon/ripdrag, the receive direction and the
+			 * NNN_PIPE list-back. NNN_DND_MODE skips the plugin's prompt.
+			 */
+			setenv("NNN_DND_MODE", (r == 'r') ? "receive" : "drag", 1);
+
+			enum action dndact;
+
+			do {
+				dndact = SEL_MAX;
+				if (!run_plugin(&path, "dragdrop",
+						(ndents ? pdents[cur].name : NULL),
+						&lastname, &lastdir, &dndact)) {
+					unsetenv("NNN_DND_MODE");
+					printwait(messages[MSG_FAILED], &presel);
+					goto nochange;
+				}
+
+				if (g_state.picked)
+					return EXIT_SUCCESS;
+			} while (handle_cur_move(dndact));
+
+			unsetenv("NNN_DND_MODE");
+			copycurname();
+			cd = FALSE;
+			goto begin;
+		}
 		case SEL_SELSIZE:
 			showselsize(path);
 			goto nochange;

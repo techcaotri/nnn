@@ -118,6 +118,7 @@ enum action {
 	SEL_QUITCD,
 	SEL_QUIT,
 	SEL_QUITERR,
+	SEL_DRAGDROP,
 #ifndef NOMOUSE
 	SEL_CLICK,
 #endif
@@ -260,6 +261,8 @@ static struct key bindings[] = {
 	{ 'e',            SEL_EDIT },
 	/* Run a plugin */
 	{ ';',            SEL_PLUGIN },
+	/* Drag and drop (native, via the nnn-dnd helper) */
+	{ 'D',            SEL_DRAGDROP },
 	/* Show total size of listed selection */
 	{ 'S',            SEL_SELSIZE },
 	/* Run command */
