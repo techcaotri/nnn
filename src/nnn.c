@@ -3594,6 +3594,8 @@ static bool g_dnd_tmux_grabbed; /* tmux mouse turned off for an in-flight drag *
 static bool g_dnd_drop_pending; /* a paste/drop was captured; browse() acts on it */
 static char *g_dnd_drop_buf;    /* captured paste/drop bytes (dropped paths/URIs) */
 static size_t g_dnd_drop_len, g_dnd_drop_cap;
+static bool g_dnd_drop_collecting; /* receiving a structured OSC-72 drop (bare kitty) */
+static int g_dnd_drop_idx;         /* offered-mime index requested for the drop */
 
 /* Bracketed-paste markers, registered via define_key() so ncurses returns the
  * whole sequence as one keycode (with status KEY_CODE_YES). A GUI file drop the
@@ -3603,6 +3605,7 @@ static size_t g_dnd_drop_len, g_dnd_drop_cap;
 #define KEY_DND_PASTE_END   (KEY_MAX + 2)
 
 static void dnd_log(const char *msg); /* forward decl: used by dnd_osc72_write */
+static void dnd_drop_putc(char c);    /* forward decl: used by the OSC-72 drop decoder */
 
 static bool dnd_in_tmux(void)
 {
@@ -3973,12 +3976,121 @@ static void dnd_osc72_send_request(void)
 	dnd_log("data request -> sent (batched)");
 }
 
+static int dnd_b64_rev(uchar_t c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A';
+	if (c >= 'a' && c <= 'z')
+		return c - 'a' + 26;
+	if (c >= '0' && c <= '9')
+		return c - '0' + 52;
+	if (c == '+')
+		return 62;
+	if (c == '/')
+		return 63;
+	return -1;
+}
+
+/* Decode base64 (padded or not) drop payload into the capture buffer. */
+static void dnd_b64_decode_into_drop(const char *in)
+{
+	int val = 0, bits = 0, d;
+
+	for (; *in; ++in) {
+		d = dnd_b64_rev((uchar_t)*in);
+		if (d < 0)
+			continue;
+		val = (val << 6) | d;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			dnd_drop_putc((char)((val >> bits) & 0xFF));
+		}
+	}
+}
+
+/* Index of text/uri-list among the space-separated offered mimes, or -1. */
+static int dnd_uri_index(const char *mimes)
+{
+	int idx = 0;
+	const char *m = mimes;
+
+	if (!mimes)
+		return -1;
+	for (;;) {
+		const char *e = m;
+
+		while (*e && *e != ' ')
+			++e;
+		if ((size_t)(e - m) == 13 && strncmp(m, "text/uri-list", 13) == 0)
+			return idx;
+		if (!*e)
+			return -1;
+		++idx;
+		m = e + 1;
+	}
+}
+
+/* Structured-drop hover ('m'): accept a copy of text/uri-list when offered.
+ * We accept as COPY at the protocol level so the source never deletes the files;
+ * dnd_handle_drop() asks copy/move afterwards and does its own move if needed. */
+static void dnd_osc72_drop_hover(const char *mimes)
+{
+	int idx = dnd_uri_index(mimes);
+
+	if (idx >= 0) {
+		g_dnd_drop_idx = idx + 1; /* cache for the drop in case 'M' omits mimes */
+		dnd_osc72_write("\x1b]72;t=m:o=1;text/uri-list\x1b\\");
+	} else
+		dnd_osc72_write("\x1b]72;t=m:o=0\x1b\\");
+}
+
+/* Structured drop released ('M'): request the text/uri-list by its offered index. */
+static void dnd_osc72_drop_start(const char *mimes)
+{
+	int idx = dnd_uri_index(mimes);
+	char req[32];
+
+	g_dnd_drop_collecting = FALSE;
+	if (idx < 0 && g_dnd_drop_idx > 0)
+		idx = g_dnd_drop_idx - 1; /* fall back to the hover-cached index */
+	if (idx < 0) {
+		dnd_osc72_write("\x1b]72;t=r:o=0\x1b\\"); /* uri-list not offered */
+		return;
+	}
+	g_dnd_drop_idx = idx + 1;
+	g_dnd_drop_collecting = TRUE;
+	g_dnd_drop_len = 0;
+	snprintf(req, sizeof(req), "\x1b]72;t=r:x=%d\x1b\\", g_dnd_drop_idx);
+	dnd_osc72_write(req);
+}
+
+/* A structured-drop data chunk ('r'): decode into the buffer; an empty,
+ * no-more chunk ends the drop. Hand the uri-list to browse() via the same
+ * pending-drop path the bracketed-paste fallback uses. */
+static void dnd_osc72_drop_data(const char *payload, int more)
+{
+	if (!g_dnd_drop_collecting)
+		return;
+	if (payload && *payload)
+		dnd_b64_decode_into_drop(payload);
+	if (!more && (!payload || !*payload)) {
+		dnd_osc72_write("\x1b]72;t=r:o=0\x1b\\"); /* end the drop */
+		g_dnd_drop_collecting = FALSE;
+		dnd_drop_putc('\0');
+		g_dnd_drop_pending = TRUE;
+		dnd_log("structured drop received");
+	}
+}
+
 /* Handle one inbound OSC-72 event body (the bytes after the leading "72;"). */
 static void dnd_osc72_event(const char *body)
 {
 	char t = 0;
-	int x = -1;
-	const char *p = body;
+	int x = -1, more = 0;
+	const char *p = body, *payload = strchr(body, ';');
+
+	payload = payload ? payload + 1 : NULL;
 
 	while (*p && *p != ';') { /* metadata: key=val pairs separated by ':' */
 		if (p[1] == '=') {
@@ -3986,11 +4098,19 @@ static void dnd_osc72_event(const char *body)
 				t = p[2];
 			else if (p[0] == 'x')
 				x = atoi(p + 2);
+			else if (p[0] == 'm')
+				more = (p[2] == '1');
 		}
 		while (*p && *p != ':' && *p != ';')
 			++p;
 		if (*p == ':')
 			++p;
+	}
+
+	/* Continuation chunk of a structured drop (kitty may send bare ';data'). */
+	if (g_dnd_drop_collecting && (t == 'r' || t == 0)) {
+		dnd_osc72_drop_data(payload, more);
+		return;
 	}
 
 	switch (t) {
@@ -4013,6 +4133,15 @@ static void dnd_osc72_event(const char *body)
 		dnd_log("status t=E (OK or error)");
 		break;
 	}
+	case 'm': /* structured drop hovering over the window */
+		dnd_osc72_drop_hover(payload);
+		break;
+	case 'M': /* structured drop released */
+		dnd_osc72_drop_start(payload);
+		break;
+	case 'r': /* structured drop data */
+		dnd_osc72_drop_data(payload, more);
+		break;
 	default:
 		break; /* other events consumed and ignored */
 	}
@@ -4077,6 +4206,14 @@ static void dnd_osc72_enable(void)
 	 * provide, so the drop would stall and the drag icon would never clear.
 	 */
 	dnd_osc72_write("\x1b]72;t=o:x=1;\x1b\\");
+	/*
+	 * Structured drop reception (EnableDrop) only outside tmux: through tmux it
+	 * would make kitty stop pasting dropped paths (suppressing the fallback) yet
+	 * the structured events are not routed back to the pane, so drops would
+	 * silently vanish. Inside tmux the bracketed-paste fallback handles drops.
+	 */
+	if (!dnd_in_tmux())
+		dnd_osc72_write("\x1b]72;t=a;text/uri-list\x1b\\");
 	dnd_drop_enable(); /* also accept GUI file drops (bracketed-paste fallback) */
 	g_dnd_on = TRUE;
 	dnd_log("enable sent (drag offering on)");
@@ -4087,7 +4224,10 @@ static void dnd_osc72_disable(void)
 	if (!g_dnd_on)
 		return;
 	dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+	if (!dnd_in_tmux())
+		dnd_osc72_write("\x1b]72;t=A\x1b\\"); /* stop accepting drops */
 	dnd_full_write("\x1b[?2004l", 8); /* bracketed paste off */
+	g_dnd_drop_collecting = FALSE;
 	dnd_clear_data();
 	g_dnd_on = FALSE;
 }
@@ -4104,6 +4244,7 @@ static void dnd_osc72_resync(void)
 	if (!dnd_osc72_capable())
 		return;
 	dnd_clear_data();	/* abandon any drag interrupted by the subprocess */
+	g_dnd_drop_collecting = FALSE;
 	g_dnd_on = FALSE;	/* force dnd_osc72_enable() to re-send the offer */
 	dnd_osc72_enable();
 }
@@ -4322,6 +4463,8 @@ try_quit:
 				if (g_dnd_on && c == ']') {
 					dnd_osc72_consume();
 					settimeout();
+					if (g_dnd_drop_pending)
+						return 0; /* browse() handles the structured drop */
 					goto try_quit;
 				}
 				if (c == ESC)
