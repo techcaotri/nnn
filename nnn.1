@@ -375,6 +375,55 @@ to list the selection file.
 can show the total size of non-filtered selected files listed in a
 directory. For directories, only the size of the directory is added by
 default. To add the size of the contents of a directory, sort by disk usage (aka du mode).
+.Sh DRAG AND DROP
+.Pp
+Press
+.Ql \fBD\fR
+to drag the current selection (or the hovered file when nothing is
+selected) out to a GUI application, or to receive files dropped from a GUI
+application. Drag-and-drop is handled by the bundled
+.Ql nnn-dnd
+helper, a small libX11 XDND source/target window. Build it with
+.Ql make O_DND=1
+(it links only libX11) and install it alongside
+.Nm .
+When the helper is not found, the
+.Ql dragdrop
+plugin is used as a fallback (which can use
+.Ql dragon
+or
+.Ql ripdrag ) .
+Received files are added to the selection and shown as a list. It works on
+X11, and on Wayland via XWayland.
+.Pp
+On terminals that implement kitty's drag-and-drop protocol (kitty >= 0.47.1),
+nnn can instead drag out
+.Em in-process
+via
+.Ql OSC 72
+escape codes (no helper, works over SSH). This is mouse-gesture-driven: with
+.Ev NNN_DND_OSC72
+set to
+.Ql 1
+nnn declares itself a drag source, and dragging the selection (or hovered
+file) out is started by the
+.Em mouse
+on the terminal, not by a key. Inside
+.Xr tmux 1
+it needs
+.Ql set -g allow-passthrough on .
+It is opt-in because enabling alters the terminal's mouse gestures; otherwise
+the
+.Ql D
+key uses the
+.Ql nnn-dnd
+helper. Set
+.Ev NNN_DND_DEBUG
+to a file path (or
+.Ql 1
+for
+.Pa /tmp/nnn-dnd.log )
+to trace the protocol.
 .Sh FIND AND LIST
 There are two ways to search and list:
 .Pp

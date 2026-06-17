@@ -2637,6 +2637,14 @@ static int join(pid_t p, uchar_t flag)
  * Spawns a child process. Behaviour can be controlled using flag.
  * Limited to 3 arguments to a program, flag works on bit set.
  */
+
+/*
+ * Set when a curses-suspending subprocess (opener/pager/editor) returns: it
+ * tells browse() to re-advertise the OSC-72 drag source, because endwin()/
+ * refresh() resets the terminal and kitty forgets nnn is draggable.
+ */
+static bool g_dnd_resync;
+
 static int spawn(char *command, char *arg1, char *arg2, char *arg3, ushort_t flag)
 {
 	pid_t pid;
@@ -2695,8 +2703,11 @@ static int spawn(char *command, char *arg1, char *arg2, char *arg3, ushort_t fla
 			while ((read(STDIN_FILENO, &status, 1) > 0) && (status != '\n'));
 		}
 
-		if (flag & F_NORMAL)
+		if (flag & F_NORMAL) {
 			refresh();
+			/* endwin()/refresh() drops kitty's OSC-72 drag registration; re-advertise on resume. */
+			g_dnd_resync = TRUE;
+		}
 
 		free(cmd);
 	}
@@ -3564,6 +3575,905 @@ static inline int handle_event(void)
 }
 
 /*
+ * ===== kitty OSC-72 drag-and-drop (mouse-gesture-driven, bidirectional) =====
+ *
+ * nnn declares itself a drag source once at startup (EnableDrag). When the user
+ * mouse-drags on a protocol-aware terminal (kitty >= 0.47.1), the terminal sends
+ * an inbound "t=o" offer, which nnn answers with agree -> present -> start; the
+ * terminal then performs the real OS drag. Inbound OSC-72 events are parsed out
+ * of the input stream in nextsel(). Opt-in via $NNN_DND_OSC72=1 (it changes the
+ * terminal's mouse-gesture handling). Works over SSH; inside tmux it needs
+ * `set -g allow-passthrough on`. This mirrors Yazi's design; see the design doc
+ * sections 5-6 and src/nnn-dnd.c (the libX11 helper used elsewhere).
+ */
+static bool g_dnd_on;        /* drag offering enabled with the terminal */
+static char *g_dnd_b64;      /* base64 text/uri-list for the in-flight drag */
+static size_t g_dnd_b64len;
+static int g_dnd_count;      /* number of files in the in-flight drag */
+static bool g_dnd_tmux_grabbed; /* tmux mouse turned off for an in-flight drag */
+static bool g_dnd_drop_pending; /* a paste/drop was captured; browse() acts on it */
+static char *g_dnd_drop_buf;    /* captured paste/drop bytes (dropped paths/URIs) */
+static size_t g_dnd_drop_len, g_dnd_drop_cap;
+static bool g_dnd_drop_collecting; /* receiving a structured OSC-72 drop (bare kitty) */
+static int g_dnd_drop_idx;         /* offered-mime index requested for the drop */
+static struct timespec g_dnd_end_ts; /* when the last drag ended (for self-drop guard) */
+
+#ifdef CLOCK_MONOTONIC_RAW
+#define DND_CLOCK CLOCK_MONOTONIC_RAW
+#elif defined(CLOCK_MONOTONIC)
+#define DND_CLOCK CLOCK_MONOTONIC
+#else
+#define DND_CLOCK CLOCK_REALTIME
+#endif
+
+/* Bracketed-paste markers, registered via define_key() so ncurses returns the
+ * whole sequence as one keycode (with status KEY_CODE_YES). A GUI file drop the
+ * terminal cannot deliver as a structured OSC-72 drop (notably inside tmux)
+ * arrives instead as a bracketed paste of the dropped paths. */
+#define KEY_DND_PASTE_START (KEY_MAX + 1)
+#define KEY_DND_PASTE_END   (KEY_MAX + 2)
+
+static void dnd_log(const char *msg); /* forward decl: used by dnd_osc72_write */
+static void dnd_drop_putc(char c);    /* forward decl: used by the OSC-72 drop decoder */
+
+static bool dnd_in_tmux(void)
+{
+	char *t = getenv("TMUX");
+
+	return (t && *t);
+}
+
+/*
+ * While an OSC-72 drag is in flight, tmux's own mouse handling treats a drag
+ * across a pane border as a resize. Toggle tmux mouse off for the drag and
+ * back on when it ends. F_NOWAIT keeps curses up (no endwin), so this is safe
+ * mid-gesture. Restored on every drag-end path via dnd_clear_data() (and on the
+ * next subprocess resync) so an abnormal end cannot leave the mouse disabled.
+ */
+static void dnd_tmux_mouse(bool on)
+{
+	char cmd[32];
+
+	if (!dnd_in_tmux())
+		return;
+	snprintf(cmd, sizeof cmd, "tmux set -g mouse %s", on ? "on" : "off");
+	spawn(cmd, NULL, NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
+}
+
+static void dnd_release_tmux_mouse(void)
+{
+	if (g_dnd_tmux_grabbed) {
+		dnd_tmux_mouse(TRUE);
+		g_dnd_tmux_grabbed = FALSE;
+	}
+}
+
+/* TRUE within ~600ms of a drag ending: used to neutralise a drop onto our own
+ * window (the release click that would otherwise open a file, and the spurious
+ * re-offer the terminal sends right after). */
+static bool dnd_recent_drag(void)
+{
+	struct timespec now;
+	long long ms;
+
+	if (!g_dnd_end_ts.tv_sec && !g_dnd_end_ts.tv_nsec)
+		return FALSE;
+	clock_gettime(DND_CLOCK, &now);
+	ms = (long long)(now.tv_sec - g_dnd_end_ts.tv_sec) * 1000
+	   + (now.tv_nsec - g_dnd_end_ts.tv_nsec) / 1000000;
+	return (ms >= 0 && ms < 600);
+}
+
+/* Opt-in only: enabling alters terminal mouse gestures, so require NNN_DND_OSC72=1. */
+static bool dnd_osc72_capable(void)
+{
+	char *v = getenv("NNN_DND_OSC72");
+
+	return (v && *v == '1');
+}
+
+static int dnd_unreserved(uchar_t c)
+{
+	return ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		|| (c >= '0' && c <= '9')
+		|| c == '-' || c == '_' || c == '.' || c == '~' || c == '/');
+}
+
+/* Standard base64. out must hold at least 4 * ((len + 2) / 3) bytes. */
+static size_t dnd_b64(const uchar_t *in, size_t len, char *out)
+{
+	static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	size_t i, o = 0;
+
+	for (i = 0; i + 3 <= len; i += 3) {
+		uint_t v = ((uint_t)in[i] << 16) | ((uint_t)in[i + 1] << 8) | in[i + 2];
+
+		out[o++] = t[(v >> 18) & 63];
+		out[o++] = t[(v >> 12) & 63];
+		out[o++] = t[(v >> 6) & 63];
+		out[o++] = t[v & 63];
+	}
+	if (i < len) {
+		uint_t v = (uint_t)in[i] << 16;
+		int rem = (int)(len - i);
+
+		if (rem == 2)
+			v |= (uint_t)in[i + 1] << 8;
+		out[o++] = t[(v >> 18) & 63];
+		out[o++] = t[(v >> 12) & 63];
+		if (rem == 2)
+			out[o++] = t[(v >> 6) & 63];
+		/* no '=' padding: kitty's OSC-72 decoder (like Yazi) expects unpadded */
+	}
+	return o;
+}
+
+/* Write one NUL-terminated OSC-72 sequence to the tty, wrapping it in tmux's
+ * DCS passthrough (every ESC doubled) when running inside tmux. */
+/* write() all n bytes, retrying short/interrupted writes (a partial write
+ * here would truncate the base64 payload and make the terminal reject it). */
+static void dnd_full_write(const char *p, size_t n)
+{
+	while (n) {
+		ssize_t w = write(STDOUT_FILENO, p, n);
+
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (w == 0)
+			break;
+		p += w;
+		n -= (size_t)w;
+	}
+}
+
+static void dnd_osc72_write(const char *seq)
+{
+	size_t len = strlen(seq);
+
+	if (getenv("NNN_DND_DEBUG")) { /* log exactly what we emit (ESC -> \e) */
+		char *s = malloc(len * 2 + 8);
+
+		if (s) {
+			size_t i, o = 0;
+
+			memcpy(s, "out: ", 5);
+			o = 5;
+			for (i = 0; i < len; ++i) {
+				if (seq[i] == 0x1b) {
+					s[o++] = '\\';
+					s[o++] = 'e';
+				} else
+					s[o++] = seq[i];
+			}
+			s[o] = '\0';
+			dnd_log(s);
+			free(s);
+		}
+	}
+
+	if (dnd_in_tmux()) {
+		size_t cap = len * 2 + 16, o = 7, i;
+		char *w = malloc(cap);
+
+		if (!w)
+			return;
+		memcpy(w, "\x1bPtmux;", 7);
+		for (i = 0; i < len; ++i) {
+			if (seq[i] == '\x1b')
+				w[o++] = '\x1b';
+			w[o++] = seq[i];
+		}
+		w[o++] = '\x1b';
+		w[o++] = '\\';
+		dnd_full_write(w, o);
+		free(w);
+	} else
+		dnd_full_write(seq, len);
+}
+
+/* Append a line to $NNN_DND_DEBUG (a file path, or /tmp/nnn-dnd.log if "1").
+ * File-based so it never corrupts the curses screen. No-op when unset. */
+static void dnd_log(const char *msg)
+{
+	char *path = getenv("NNN_DND_DEBUG");
+	int fd;
+
+	if (!path || !*path)
+		return;
+	if (path[0] == '1' && !path[1])
+		path = "/tmp/nnn-dnd.log";
+	fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+	if (fd < 0)
+		return;
+	(void)!write(fd, msg, strlen(msg));
+	(void)!write(fd, "\n", 1);
+	close(fd);
+}
+
+static void dnd_clear_data(void)
+{
+	free(g_dnd_b64);
+	g_dnd_b64 = NULL;
+	g_dnd_b64len = 0;
+	dnd_release_tmux_mouse(); /* every drag-end path runs through here */
+}
+
+/* Build a file:// text/uri-list (selection, or the hovered file when none) and
+ * base64 it into g_dnd_b64. Returns FALSE if there is nothing to drag. */
+static bool dnd_prepare_data(void)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	size_t cap = PATH_MAX, ulen = 0;
+	char *uris, hov[PATH_MAX];
+	char **paths = NULL;
+	int n = 0, i;
+
+	dnd_clear_data();
+
+	uris = malloc(cap);
+	if (!uris)
+		return FALSE;
+
+	if (nselected && pselbuf) {
+		char *p = pselbuf, *end = pselbuf + selbufpos;
+
+		while (p < end) {
+			size_t l = strlen(p);
+
+			if (l) {
+				char **np = realloc(paths, (size_t)(n + 1) * sizeof(char *));
+
+				if (!np) {
+					free(uris);
+					free(paths);
+					return FALSE;
+				}
+				paths = np;
+				paths[n++] = p;
+			}
+			p += l + 1;
+		}
+	}
+
+	if (n == 0) {
+		if (!ndents) {
+			free(uris);
+			free(paths);
+			return FALSE;
+		}
+		mkpath(g_ctx[cfg.curctx].c_path, pdents[cur].name, hov);
+		paths = malloc(sizeof(char *));
+		if (!paths) {
+			free(uris);
+			return FALSE;
+		}
+		paths[n++] = hov;
+	}
+
+	g_dnd_count = n;
+
+	for (i = 0; i < n; ++i) {
+		const char *s = paths[i];
+		size_t need = 7 + strlen(s) * 3 + 2;
+
+		if (ulen + need + 1 > cap) {
+			char *nu = realloc(uris, (cap = (ulen + need + 1) * 2));
+
+			if (!nu) {
+				free(uris);
+				free(paths);
+				return FALSE;
+			}
+			uris = nu;
+		}
+		memcpy(uris + ulen, "file://", 7);
+		ulen += 7;
+		for (; *s; ++s) {
+			uchar_t c = (uchar_t)*s;
+
+			if (dnd_unreserved(c))
+				uris[ulen++] = (char)c;
+			else {
+				uris[ulen++] = '%';
+				uris[ulen++] = hex[c >> 4];
+				uris[ulen++] = hex[c & 15];
+			}
+		}
+		uris[ulen++] = '\r';
+		uris[ulen++] = '\n';
+	}
+	free(paths);
+
+	g_dnd_b64 = malloc(4 * ((ulen + 2) / 3) + 1);
+	if (!g_dnd_b64) {
+		free(uris);
+		return FALSE;
+	}
+	g_dnd_b64len = dnd_b64((uchar_t *)uris, ulen, g_dnd_b64);
+	g_dnd_b64[g_dnd_b64len] = '\0';
+	free(uris);
+	return (g_dnd_b64len > 0);
+}
+
+/* Build the full offer response (agree + present + start) in ONE buffer and
+ * write it atomically. kitty needs these together to "build" the drag source,
+ * and a single tmux-passthrough wrap avoids inter-message races. */
+static void dnd_osc72_offer(void)
+{
+	size_t chunks, cap, len = 0, off = 0;
+	char *b;
+
+	if (g_dnd_b64) { /* a drag is already being built/in flight */
+		dnd_log("offer ignored (drag already active)");
+		return;
+	}
+	if (dnd_recent_drag()) { /* spurious re-offer right after a drop onto our own window */
+		dnd_log("offer ignored (just ended)");
+		return;
+	}
+	if (!dnd_prepare_data()) {
+		dnd_log("offer -> nothing to drag");
+		return;
+	}
+
+	chunks = g_dnd_b64len / 4096 + 1;
+	cap = g_dnd_b64len + chunks * 48 + 512; /* + headroom for the icon */
+	b = malloc(cap);
+	if (!b)
+		return;
+
+	/* agree-drag: copy or move, offering text/uri-list */
+	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=o:o=3;text/uri-list\x1b\\");
+	/* pre-send the data for MIME index 0, chunked at 4096 base64 bytes */
+	while (off < g_dnd_b64len) {
+		size_t n = g_dnd_b64len - off;
+		int more;
+
+		if (n > 4096)
+			n = 4096;
+		more = (off + n < g_dnd_b64len);
+		len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=p:x=0:m=%d;", more);
+		memcpy(b + len, g_dnd_b64 + off, n);
+		len += n;
+		b[len++] = '\x1b';
+		b[len++] = '\\';
+		off += n;
+	}
+	/* end-of-data marker (no payload) */
+	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=p:x=0\x1b\\");
+	/* a small UTF-8 text icon so the drag has a visual (like Yazi) */
+	{
+		char icon[64], ib64[128];
+		int in = snprintf(icon, sizeof icon, "%d file(s)",
+				  g_dnd_count > 0 ? g_dnd_count : 1);
+		size_t il = dnd_b64((uchar_t *)icon, (size_t)in, ib64);
+
+		ib64[il] = '\0';
+		len += (size_t)snprintf(b + len, cap - len,
+			"\x1b]72;t=p:x=-1:y=0:X=6:Y=4:o=0:m=0;%s\x1b\\", ib64);
+	}
+	/* start the drag */
+	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=P:x=-1\x1b\\");
+	b[len] = '\0';
+
+	dnd_osc72_write(b);
+	free(b);
+	/* Drag is now in flight: stop tmux from resizing panes on border crossings. */
+	if (dnd_in_tmux() && !g_dnd_tmux_grabbed) {
+		dnd_tmux_mouse(FALSE);
+		g_dnd_tmux_grabbed = TRUE;
+	}
+	dnd_log("offer -> agree + present + start (batched)");
+}
+
+/* Answer a t=e:x=5 data request with the prepared data, in one atomic write. */
+static void dnd_osc72_send_request(void)
+{
+	size_t chunks, cap, len = 0, off = 0;
+	char *b;
+
+	if (!g_dnd_b64)
+		return;
+	chunks = g_dnd_b64len / 4096 + 1;
+	cap = g_dnd_b64len + chunks * 48 + 64;
+	b = malloc(cap);
+	if (!b)
+		return;
+
+	while (off < g_dnd_b64len) {
+		size_t n = g_dnd_b64len - off;
+		int more;
+
+		if (n > 4096)
+			n = 4096;
+		more = (off + n < g_dnd_b64len);
+		len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=e:y=0:m=%d;", more);
+		memcpy(b + len, g_dnd_b64 + off, n);
+		len += n;
+		b[len++] = '\x1b';
+		b[len++] = '\\';
+		off += n;
+	}
+	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=e:y=0:m=0\x1b\\"); /* end */
+	b[len] = '\0';
+
+	dnd_osc72_write(b);
+	free(b);
+	dnd_log("data request -> sent (batched)");
+}
+
+static int dnd_b64_rev(uchar_t c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A';
+	if (c >= 'a' && c <= 'z')
+		return c - 'a' + 26;
+	if (c >= '0' && c <= '9')
+		return c - '0' + 52;
+	if (c == '+')
+		return 62;
+	if (c == '/')
+		return 63;
+	return -1;
+}
+
+/* Decode base64 (padded or not) drop payload into the capture buffer. */
+static void dnd_b64_decode_into_drop(const char *in)
+{
+	int val = 0, bits = 0, d;
+
+	for (; *in; ++in) {
+		d = dnd_b64_rev((uchar_t)*in);
+		if (d < 0)
+			continue;
+		val = (val << 6) | d;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			dnd_drop_putc((char)((val >> bits) & 0xFF));
+		}
+	}
+}
+
+/* Index of text/uri-list among the space-separated offered mimes, or -1. */
+static int dnd_uri_index(const char *mimes)
+{
+	int idx = 0;
+	const char *m = mimes;
+
+	if (!mimes)
+		return -1;
+	for (;;) {
+		const char *e = m;
+
+		while (*e && *e != ' ')
+			++e;
+		if ((size_t)(e - m) == 13 && strncmp(m, "text/uri-list", 13) == 0)
+			return idx;
+		if (!*e)
+			return -1;
+		++idx;
+		m = e + 1;
+	}
+}
+
+/* Structured-drop hover ('m'): accept a copy of text/uri-list when offered.
+ * We accept as COPY at the protocol level so the source never deletes the files;
+ * dnd_handle_drop() asks copy/move afterwards and does its own move if needed. */
+static void dnd_osc72_drop_hover(const char *mimes)
+{
+	int idx = dnd_uri_index(mimes);
+
+	if (idx >= 0) {
+		g_dnd_drop_idx = idx + 1; /* cache for the drop in case 'M' omits mimes */
+		dnd_osc72_write("\x1b]72;t=m:o=1;text/uri-list\x1b\\");
+	} else
+		dnd_osc72_write("\x1b]72;t=m:o=0\x1b\\");
+}
+
+/* Structured drop released ('M'): request the text/uri-list by its offered index. */
+static void dnd_osc72_drop_start(const char *mimes)
+{
+	int idx = dnd_uri_index(mimes);
+	char req[32];
+
+	g_dnd_drop_collecting = FALSE;
+	if (idx < 0 && g_dnd_drop_idx > 0)
+		idx = g_dnd_drop_idx - 1; /* fall back to the hover-cached index */
+	if (idx < 0) {
+		dnd_osc72_write("\x1b]72;t=r:o=0\x1b\\"); /* uri-list not offered */
+		return;
+	}
+	g_dnd_drop_idx = idx + 1;
+	g_dnd_drop_collecting = TRUE;
+	g_dnd_drop_len = 0;
+	snprintf(req, sizeof(req), "\x1b]72;t=r:x=%d\x1b\\", g_dnd_drop_idx);
+	dnd_osc72_write(req);
+}
+
+/* A structured-drop data chunk ('r'): decode into the buffer; an empty,
+ * no-more chunk ends the drop. Hand the uri-list to browse() via the same
+ * pending-drop path the bracketed-paste fallback uses. */
+static void dnd_osc72_drop_data(const char *payload, int more)
+{
+	if (!g_dnd_drop_collecting)
+		return;
+	if (payload && *payload)
+		dnd_b64_decode_into_drop(payload);
+	if (!more && (!payload || !*payload)) {
+		dnd_osc72_write("\x1b]72;t=r:o=0\x1b\\"); /* end the drop */
+		g_dnd_drop_collecting = FALSE;
+		dnd_drop_putc('\0');
+		g_dnd_drop_pending = TRUE;
+		dnd_log("structured drop received");
+	}
+}
+
+/* Handle one inbound OSC-72 event body (the bytes after the leading "72;"). */
+static void dnd_osc72_event(const char *body)
+{
+	char t = 0;
+	int x = -1, more = 0;
+	const char *p = body, *payload = strchr(body, ';');
+
+	payload = payload ? payload + 1 : NULL;
+
+	while (*p && *p != ';') { /* metadata: key=val pairs separated by ':' */
+		if (p[1] == '=') {
+			if (p[0] == 't')
+				t = p[2];
+			else if (p[0] == 'x')
+				x = atoi(p + 2);
+			else if (p[0] == 'm')
+				more = (p[2] == '1');
+		}
+		while (*p && *p != ':' && *p != ';')
+			++p;
+		if (*p == ':')
+			++p;
+	}
+
+	/* Continuation chunk of a structured drop (kitty may send bare ';data'). */
+	if (g_dnd_drop_collecting && (t == 'r' || t == 0)) {
+		dnd_osc72_drop_data(payload, more);
+		return;
+	}
+
+	switch (t) {
+	case 'o': /* inbound drag offer -> respond with one atomic batch */
+		dnd_osc72_offer();
+		break;
+	case 'e': /* drag status */
+		if (x == 5) /* terminal requests the data */
+			dnd_osc72_send_request();
+		else if (x == 4) { /* drag finished */
+			clock_gettime(DND_CLOCK, &g_dnd_end_ts);
+			dnd_clear_data();
+			dnd_log("drag finished");
+		}
+		break;
+	case 'E': { /* OK (drag started) or an error such as EPERM */
+		const char *pl = strchr(body, ';');
+
+		if (!(pl && pl[1] == 'O' && pl[2] == 'K'))
+			dnd_clear_data();
+		dnd_log("status t=E (OK or error)");
+		break;
+	}
+	case 'm': /* structured drop hovering over the window */
+		dnd_osc72_drop_hover(payload);
+		break;
+	case 'M': /* structured drop released */
+		dnd_osc72_drop_start(payload);
+		break;
+	case 'r': /* structured drop data */
+		dnd_osc72_drop_data(payload, more);
+		break;
+	default:
+		break; /* other events consumed and ignored */
+	}
+}
+
+/* Called from nextsel() right after reading ESC ']'. Reads the rest of the OSC
+ * sequence (until ST or BEL) and dispatches it. Always consumes (never leaks). */
+static void dnd_osc72_consume(void)
+{
+	char buf[2048];
+	int n = 0;
+	wint_t ch;
+
+	timeout(120); /* tolerate small gaps within the burst */
+	while (n < (int)sizeof(buf) - 1) {
+		if (get_wch(&ch) == ERR)
+			break;
+		if (ch == 7) /* BEL terminator */
+			break;
+		if (ch == 27) { /* ESC: ST is ESC '\'; consume the trailing byte */
+			(void)get_wch(&ch);
+			break;
+		}
+		buf[n++] = (char)ch;
+	}
+	buf[n] = '\0';
+	settimeout();
+	dnd_log(buf);
+
+	if (n >= 3 && buf[0] == '7' && buf[1] == '2' && buf[2] == ';')
+		dnd_osc72_event(buf + 3);
+}
+
+/*
+ * Register the bracketed-paste markers as single keycodes and turn bracketed
+ * paste ON. A GUI file drop the terminal cannot deliver as a structured OSC-72
+ * drop (notably inside tmux) then arrives as a bracketed paste of the dropped
+ * paths, which dnd_consume_paste()/dnd_handle_drop() turn into a copy/move.
+ */
+static void dnd_drop_enable(void)
+{
+	static bool keys_defined;
+
+	if (!keys_defined) {
+		define_key("\x1b[200~", KEY_DND_PASTE_START);
+		define_key("\x1b[201~", KEY_DND_PASTE_END);
+		keys_defined = TRUE;
+	}
+	/* Sent to the immediate terminal (tmux), NOT tmux-passthrough-wrapped: we
+	 * want tmux itself to wrap the dropped paths as a paste for us. */
+	dnd_full_write("\x1b[?2004h", 8);
+}
+
+static void dnd_osc72_enable(void)
+{
+	if (g_dnd_on || !dnd_osc72_capable())
+		return;
+	/*
+	 * Empty machine id (like Yazi's EnableDrag("")): the terminal then treats
+	 * the drag as local and hands the drop target the file:// path directly,
+	 * instead of requesting the file contents via t=k -- which nnn does not
+	 * provide, so the drop would stall and the drag icon would never clear.
+	 */
+	dnd_osc72_write("\x1b]72;t=o:x=1;\x1b\\");
+	/*
+	 * Structured drop reception (EnableDrop) only outside tmux: through tmux it
+	 * would make kitty stop pasting dropped paths (suppressing the fallback) yet
+	 * the structured events are not routed back to the pane, so drops would
+	 * silently vanish. Inside tmux the bracketed-paste fallback handles drops.
+	 */
+	if (!dnd_in_tmux())
+		dnd_osc72_write("\x1b]72;t=a;text/uri-list\x1b\\");
+	dnd_drop_enable(); /* also accept GUI file drops (bracketed-paste fallback) */
+	g_dnd_on = TRUE;
+	dnd_log("enable sent (drag offering on)");
+}
+
+static void dnd_osc72_disable(void)
+{
+	if (!g_dnd_on)
+		return;
+	dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+	if (!dnd_in_tmux())
+		dnd_osc72_write("\x1b]72;t=A\x1b\\"); /* stop accepting drops */
+	dnd_full_write("\x1b[?2004l", 8); /* bracketed paste off */
+	g_dnd_drop_collecting = FALSE;
+	dnd_clear_data();
+	g_dnd_on = FALSE;
+}
+
+/*
+ * Re-advertise the drag source after returning from a curses-suspending
+ * subprocess (opener/pager/editor). endwin()/refresh() resets the terminal
+ * so kitty forgets nnn is a drag source, and any drag that was in flight when
+ * the subprocess started is now dead -- drop its buffered data too. Without
+ * this the "N file(s)" icon never reappears after opening a file.
+ */
+static void dnd_osc72_resync(void)
+{
+	if (!dnd_osc72_capable())
+		return;
+	dnd_clear_data();	/* abandon any drag interrupted by the subprocess */
+	g_dnd_drop_collecting = FALSE;
+	g_dnd_on = FALSE;	/* force dnd_osc72_enable() to re-send the offer */
+	dnd_osc72_enable();
+}
+
+static int dnd_hexval(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	c |= 32;
+	return (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+}
+
+/* Append one byte to the growable capture buffer. */
+static void dnd_drop_putc(char c)
+{
+	if (g_dnd_drop_len + 1 > g_dnd_drop_cap) {
+		size_t nc = g_dnd_drop_cap ? g_dnd_drop_cap << 1 : 4096;
+		char *nb = realloc(g_dnd_drop_buf, nc);
+
+		if (!nb)
+			return;
+		g_dnd_drop_buf = nb;
+		g_dnd_drop_cap = nc;
+	}
+	g_dnd_drop_buf[g_dnd_drop_len++] = c;
+}
+
+/* Read the bracketed-paste body (after KEY_DND_PASTE_START) up to the matching
+ * end marker, capturing the raw bytes (the dropped paths). browse() then asks
+ * copy/move and acts via dnd_handle_drop(). */
+static void dnd_consume_paste(void)
+{
+	wint_t ch;
+	int st, k, n;
+	char mb[16];
+
+	g_dnd_drop_len = 0;
+	timeout(200); /* the paste arrives as a burst */
+	for (;;) {
+		st = get_wch(&ch);
+		if (st == ERR)
+			break;
+		if (st == KEY_CODE_YES) {
+			if (ch == KEY_DND_PASTE_END)
+				break;
+			continue; /* ignore stray function keys within the burst */
+		}
+		n = wctomb(mb, (wchar_t)ch);
+		if (n <= 0) {
+			mb[0] = (char)ch;
+			n = 1;
+		}
+		for (k = 0; k < n; ++k)
+			dnd_drop_putc(mb[k]);
+	}
+	settimeout();
+	dnd_drop_putc('\0');
+	g_dnd_drop_pending = TRUE;
+}
+
+/*
+ * Bring our window forward when files are dropped in. A pty program cannot
+ * raise/focus its own OS window (kitty implements no window-manipulation escape,
+ * and X11 focus needs a display connection -- the very reason for OSC-72). Best
+ * effort: BEL makes kitty set the window urgency hint (taskbar/visual flash),
+ * and `kitten @ focus-window` actually focuses it IF kitty remote control is
+ * enabled (allow_remote_control). F_NOWAIT|F_NOTRACE: no curses suspend, errors
+ * silenced when remote control is off or the kitten is absent.
+ */
+static void dnd_focus_window(void)
+{
+	dnd_osc72_write("\a"); /* window attention (flash) */
+	spawn("kitten @ focus-window", NULL, NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
+}
+
+/*
+ * Turn the captured paste/drop bytes into existing local paths and, if any,
+ * ask copy or move and run it into the current directory. Handles newline- and
+ * (shell-escaped) space-separated paths, quotes, and file:// URIs. Returns TRUE
+ * when files were acted on (browse() then re-reads the directory). A paste with
+ * no existing paths is a plain text paste -- swallow it (no stray keys).
+ */
+static bool dnd_handle_drop(void)
+{
+	char *out, tok[PATH_MAX], path[PATH_MAX], buf[CMD_LEN_MAX];
+	const char *p = g_dnd_drop_buf;
+	size_t outlen = 0;
+	int count = 0, r, fd;
+
+	if (!g_dnd_drop_buf || !g_dnd_drop_len)
+		return FALSE;
+
+	out = malloc(g_dnd_drop_len + 16);
+	if (!out)
+		return FALSE;
+
+	while (*p) {
+		size_t tl = 0;
+		char q = 0;
+		const char *src;
+
+		while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+			++p;
+		if (!*p)
+			break;
+
+		while (*p && tl + 1 < sizeof(tok)) { /* one shell-ish token */
+			char c = *p;
+
+			if (q) {
+				if (c == q)
+					q = 0;
+				else
+					tok[tl++] = c;
+				++p;
+			} else if (c == '\'' || c == '"') {
+				q = c;
+				++p;
+			} else if (c == '\\' && p[1]) {
+				tok[tl++] = p[1];
+				p += 2;
+			} else if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+				break;
+			else {
+				tok[tl++] = c;
+				++p;
+			}
+		}
+		tok[tl] = '\0';
+		if (!tl)
+			continue;
+
+		src = tok;
+		if (strncmp(tok, "file://", 7) == 0) { /* file:// URI -> local path */
+			const char *s = tok + 7;
+			size_t pl = 0;
+
+			if (*s && *s != '/') { /* skip authority (e.g. localhost) */
+				const char *slash = strchr(s, '/');
+
+				if (slash)
+					s = slash;
+			}
+			for (; *s && pl + 1 < sizeof(path); ++s) {
+				int hi, lo;
+
+				if (*s == '%' && (hi = dnd_hexval(s[1])) >= 0
+				    && (lo = dnd_hexval(s[2])) >= 0) {
+					path[pl++] = (char)((hi << 4) | lo);
+					s += 2;
+				} else
+					path[pl++] = *s;
+			}
+			path[pl] = '\0';
+			src = path;
+		}
+
+		if (access(src, F_OK) == 0) {
+			size_t sl = strlen(src);
+
+			memcpy(out + outlen, src, sl);
+			outlen += sl;
+			out[outlen++] = '\0';
+			++count;
+		}
+	}
+
+	if (!count) {
+		free(out);
+		return FALSE; /* not a file drop -- swallow the paste */
+	}
+
+	dnd_focus_window(); /* a real drop arrived: pull our window forward */
+
+	r = get_input("Drop: 'c'opy or 'm'ove file(s)?");
+	if (r != 'c' && r != 'm') {
+		free(out);
+		printmsg("dnd: cancelled");
+		return FALSE;
+	}
+
+	fd = create_tmp_file();
+	if (fd == -1) {
+		free(out);
+		return FALSE;
+	}
+	(void)!write(fd, out, outlen);
+	close(fd);
+	free(out);
+
+	/* NUL-separated paths -> cp/mv into the current dir, exactly like opstr(). */
+	snprintf(buf, sizeof(buf), "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < '%s'",
+		 (r == 'c') ? cp : mv, g_tmpfpath);
+	spawn(utils[UTIL_SH_EXEC], buf, NULL, NULL, F_CLI | F_CHKRTN);
+	unlink(g_tmpfpath);
+	return TRUE;
+}
+
+/*
  * Returns SEL_* if key is bound and 0 otherwise.
  * Also modifies the run and env pointers (used on SEL_{RUN,RUNARG}).
  * The next keyboard input can be simulated by presel.
@@ -3580,6 +4490,38 @@ try_quit:
 		//DPRINTF_D(c);
 		//DPRINTF_S(keyname(c));
 
+		/* GUI file drop delivered as a bracketed paste -> capture and hand to browse() */
+		if (i == KEY_CODE_YES && c == KEY_DND_PASTE_START) {
+			dnd_consume_paste();
+			return 0;
+		}
+
+		/*
+		 * A bare ']' while a drag source is active is the start of an inbound
+		 * OSC-72 event whose leading ESC ncurses already consumed. Without this
+		 * ']' is bound to SEL_PROMPT, so the "72;t=..." body would open and fill
+		 * the >>> prompt. If the next byte begins the OSC body ('7' of "72;"),
+		 * consume the whole event; otherwise it is a genuine ']' -> leave it.
+		 */
+		if (g_dnd_on && i != KEY_CODE_YES && c == ']') {
+			wint_t nx;
+			int pi;
+
+			timeout(80);
+			pi = get_wch(&nx);
+			settimeout();
+			if (pi != ERR && nx == '7') {
+				unget_wch(nx); /* let consume read the full "72;..." body */
+				dnd_osc72_consume();
+				settimeout();
+				if (g_dnd_drop_pending)
+					return 0;
+				goto try_quit;
+			}
+			if (pi != ERR)
+				unget_wch(nx);
+		}
+
 #ifdef KEY_RESIZE
 		if (c == KEY_RESIZE)
 			handle_key_resize();
@@ -3587,9 +4529,24 @@ try_quit:
 
 		/* Handle Alt+key */
 		if (c == ESC) {
-			timeout(0);
+			/*
+			 * Peek the next byte. With OSC-72 DnD active, the terminal's
+			 * inbound "ESC ] 72 ; ... ST" events can be split across reads
+			 * (notably through tmux); a 0ms peek would miss the ']', treat
+			 * the ESC as a lone Escape, and let the "72;t=..." body leak as
+			 * keystrokes. Wait briefly so the whole sequence is recognised.
+			 */
+			timeout(g_dnd_on ? 100 : 0);
 			i = get_wch(&c);
 			if (i != ERR) {
+				/* Inbound kitty OSC-72 drag-and-drop event (ESC ]) */
+				if (g_dnd_on && c == ']') {
+					dnd_osc72_consume();
+					settimeout();
+					if (g_dnd_drop_pending)
+						return 0; /* browse() handles the structured drop */
+					goto try_quit;
+				}
 				if (c == ESC)
 					c = 'q'; /* Quit context */
 				else {
@@ -6364,6 +7321,7 @@ static void show_help(const char *path)
 	"0\n"
 	"1MISC\n"
 	      "8Alt ;  Select plugin%11=  Launch app\n"
+	       "cD  Drag and drop\n"
 	       "9! ^]  Shell%19]  Cmd prompt\n"
 		  "cc  Connect remote%10u  Unmount remote/archive\n"
 	       "9t ^T  Sort toggles%12s  Manage session\n"
@@ -8494,6 +9452,8 @@ static bool browse(char *ipath, int pkey)
 	bool watch = FALSE, cd = TRUE;
 	ino_t inode = 0;
 
+	dnd_osc72_enable(); /* declare nnn a kitty OSC-72 drag source (if opted in) */
+
 #ifndef NOMOUSE
 	MEVENT event = {0};
 	struct timespec mousetimings[2] = {{.tv_sec = 0, .tv_nsec = 0}, {.tv_sec = 0, .tv_nsec = 0}};
@@ -8675,9 +9635,20 @@ nochange:
 		if (!isatty(STDIN_FILENO) && !g_state.picker)
 			return EXIT_FAILURE;
 
+		if (g_dnd_resync) {
+			g_dnd_resync = FALSE;
+			dnd_osc72_resync();
+		}
+
 		sel = nextsel(presel);
 		if (presel)
 			presel = 0;
+
+		if (g_dnd_drop_pending) {
+			g_dnd_drop_pending = FALSE;
+			if (dnd_handle_drop())
+				goto begin; /* re-read dir to show the copied/moved files */
+		}
 
 		switch (sel) {
 #ifndef NOMOUSE
@@ -8779,6 +9750,19 @@ nochange:
 					rightclicksel = 1;
 					presel = SELECT;
 					goto nochange;
+				}
+
+				/*
+				 * Neutralise a drag dropped back onto our own window: while a
+				 * drag is in flight (or just ended), the press that ends it
+				 * must not register as a double-click and open the file -- that
+				 * opener would otherwise swallow the in-flight OSC-72 events.
+				 * Reset the click timing and just keep the selection.
+				 */
+				if (g_dnd_b64 || dnd_recent_drag()) {
+					mousetimings[0].tv_sec = mousetimings[1].tv_sec = 0;
+					mousedent[0] = mousedent[1] = -1;
+					break;
 				}
 
 				currentmouse ^= 1;
@@ -9743,6 +10727,72 @@ nochange:
 			if (g_state.runplugin == 1) /* Allow filtering in plugins directory */
 				presel = FILTER;
 			goto begin;
+		case SEL_DRAGDROP:
+		{
+			/*
+			 * Native drag-and-drop. Drag the selection (or, when none,
+			 * the hovered file) OUT to a GUI app via the bundled nnn-dnd
+			 * helper; or receive a drop via the dragdrop plugin (which
+			 * talks back through NNN_PIPE). See docs/Brainstorm_nnn_Support_
+			 * Drag_and_Drop.md and src/nnn-dnd.c.
+			 */
+			if (!ndents && !nselected) {
+				printwait("no file to drag", &presel);
+				goto nochange;
+			}
+
+			r = get_input("drag out (d) / receive (r) [default=d]");
+			if (r != 'd' && r != 'r' && r != '\r')
+				goto nochange;
+
+			endselection(FALSE);
+
+			/* Native drag-out path: use nnn-dnd if it is installed. */
+			if (r != 'r' && getutil("nnn-dnd")) {
+				if (selpath)
+					setenv("NNN_SEL", selpath, 1);
+
+				if (nselected)
+					spawn("nnn-dnd", "-x", "--nnn-sel", NULL,
+					      F_NOWAIT | F_NOTRACE);
+				else {
+					mkpath(path, pdents[cur].name, newpath);
+					spawn("nnn-dnd", "-x", newpath, NULL,
+					      F_NOWAIT | F_NOTRACE);
+				}
+
+				statusbar(path);
+				goto nochange;
+			}
+
+			/*
+			 * Fallback / receive path: delegate to the dragdrop plugin,
+			 * which handles dragon/ripdrag, the receive direction and the
+			 * NNN_PIPE list-back. NNN_DND_MODE skips the plugin's prompt.
+			 */
+			setenv("NNN_DND_MODE", (r == 'r') ? "receive" : "drag", 1);
+
+			enum action dndact;
+
+			do {
+				dndact = SEL_MAX;
+				if (!run_plugin(&path, "dragdrop",
+						(ndents ? pdents[cur].name : NULL),
+						&lastname, &lastdir, &dndact)) {
+					unsetenv("NNN_DND_MODE");
+					printwait(messages[MSG_FAILED], &presel);
+					goto nochange;
+				}
+
+				if (g_state.picked)
+					return EXIT_SUCCESS;
+			} while (handle_cur_move(dndact));
+
+			unsetenv("NNN_DND_MODE");
+			copycurname();
+			cd = FALSE;
+			goto begin;
+		}
 		case SEL_SELSIZE:
 			showselsize(path);
 			goto nochange;
@@ -10284,6 +11334,7 @@ static bool set_tmp_path(void)
 
 static void cleanup(void)
 {
+	dnd_osc72_disable(); /* tell the terminal we are no longer a drag source */
 #ifndef NOX11
 	if (cfg.x11 && !g_state.picker) {
 		printf("\033[23;0t"); /* reset terminal window title */

@@ -30,6 +30,7 @@
    - 3.4 5W1H Analysis of the Main Classes
    - 3.5 Dynamic Behaviour (activity, sequence, state, flowchart)
    - 3.6 Keyboard and Input Event Handling (Deep Dive)
+   - 3.7 Drag-and-Drop Subsystem (kitty OSC-72)
 4. Cross-Cutting Concerns
 5. Traceability to the Fork Features (Part I and Part II)
 
@@ -185,6 +186,7 @@ flowchart LR
         E2["Plugins (run_plugin / launch_app)"]
         E3["Control Pipe (plctrl_init / read_nointr)"]
         E4["FIFO Preview (notify_fifo / send_to_explorer)"]
+        E5["Drag-and-Drop (dnd_osc72_* / nnn-dnd helper)"]
     end
 
     subgraph Persist["Persistence Module"]
@@ -1871,6 +1873,224 @@ sequenceDiagram
 returns to. That uniformity is the design's core strength: new interactive
 behaviour slots into a well-defined pipeline rather than ad-hoc input code.
 
+### 3.7 Drag-and-Drop Subsystem (kitty OSC-72)
+
+This subsystem lets nnn act as both a **drag source** (drag a file out to a GUI
+app) and a **drop target** (drop files in from a GUI app), entirely in-process,
+over a pty -- including over SSH and (for drag-out) inside tmux. It is an
+**opt-in** feature gated on `NNN_DND_OSC72=1` and built with `make O_DND=1`
+(which also builds the separate `nnn-dnd` libX11 helper, see 3.7.8). All of it
+lives in one contiguous block of `src/nnn.c` (functions prefixed `dnd_`) plus a
+few hooks in `nextsel()`, `browse()`, `spawn()`, and `cleanup()`.
+
+#### 3.7.1 Design constraint and the delegation model
+
+A GUI drag is an X11/Wayland (XDND) protocol between **windows**. nnn is
+pty-bound: no drawing surface the display server can address, no X connection.
+It therefore **delegates** the real drag to a protocol-aware terminal (kitty
+>= 0.47.1) via the **OSC-72** escape protocol -- the terminal owns the window,
+so it can perform the OS-level drag/drop on nnn's behalf. The protocol is
+**mouse-gesture-driven and bidirectional**: nnn announces intent once, then the
+terminal sends events that nnn answers.
+
+```mermaid
+%% Why delegation is the only in-process option for a pty app
+flowchart LR
+    N["nnn (pty process)"] -->|"no X connection"| X["X11/Wayland XDND<br/>(window-to-window)"]
+    N -->|"OSC-72 escapes over the pty"| K["kitty terminal<br/>(owns the window)"]
+    K -->|"performs the real drag/drop"| G["GUI app (browser, file manager, chat)"]
+    style X stroke-dasharray: 5 5
+```
+
+#### 3.7.2 State and function inventory
+
+```
+ASCII Table 3.7.2: DnD globals (implicit "DnD session" object, src/nnn.c:3589+)
++-----------------------+----------------------------------------------------+
+| Global                | Role                                               |
++-----------------------+----------------------------------------------------+
+| g_dnd_on              | EnableDrag/EnableDrop announced to the terminal    |
+| g_dnd_b64 / _b64len   | Unpadded base64 text/uri-list for the in-flight    |
+|                       | drag-OUT                                           |
+| g_dnd_count           | Number of files in the in-flight drag (for icon)   |
+| g_dnd_tmux_grabbed    | tmux mouse turned off for this drag (Problem 4)    |
+| g_dnd_drop_pending    | A paste/drop was captured; browse() must act       |
+| g_dnd_drop_buf/_len/  | Growable capture buffer for an incoming drop       |
+|   _cap                |                                                    |
+| g_dnd_drop_collecting | Receiving a structured OSC-72 drop (bare kitty)    |
+| g_dnd_drop_idx        | Offered-mime index requested for the drop          |
+| g_dnd_end_ts          | When the last drag ended (self-drop guard)         |
+| g_dnd_resync          | Set in spawn() to re-advertise after a subprocess  |
++-----------------------+----------------------------------------------------+
+```
+
+```
+ASCII Table 3.7.2b: DnD functions grouped by responsibility
++------------------+--------------------------------------------------------------+
+| Group            | Functions (src/nnn.c)                                        |
++------------------+--------------------------------------------------------------+
+| Capability/IO    | dnd_osc72_capable, dnd_in_tmux, dnd_full_write,             |
+|                  | dnd_osc72_write (tmux-passthrough wrap), dnd_log            |
+| Encoding         | dnd_b64 (encode, unpadded), dnd_b64_rev / _decode_into_drop,|
+|                  | dnd_unreserved, dnd_hexval                                  |
+| Drag-OUT (source)| dnd_prepare_data, dnd_osc72_offer, dnd_osc72_send_request   |
+| Drop-IN (target) | dnd_drop_enable, dnd_uri_index, dnd_osc72_drop_hover/       |
+|                  | _start/_data, dnd_drop_putc, dnd_consume_paste,            |
+|                  | dnd_handle_drop, dnd_focus_window                          |
+| Event routing    | dnd_osc72_event (parse one body), dnd_osc72_consume (read   |
+|                  | a sequence off the input stream)                           |
+| Lifecycle        | dnd_osc72_enable, dnd_osc72_disable, dnd_osc72_resync,      |
+|                  | dnd_clear_data, dnd_tmux_mouse, dnd_release_tmux_mouse,     |
+|                  | dnd_recent_drag                                            |
++------------------+--------------------------------------------------------------+
+```
+
+#### 3.7.3 Drag-OUT (nnn is the drag source)
+
+`dnd_osc72_enable()` announces EnableDrag once at `browse()` start with an
+**empty machine-id** (local drag). When the user mouse-drags, the terminal sends
+an inbound `t=o` offer; `dnd_osc72_event()` routes it to `dnd_osc72_offer()`,
+which builds the agree + present + icon + start response as **one atomic,
+unpadded** write (`dnd_osc72_write()` tmux-wraps it when needed).
+
+```mermaid
+%% Drag-OUT control flow inside nnn
+sequenceDiagram
+    autonumber
+    participant K as "kitty"
+    participant NS as "nextsel()"
+    participant EV as "dnd_osc72_event()"
+    participant OF as "dnd_osc72_offer()"
+    Note over NS: ESC ] seen -> dnd_osc72_consume() reads the body
+    K->>NS: offer t=o (gesture began)
+    NS->>EV: body after the 72 prefix
+    EV->>OF: case o
+    OF->>OF: dnd_prepare_data() builds file uri-list, unpadded base64
+    OF->>K: one atomic batch (agree+present+end+icon+start)
+    OF->>OF: tmux set -g mouse off (g_dnd_tmux_grabbed)
+    K->>NS: t=E OK (drag started)
+    K->>NS: t=e:x=4 finished -> dnd_clear_data() restores tmux mouse
+```
+
+The two non-obvious correctness rules (see Problems doc 2.5) are encoded here:
+the base64 is **unpadded** (`dnd_b64`), and the EnableDrag machine-id is **empty**
+so kitty treats the drag as local and never asks for file contents.
+
+#### 3.7.4 Drop-IN (nnn is the drop target) -- two mechanisms
+
+Inbound drop events are **not routed through tmux**, so nnn uses two paths that
+converge on one handler:
+
+```
+ASCII Table 3.7.4: Drop-IN mechanism selection
++----------------------------+----------------+--------------------------------+
+| Environment                | Mechanism      | How nnn captures the paths     |
++----------------------------+----------------+--------------------------------+
+| bare kitty (no tmux)       | OSC-72         | EnableDrop (t=a;text/uri-list);|
+|                            | EnableDrop     | hover->accept->request->decode |
+| inside tmux (and always as | bracketed      | ESC[?2004h; kitty pastes the   |
+| a fallback)                | paste          | paths wrapped in ESC[200~..201~|
++----------------------------+----------------+--------------------------------+
+```
+
+EnableDrop is sent **only outside tmux** (`dnd_osc72_enable()` checks
+`dnd_in_tmux()`): inside tmux it would make kitty stop pasting -- killing the
+fallback -- while the structured events never reach the pane. Both paths set
+`g_dnd_drop_pending`; `browse()` then calls `dnd_handle_drop()`.
+
+```mermaid
+%% Drop-IN: capture -> converge -> copy/move
+flowchart TD
+    subgraph Capture["Capture (in nextsel)"]
+        BP["bracketed paste markers (define_key)<br/>-> dnd_consume_paste()"]
+        OSC["t=m/t=M/t=r -> dnd_osc72_drop_hover/start/data"]
+    end
+    BP --> P["g_dnd_drop_pending = TRUE"]
+    OSC --> P
+    P --> HD["browse(): dnd_handle_drop()"]
+    HD --> PR["parse: file:// + percent-decode, quotes,<br/>backslash escapes#59; keep paths that exist"]
+    PR --> Z{"any existing files?"}
+    Z -->|"no"| SW["swallow the paste (no stray keys)"]
+    Z -->|"yes"| FW["dnd_focus_window(): BEL + kitten @ focus-window"]
+    FW --> AM["get_input(MSG_CP_MV_AS): 'c' or 'm'"]
+    AM --> RUN["xargs -0 cp/mv into '.'<br/>(same command shape as opstr)"]
+    RUN --> BEGIN["goto begin -> re-read directory"]
+```
+
+`dnd_handle_drop()` deliberately reuses nnn's existing copy/move plumbing: it
+writes the NUL-separated existing paths to a temp file and runs the same
+`xargs -0 ... cp/mv ... .` command `opstr()` builds for selection copy, so
+conflict handling and the `cp`/`mv` flags are identical to a normal paste.
+
+#### 3.7.5 Inbound-event integration with nextsel (the fragile boundary)
+
+OSC-72 events arrive interleaved with keystrokes. nnn intercepts them in
+`nextsel()` before the `bindings[]` lookup. There are **three** ways an event's
+framing can reach nnn, and all three are handled (the third was the root cause of
+the self-drop leak, Problems doc 7):
+
+```
+ASCII Table 3.7.5: Inbound OSC-72 entry points in nextsel()
++--------------------------------+-----------------------------------------------+
+| Bytes nnn sees                 | Handling                                      |
++--------------------------------+-----------------------------------------------+
+| ESC then ']' (one read)        | ESC handler peeks ']' (100ms when g_dnd_on)   |
+|                                | -> dnd_osc72_consume()                        |
+| ESC alone, then ']' (split)    | the same 100ms peek catches the late ']'      |
+| bare ']' (ncurses ate the ESC) | a bare ']' + peek '7' of "72;" is consumed as |
+|                                | OSC-72; otherwise ']' falls through to        |
+|                                | SEL_PROMPT (its real binding, nnn.h:274)      |
+| ESC [ 200~ (bracketed paste)   | define_key -> KEY_DND_PASTE_START ->          |
+|                                | dnd_consume_paste()                           |
++--------------------------------+-----------------------------------------------+
+```
+
+`dnd_osc72_consume()` reads the body until ST/BEL and dispatches to
+`dnd_osc72_event()`, which parses the `key=val` metadata (`t`, `x`, `o`, `m`) and
+the payload, then switches on `t`: `o` (drag offer), `e`/`E` (drag status),
+`m`/`M`/`r` (drop hover/release/data).
+
+#### 3.7.6 Lifecycle, robustness, and self-drop neutralisation
+
+```
+ASCII Table 3.7.6: DnD lifecycle hooks and the invariants they protect
++----------------------------+------------------------------------------------+
+| Hook                       | Invariant protected                            |
++----------------------------+------------------------------------------------+
+| browse() start: enable     | drag/drop announced once per session           |
+| spawn() F_NORMAL: set      | a curses-suspending subprocess (opener) drops  |
+|   g_dnd_resync             | EnableDrag; browse re-advertises next iteration|
+| dnd_clear_data() on every  | restores tmux mouse so a drag can never leave  |
+|   drag-end                 | it disabled (Problem 4)                        |
+| dnd_recent_drag() (~600ms) | a drop onto our OWN window is a no-op: the      |
+|                            | release click does not open a file, and the    |
+|                            | spurious re-offer is ignored (Problem 7)       |
+| cleanup(): disable         | StopOfferingDrags + bracketed paste off on exit|
++----------------------------+------------------------------------------------+
+```
+
+The self-drop case is the subtlest: dropping a drag back on nnn's own window
+must do nothing. `dnd_recent_drag()` suppresses the release click (so no
+`SEL_OPEN`) and the spurious follow-up offer, while the bare-`]` handling (3.7.5)
+stops the inbound events leaking into the `SEL_PROMPT` prompt.
+
+#### 3.7.7 Focus on drop -- a hard limitation
+
+`dnd_focus_window()` can only **request** attention: a pty app cannot focus its
+own OS window (kitty has no window-manipulation escape; X11 focus needs a display
+connection; WMs block focus-stealing). It emits BEL (kitty urgency hint) and
+tries `kitten @ focus-window` (works only with `allow_remote_control`).
+
+#### 3.7.8 The nnn-dnd helper (Approach B, complementary)
+
+`make O_DND=1` also builds `src/nnn-dnd.c`, a small **libX11** helper used by the
+`dragdrop` plugin for terminals without OSC-72. In source mode it owns a real
+`XdndAware` window and advertises `text/uri-list`; in target mode (`-t`) it
+receives a drop and prints the paths. The OSC-72 path (in-process, kitty) and the
+helper path (out-of-process, any X11 terminal) are complementary, selected by
+the plugin and `NNN_DND_MODE`. See the brainstorm doc for the full approach
+comparison.
+
 ---
 
 ## 4. Cross-Cutting Concerns
@@ -1943,6 +2163,13 @@ ASCII Table 5: How the fork features map onto this design
 |          |                            | instance via pipe, other pane via tmux,   |
 |          |                            | like ctx_switcher). Cross tab/session/    |
 |          |                            | instance.                                |
+| Native   | DnD Subsystem (3.7) +       | NNN_DND_OSC72=1 makes nnn a kitty OSC-72  |
+| drag &   | Process Service (3.5.5) +   | drag source / drop target in-process:     |
+| drop     | Input (3.6, nextsel hooks)  | drag-out (unpadded base64, empty machine- |
+|          |                            | id), drop-in (EnableDrop in bare kitty,   |
+|          |                            | bracketed-paste fallback in tmux) asking  |
+|          |                            | copy/move. nnn-dnd libX11 helper covers   |
+|          |                            | non-OSC-72 terminals. See Problems 2-7.   |
 +----------+----------------------------+------------------------------------------+
 ```
 
@@ -1992,5 +2219,12 @@ ASCII Table A: Where to find each design element in the source
 | cdprep                         | 8395                                          |
 | browse (event loop)            | 8425                                          |
 | main                           | 10255                                         |
+| DnD globals / g_dnd_resync     | 3589 / 2646                                   |
+| DnD core block (dnd_osc72_*)   | 3619-4360                                     |
+| DnD enable / disable / resync  | 4228 / 4252 / 4272                            |
+| DnD inbound hooks in nextsel   | bare ']' ~4493, ESC ']' peek handler          |
+| DnD browse hooks (resync/drop) | 9638 / 9647                                   |
+| ']' -> SEL_PROMPT binding      | src/nnn.h:274                                 |
+| nnn-dnd libX11 helper          | src/nnn-dnd.c (built with O_DND=1)            |
 +--------------------------------+-----------------------------------------------+
 ```
