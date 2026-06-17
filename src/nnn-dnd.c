@@ -46,6 +46,12 @@
 #define XDND_VERSION    5
 #define DND_TIMEOUT_SEC 10
 
+static int dbg_on; /* enabled by $NNN_DND_DEBUG */
+#define DBG(...) do { if (dbg_on) { \
+		fprintf(stderr, "nnn-dnd[dbg]: "); \
+		fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); \
+		fflush(stderr); } } while (0)
+
 /* All XDND / selection atoms we need, interned once. */
 struct atoms {
 	Atom XdndAware;
@@ -625,6 +631,9 @@ static int run_target(struct app *ap)
 			PropModeReplace, (unsigned char *)&version, 1);
 	ap->label = "Drop files here";
 
+	DBG("target: win=0x%lx, XdndAware set, entering event loop",
+	    (unsigned long)ap->win);
+
 	for (;;) {
 		XEvent ev;
 
@@ -669,6 +678,8 @@ static int run_target(struct app *ap)
 						if ((Atom)ev.xclient.data.l[i] == ap->a.text_uri_list)
 							accept = 1;
 				}
+				DBG("target: XdndEnter from 0x%lx accept=%d",
+				    (unsigned long)source, accept);
 			} else if (mt == ap->a.XdndPosition) {
 				source = (Window)ev.xclient.data.l[0];
 				/* Reply with our status: accept uri-list, action copy.
@@ -676,6 +687,7 @@ static int run_target(struct app *ap)
 				send_xdnd(ap, source, ap->a.XdndStatus, (long)ap->win,
 					  accept ? 1 : 0, 0, 0,
 					  accept ? (long)ap->a.XdndActionCopy : None);
+				DBG("target: XdndPosition, sent status accept=%d", accept);
 			} else if (mt == ap->a.XdndLeave) {
 				source = None;
 				accept = 0;
@@ -688,6 +700,7 @@ static int run_target(struct app *ap)
 					continue;
 				}
 				/* Ask the X server to hand us the dragged data. */
+				DBG("target: XdndDrop, converting selection");
 				XConvertSelection(ap->dpy, ap->a.XdndSelection,
 						  ap->a.text_uri_list, ap->a.prop,
 						  ap->win, drop_time);
@@ -696,6 +709,8 @@ static int run_target(struct app *ap)
 			size_t len = 0;
 			char *data;
 
+			DBG("target: SelectionNotify prop=%ld",
+			    (long)ev.xselection.property);
 			if (ev.xselection.property == None) {
 				if (source)
 					send_xdnd(ap, source, ap->a.XdndFinished,
@@ -775,6 +790,9 @@ static int run_source(struct app *ap)
 	if (XGetSelectionOwner(ap->dpy, ap->a.XdndSelection) != ap->win)
 		die("could not take ownership of XdndSelection");
 
+	DBG("source: win=0x%lx, %d file(s), entering event loop",
+	    (unsigned long)ap->win, ap->nfiles);
+
 	for (;;) {
 		XEvent ev;
 
@@ -789,6 +807,8 @@ static int run_source(struct app *ap)
 		}
 		XNextEvent(ap->dpy, &ev);
 
+		DBG("source: event type=%d", ev.type);
+
 		switch (ev.type) {
 		case Expose:
 			draw_label(ap);
@@ -799,6 +819,7 @@ static int run_source(struct app *ap)
 				return 0;
 			if (ev.xclient.message_type == ap->a.XdndStatus) {
 				accepted = (int)(ev.xclient.data.l[1] & 1);
+				DBG("source: XdndStatus accepted=%d", accepted);
 			} else if (ev.xclient.message_type == ap->a.XdndFinished) {
 				if (ap->o.and_exit)
 					return 0;
@@ -811,11 +832,13 @@ static int run_source(struct app *ap)
 			break;
 		case ButtonPress:
 			if (ev.xbutton.button == Button1 && !dragging) {
-				dragging = 1;
-				XGrabPointer(ap->dpy, ap->win, False,
+				int gr = XGrabPointer(ap->dpy, ap->win, False,
 					     ButtonReleaseMask | PointerMotionMask,
 					     GrabModeAsync, GrabModeAsync, None,
 					     ap->drag_cursor, CurrentTime);
+
+				dragging = 1;
+				DBG("source: ButtonPress, XGrabPointer=%d (0=ok)", gr);
 			}
 			break;
 		case MotionNotify:
@@ -837,6 +860,8 @@ static int run_source(struct app *ap)
 							  (long)ap->win,
 							  (long)cur_ver << 24,
 							  (long)ap->a.text_uri_list, 0, 0);
+					DBG("source: target=0x%lx ver=%d",
+					    (unsigned long)tgt, ver);
 				}
 				if (cur_target)
 					send_xdnd(ap, cur_msg, ap->a.XdndPosition,
@@ -850,9 +875,12 @@ static int run_source(struct app *ap)
 			if (ev.xbutton.button == Button1 && dragging) {
 				dragging = 0;
 				XUngrabPointer(ap->dpy, CurrentTime);
+				DBG("source: ButtonRelease target=0x%lx accepted=%d",
+				    (unsigned long)cur_target, accepted);
 				if (cur_target && cur_msg && accepted) {
 					send_xdnd(ap, cur_msg, ap->a.XdndDrop, (long)ap->win,
 						  0, CurrentTime, 0, 0);
+					DBG("source: sent XdndDrop");
 					dropped = 1;
 					drop_started = time(NULL);
 				} else {
@@ -901,6 +929,7 @@ int main(int argc, char **argv)
 	};
 
 	memset(&ap, 0, sizeof ap);
+	dbg_on = (getenv("NNN_DND_DEBUG") != NULL);
 
 	while ((c = getopt_long(argc, argv, "txpaATIifkhV", longopts, NULL)) != -1) {
 		switch (c) {
