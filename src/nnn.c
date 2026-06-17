@@ -3591,6 +3591,16 @@ static char *g_dnd_b64;      /* base64 text/uri-list for the in-flight drag */
 static size_t g_dnd_b64len;
 static int g_dnd_count;      /* number of files in the in-flight drag */
 static bool g_dnd_tmux_grabbed; /* tmux mouse turned off for an in-flight drag */
+static bool g_dnd_drop_pending; /* a paste/drop was captured; browse() acts on it */
+static char *g_dnd_drop_buf;    /* captured paste/drop bytes (dropped paths/URIs) */
+static size_t g_dnd_drop_len, g_dnd_drop_cap;
+
+/* Bracketed-paste markers, registered via define_key() so ncurses returns the
+ * whole sequence as one keycode (with status KEY_CODE_YES). A GUI file drop the
+ * terminal cannot deliver as a structured OSC-72 drop (notably inside tmux)
+ * arrives instead as a bracketed paste of the dropped paths. */
+#define KEY_DND_PASTE_START (KEY_MAX + 1)
+#define KEY_DND_PASTE_END   (KEY_MAX + 2)
 
 static void dnd_log(const char *msg); /* forward decl: used by dnd_osc72_write */
 
@@ -4036,6 +4046,26 @@ static void dnd_osc72_consume(void)
 		dnd_osc72_event(buf + 3);
 }
 
+/*
+ * Register the bracketed-paste markers as single keycodes and turn bracketed
+ * paste ON. A GUI file drop the terminal cannot deliver as a structured OSC-72
+ * drop (notably inside tmux) then arrives as a bracketed paste of the dropped
+ * paths, which dnd_consume_paste()/dnd_handle_drop() turn into a copy/move.
+ */
+static void dnd_drop_enable(void)
+{
+	static bool keys_defined;
+
+	if (!keys_defined) {
+		define_key("\x1b[200~", KEY_DND_PASTE_START);
+		define_key("\x1b[201~", KEY_DND_PASTE_END);
+		keys_defined = TRUE;
+	}
+	/* Sent to the immediate terminal (tmux), NOT tmux-passthrough-wrapped: we
+	 * want tmux itself to wrap the dropped paths as a paste for us. */
+	dnd_full_write("\x1b[?2004h", 8);
+}
+
 static void dnd_osc72_enable(void)
 {
 	if (g_dnd_on || !dnd_osc72_capable())
@@ -4047,6 +4077,7 @@ static void dnd_osc72_enable(void)
 	 * provide, so the drop would stall and the drag icon would never clear.
 	 */
 	dnd_osc72_write("\x1b]72;t=o:x=1;\x1b\\");
+	dnd_drop_enable(); /* also accept GUI file drops (bracketed-paste fallback) */
 	g_dnd_on = TRUE;
 	dnd_log("enable sent (drag offering on)");
 }
@@ -4056,6 +4087,7 @@ static void dnd_osc72_disable(void)
 	if (!g_dnd_on)
 		return;
 	dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+	dnd_full_write("\x1b[?2004l", 8); /* bracketed paste off */
 	dnd_clear_data();
 	g_dnd_on = FALSE;
 }
@@ -4076,6 +4108,183 @@ static void dnd_osc72_resync(void)
 	dnd_osc72_enable();
 }
 
+static int dnd_hexval(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	c |= 32;
+	return (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+}
+
+/* Append one byte to the growable capture buffer. */
+static void dnd_drop_putc(char c)
+{
+	if (g_dnd_drop_len + 1 > g_dnd_drop_cap) {
+		size_t nc = g_dnd_drop_cap ? g_dnd_drop_cap << 1 : 4096;
+		char *nb = realloc(g_dnd_drop_buf, nc);
+
+		if (!nb)
+			return;
+		g_dnd_drop_buf = nb;
+		g_dnd_drop_cap = nc;
+	}
+	g_dnd_drop_buf[g_dnd_drop_len++] = c;
+}
+
+/* Read the bracketed-paste body (after KEY_DND_PASTE_START) up to the matching
+ * end marker, capturing the raw bytes (the dropped paths). browse() then asks
+ * copy/move and acts via dnd_handle_drop(). */
+static void dnd_consume_paste(void)
+{
+	wint_t ch;
+	int st, k, n;
+	char mb[16];
+
+	g_dnd_drop_len = 0;
+	timeout(200); /* the paste arrives as a burst */
+	for (;;) {
+		st = get_wch(&ch);
+		if (st == ERR)
+			break;
+		if (st == KEY_CODE_YES) {
+			if (ch == KEY_DND_PASTE_END)
+				break;
+			continue; /* ignore stray function keys within the burst */
+		}
+		n = wctomb(mb, (wchar_t)ch);
+		if (n <= 0) {
+			mb[0] = (char)ch;
+			n = 1;
+		}
+		for (k = 0; k < n; ++k)
+			dnd_drop_putc(mb[k]);
+	}
+	settimeout();
+	dnd_drop_putc('\0');
+	g_dnd_drop_pending = TRUE;
+}
+
+/*
+ * Turn the captured paste/drop bytes into existing local paths and, if any,
+ * ask copy or move and run it into the current directory. Handles newline- and
+ * (shell-escaped) space-separated paths, quotes, and file:// URIs. Returns TRUE
+ * when files were acted on (browse() then re-reads the directory). A paste with
+ * no existing paths is a plain text paste -- swallow it (no stray keys).
+ */
+static bool dnd_handle_drop(void)
+{
+	char *out, tok[PATH_MAX], path[PATH_MAX], buf[CMD_LEN_MAX];
+	const char *p = g_dnd_drop_buf;
+	size_t outlen = 0;
+	int count = 0, r, fd;
+
+	if (!g_dnd_drop_buf || !g_dnd_drop_len)
+		return FALSE;
+
+	out = malloc(g_dnd_drop_len + 16);
+	if (!out)
+		return FALSE;
+
+	while (*p) {
+		size_t tl = 0;
+		char q = 0;
+		const char *src;
+
+		while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+			++p;
+		if (!*p)
+			break;
+
+		while (*p && tl + 1 < sizeof(tok)) { /* one shell-ish token */
+			char c = *p;
+
+			if (q) {
+				if (c == q)
+					q = 0;
+				else
+					tok[tl++] = c;
+				++p;
+			} else if (c == '\'' || c == '"') {
+				q = c;
+				++p;
+			} else if (c == '\\' && p[1]) {
+				tok[tl++] = p[1];
+				p += 2;
+			} else if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+				break;
+			else {
+				tok[tl++] = c;
+				++p;
+			}
+		}
+		tok[tl] = '\0';
+		if (!tl)
+			continue;
+
+		src = tok;
+		if (strncmp(tok, "file://", 7) == 0) { /* file:// URI -> local path */
+			const char *s = tok + 7;
+			size_t pl = 0;
+
+			if (*s && *s != '/') { /* skip authority (e.g. localhost) */
+				const char *slash = strchr(s, '/');
+
+				if (slash)
+					s = slash;
+			}
+			for (; *s && pl + 1 < sizeof(path); ++s) {
+				int hi, lo;
+
+				if (*s == '%' && (hi = dnd_hexval(s[1])) >= 0
+				    && (lo = dnd_hexval(s[2])) >= 0) {
+					path[pl++] = (char)((hi << 4) | lo);
+					s += 2;
+				} else
+					path[pl++] = *s;
+			}
+			path[pl] = '\0';
+			src = path;
+		}
+
+		if (access(src, F_OK) == 0) {
+			size_t sl = strlen(src);
+
+			memcpy(out + outlen, src, sl);
+			outlen += sl;
+			out[outlen++] = '\0';
+			++count;
+		}
+	}
+
+	if (!count) {
+		free(out);
+		return FALSE; /* not a file drop -- swallow the paste */
+	}
+
+	r = get_input("Drop: 'c'opy or 'm'ove file(s)?");
+	if (r != 'c' && r != 'm') {
+		free(out);
+		printmsg("dnd: cancelled");
+		return FALSE;
+	}
+
+	fd = create_tmp_file();
+	if (fd == -1) {
+		free(out);
+		return FALSE;
+	}
+	(void)!write(fd, out, outlen);
+	close(fd);
+	free(out);
+
+	/* NUL-separated paths -> cp/mv into the current dir, exactly like opstr(). */
+	snprintf(buf, sizeof(buf), "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < '%s'",
+		 (r == 'c') ? cp : mv, g_tmpfpath);
+	spawn(utils[UTIL_SH_EXEC], buf, NULL, NULL, F_CLI | F_CHKRTN);
+	unlink(g_tmpfpath);
+	return TRUE;
+}
+
 /*
  * Returns SEL_* if key is bound and 0 otherwise.
  * Also modifies the run and env pointers (used on SEL_{RUN,RUNARG}).
@@ -4092,6 +4301,12 @@ try_quit:
 		i = get_wch(&c);
 		//DPRINTF_D(c);
 		//DPRINTF_S(keyname(c));
+
+		/* GUI file drop delivered as a bracketed paste -> capture and hand to browse() */
+		if (i == KEY_CODE_YES && c == KEY_DND_PASTE_START) {
+			dnd_consume_paste();
+			return 0;
+		}
 
 #ifdef KEY_RESIZE
 		if (c == KEY_RESIZE)
@@ -9205,6 +9420,12 @@ nochange:
 		sel = nextsel(presel);
 		if (presel)
 			presel = 0;
+
+		if (g_dnd_drop_pending) {
+			g_dnd_drop_pending = FALSE;
+			if (dnd_handle_drop())
+				goto begin; /* re-read dir to show the copied/moved files */
+		}
 
 		switch (sel) {
 #ifndef NOMOUSE
