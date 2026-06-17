@@ -2637,6 +2637,14 @@ static int join(pid_t p, uchar_t flag)
  * Spawns a child process. Behaviour can be controlled using flag.
  * Limited to 3 arguments to a program, flag works on bit set.
  */
+
+/*
+ * Set when a curses-suspending subprocess (opener/pager/editor) returns: it
+ * tells browse() to re-advertise the OSC-72 drag source, because endwin()/
+ * refresh() resets the terminal and kitty forgets nnn is draggable.
+ */
+static bool g_dnd_resync;
+
 static int spawn(char *command, char *arg1, char *arg2, char *arg3, ushort_t flag)
 {
 	pid_t pid;
@@ -2695,8 +2703,11 @@ static int spawn(char *command, char *arg1, char *arg2, char *arg3, ushort_t fla
 			while ((read(STDIN_FILENO, &status, 1) > 0) && (status != '\n'));
 		}
 
-		if (flag & F_NORMAL)
+		if (flag & F_NORMAL) {
 			refresh();
+			/* endwin()/refresh() drops kitty's OSC-72 drag registration; re-advertise on resume. */
+			g_dnd_resync = TRUE;
+		}
 
 		free(cmd);
 	}
@@ -4015,6 +4026,22 @@ static void dnd_osc72_disable(void)
 	dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
 	dnd_clear_data();
 	g_dnd_on = FALSE;
+}
+
+/*
+ * Re-advertise the drag source after returning from a curses-suspending
+ * subprocess (opener/pager/editor). endwin()/refresh() resets the terminal
+ * so kitty forgets nnn is a drag source, and any drag that was in flight when
+ * the subprocess started is now dead -- drop its buffered data too. Without
+ * this the "N file(s)" icon never reappears after opening a file.
+ */
+static void dnd_osc72_resync(void)
+{
+	if (!dnd_osc72_capable())
+		return;
+	dnd_clear_data();	/* abandon any drag interrupted by the subprocess */
+	g_dnd_on = FALSE;	/* force dnd_osc72_enable() to re-send the offer */
+	dnd_osc72_enable();
 }
 
 /*
@@ -9137,6 +9164,11 @@ nochange:
 		/* If STDIN is no longer a tty (closed) we should exit */
 		if (!isatty(STDIN_FILENO) && !g_state.picker)
 			return EXIT_FAILURE;
+
+		if (g_dnd_resync) {
+			g_dnd_resync = FALSE;
+			dnd_osc72_resync();
+		}
 
 		sel = nextsel(presel);
 		if (presel)
