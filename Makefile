@@ -30,6 +30,7 @@ O_NOUG := 0  # disable user, group name in status bar
 O_NOX11 := 0  # disable X11 integration
 O_NOSORT := 0  # disable sorting entries on dir load
 O_DIMFILTERED := 1  # dim characters matching filter (default: enabled)
+O_DND := 0  # build the nnn-dnd drag-and-drop helper (X11, links -lX11)
 
 # User patches
 O_COLEMAK := 0 # change key bindings to colemak compatible layout
@@ -182,6 +183,8 @@ DISTFILES = src nnn.1 Makefile README.md LICENSE
 SRC = src/nnn.c
 HEADERS = src/nnn.h
 BIN = nnn
+DNDBIN = nnn-dnd
+DNDSRC = src/nnn-dnd.c
 DESKTOPFILE = misc/desktop/nnn.desktop
 LOGOSVG = misc/logo/logo.svg
 LOGO64X64 = misc/logo/logo-64x64.png
@@ -222,12 +225,21 @@ ifeq ($(strip $(O_ICONS)),1)
 	HEADERS += src/icons.h src/$(ICONS_INCLUDE) src/icons-in-terminal.h
 endif
 
+ifeq ($(strip $(O_DND)),1)
+all: $(BIN) $(DNDBIN)
+else
 all: $(BIN)
+endif
 
 $(BIN): $(SRC) $(HEADERS) Makefile
 	@$(MAKE) --silent prepatch
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(GETTIME_C) $< $(LDLIBS)
 	@$(MAKE) --silent postpatch
+
+# nnn-dnd: standalone X11 drag-and-drop helper, built only with O_DND=1.
+# It links libX11 only -- nnn itself gains no new dependency.
+$(DNDBIN): $(DNDSRC) Makefile
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(DNDSRC) -lX11
 
 # targets for backwards compatibility
 debug: $(BIN)
@@ -254,11 +266,15 @@ uninstall-desktop:
 install: all
 	$(INSTALL) -m 0755 -d $(DESTDIR)$(PREFIX)/bin
 	$(INSTALL) -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin
+ifeq ($(strip $(O_DND)),1)
+	$(INSTALL) -m 0755 $(DNDBIN) $(DESTDIR)$(PREFIX)/bin
+endif
 	$(INSTALL) -m 0755 -d $(DESTDIR)$(MANPREFIX)/man1
 	$(INSTALL) -m 0644 $(BIN).1 $(DESTDIR)$(MANPREFIX)/man1
 
 uninstall:
 	$(RM) $(DESTDIR)$(PREFIX)/bin/$(BIN)
+	$(RM) $(DESTDIR)$(PREFIX)/bin/$(DNDBIN)
 	$(RM) $(DESTDIR)$(MANPREFIX)/man1/$(BIN).1
 
 strip: $(BIN)
@@ -361,7 +377,7 @@ upload-local: sign static musl
 	    --upload-file $(PKG_MUSL_EMOJI)-$(VERSION).$(ARCH).tar.gz
 
 clean:
-	$(RM) -f $(BIN) nnn-$(VERSION).tar.gz *.sig $(BIN)-static $(BIN)-static-$(VERSION).x86_64.tar.gz $(BIN)-icons-static $(BIN)-icons-static-$(VERSION).x86_64.tar.gz $(BIN)-nerd-static $(BIN)-nerd-static-$(VERSION).x86_64.tar.gz $(BIN)-emoji-static $(BIN)-emoji-static-$(VERSION).x86_64.tar.gz $(BIN)-musl-static $(BIN)-musl-static-$(VERSION).x86_64.tar.gz $(BIN)-musl-emoji-static $(BIN)-musl-emoji-static-$(VERSION).x86_64.tar.gz src/icons-hash-gen src/icons-generated-*.h
+	$(RM) -f $(BIN) $(DNDBIN) nnn-$(VERSION).tar.gz *.sig $(BIN)-static $(BIN)-static-$(VERSION).x86_64.tar.gz $(BIN)-icons-static $(BIN)-icons-static-$(VERSION).x86_64.tar.gz $(BIN)-nerd-static $(BIN)-nerd-static-$(VERSION).x86_64.tar.gz $(BIN)-emoji-static $(BIN)-emoji-static-$(VERSION).x86_64.tar.gz $(BIN)-musl-static $(BIN)-musl-static-$(VERSION).x86_64.tar.gz $(BIN)-musl-emoji-static $(BIN)-musl-emoji-static-$(VERSION).x86_64.tar.gz src/icons-hash-gen src/icons-generated-*.h
 
 checkpatches:
 	./patches/check-patches.sh
