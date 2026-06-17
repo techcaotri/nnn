@@ -1215,6 +1215,186 @@ flowchart LR
 **Caveat (tooling).** The comma-separated multi-restore needs trash-cli
 `>= ~0.22`; this machine runs `0.24.5.26`, so single and multi restore both work.
 
+#### 3.5.12 Shared, Cross-Instance Directory History (plugin tie-in)
+
+nnn natively keeps only **one** previous directory per context (`c_last`,
+toggled by `-`). This fork adds an **unlimited** directory history that is shared
+across all 8 contexts (tabs), both sessions (`left`/`right`) and both running
+instances (the dual TMUX panes). The full design rationale is in
+[Brainstorm_nnn_Support_Unlimited_History.md](Brainstorm_nnn_Support_Unlimited_History.md);
+this section documents what shipped.
+
+##### 3.5.12.1 Architecture
+
+```mermaid
+%% Two planes: a one-line C recorder feeds a shared log#59; plugins navigate it
+flowchart TB
+    subgraph Record["RECORD (one C line at begin:, gated by O_HIST + NNN_HIST)"]
+        RecL["record_visit (instance L)"]
+        RecR["record_visit (instance R)"]
+    end
+    Log["Shared Visit Log (~/.config/nnn/.dirhistory, append-only TSV)"]
+    subgraph Navigate["NAVIGATE (plugins, no extra C)"]
+        Picker["History Picker (nnn-history, key #59;h)"]
+        Switcher["Context Switcher (ctx_switcher, Alt+w)"]
+    end
+    PipeL["NNN_PIPE of L"]
+    PaneR["other pane (tmux)"]
+
+    RecL --> Log
+    RecR --> Log
+    Picker -- "read + dedup" --> Log
+    Picker -- "navigate: 0c<path>" --> PipeL
+    Picker -- "switch this instance: Nc<path>" --> PipeL
+    Picker -- "switch other pane: focus + ctx key" --> PaneR
+    Switcher -- "list/switch contexts across panes" --> PaneR
+```
+
+**Explanation.** The **only** C change is one guarded line at the `begin:` choke
+point (next to Part I's session auto-save) that appends the current directory to
+a shared log. Everything navigable is a plugin reusing the `NNN_PIPE` control
+protocol -- so cross-instance history needs no navigation code in nnn.
+
+##### 3.5.12.2 The recorder and the store
+
+`record_visit()` ([src/nnn.c, under `#ifdef HIST_LOG`]) is compiled in only with
+the `O_HIST` make option (`-DHIST_LOG`) and active only when `NNN_HIST=global`
+is exported -- off by default, so the default build is byte-for-byte upstream.
+
+```
+ASCII Table 3.5.12a: Visit-log record (TSV line in .dirhistory)
++-------------+--------------------------------------------------------------+
+| Field       | Meaning                                                      |
++-------------+--------------------------------------------------------------+
+| ts_nanos    | clock_gettime(CLOCK_REALTIME) nanoseconds -- global ordering.|
+| instance_id | $TMUX_PANE if set (e.g. %12), else the pid.                  |
+| session     | curssn ('left' / 'right' / '@'), or '-' if none.            |
+| ctx         | the context (tab) number 1..8.                              |
+| path        | the absolute directory visited.                             |
++-------------+--------------------------------------------------------------+
+```
+
+One atomic `O_APPEND` write per real chdir (gated on the existing `cd` flag), so
+every navigation in every tab/session/instance lands in one shared file.
+
+```mermaid
+%% Sequence: record a visit (mirrors Part I's hook placement)
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant B as Event Loop (browse, begin:)
+    participant R as Visit Recorder (record_visit)
+    participant L as Visit Log (.dirhistory)
+
+    U->>B: navigate (any tab / instance)
+    Note over B: at begin:, cd == TRUE
+    alt O_HIST build AND NNN_HIST=global
+        B->>R: record_visit(path)
+        R->>L: append "ts id session ctx path"
+    else disabled
+        B-->>U: no-op (upstream behaviour)
+    end
+```
+
+##### 3.5.12.3 The `nnn-history` picker -- navigate and switch
+
+The picker ([plugins/nnn-history](../plugins/nnn-history), bound to `;h`) reads
+the log, dedups by path (most-recent kept), and shows the list in fzf with the
+newest at the bottom. Its key enhancement: for the **most-recent 20** entries it
+checks whether the directory is **already open in a tab**, and if so offers
+**two** actions instead of one.
+
+```
+ASCII Table 3.5.12b: Menu rows are TAB-delimited (fzf shows only the display)
++--------+-----------------------------------------------------------------+
+| Field  | Meaning                                                         |
++--------+-----------------------------------------------------------------+
+| kind   | NAV (navigate here) or SW (switch to an open tab)               |
+| target | for SW: C = this instance, O = the other pane#59; NAV: unused    |
+| ctx    | for SW: the tab number 1..8 to switch to                        |
+| path   | the directory                                                   |
+| display| the human label fzf renders (cd ... / > switch to [..]) ...     |
++--------+-----------------------------------------------------------------+
+```
+
+```mermaid
+%% Per-entry menu-build decision (most-recent 20 get the switch check)
+flowchart TD
+    Start["for each unique history dir (newest-first)"] --> Rank{"within the<br/>most-recent 20?"}
+    Rank -->|"no"| NavOnly["emit NAV (cd) only"]
+    Rank -->|"yes"| Open{"open in a tab?<br/>(match $d1..$d8 or<br/>the other session)"}
+    Open -->|"no"| NavOnly2["emit NAV (cd) only"]
+    Open -->|"yes"| Both["emit NAV (cd)<br/>+ one SW per matching tab"]
+    NavOnly --> Next["next dir"]
+    NavOnly2 --> Next
+    Both --> Next
+```
+
+**Open-tab detection.** This instance's open tabs come from nnn's exported
+`$d1..$d8` (the active context paths -- authoritative and free). The **other**
+pane's open tabs are read by **binary-parsing its session file** (`left` /
+`right`, session format v1) exactly as `ctx_switcher` does -- kept current by the
+`-S` persistent session plus Part I's auto-save-on-chdir.
+
+```mermaid
+%% Where "currently open tabs" come from
+flowchart LR
+    This["this instance"] --> Dvars["$d1..$d8 (nnn setexports)"]
+    Other["other pane"] --> Ssn["parse session file (left/right)"]
+    Dvars --> Map["open-tab map: target ctx path"]
+    Ssn --> Map
+    Map --> Match["match a history dir -> offer 'switch'"]
+```
+
+##### 3.5.12.4 Acting on a selection
+
+```
+ASCII Table 3.5.12c: How each chosen row is executed
++----------------------+-----------------------------------------------------+
+| Chosen row           | Action                                              |
++----------------------+-----------------------------------------------------+
+| NAV (cd)             | navigate the current tab: write 0c<path> to NNN_PIPE |
+| SW target=C (here)   | switch THIS instance to ctx N: write Nc<path> to     |
+|                      | NNN_PIPE (re-cd to its own path == just switch)     |
+| SW target=O (other)  | focus the other nnn pane (tmux select-pane) and send |
+|                      | the context digit N to switch its tab               |
++----------------------+-----------------------------------------------------+
+```
+
+```mermaid
+%% Sequence: picker offering navigate vs switch
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant B as Event Loop (instance L)
+    participant P as History Picker (nnn-history)
+    participant L as Visit Log (.dirhistory)
+    participant Pi as NNN_PIPE of L
+    participant R as Other pane (instance R)
+
+    U->>B: press #59;h
+    B->>P: run plugin (with $d1..$d8, $NNN_PIPE)
+    P->>L: dedup#59; for top-20 check open tabs ($d* + other session)
+    P-->>U: fzf list (NAV + SW rows, newest at bottom)
+    alt choose "cd"
+        U->>P: select NAV
+        P->>Pi: 0c<path>  (current tab navigates)
+    else choose "switch [here ctxN]"
+        U->>P: select SW target=C
+        P->>Pi: Nc<path>  (this instance switches to ctx N)
+    else choose "switch [right ctxN]"
+        U->>P: select SW target=O
+        P->>R: tmux focus + send "N" (other pane switches to ctx N)
+    end
+```
+
+**Explanation.** Navigate and "switch to my own tab" both go through this
+instance's pipe; only "switch to the other pane" needs tmux (a different
+process's pipe is not addressable, so the keystroke route -- proven by
+`ctx_switcher` -- is used). The companion `ctx_switcher` plugin (Alt+w) lists and
+switches contexts across panes directly and is the source of the session-file
+parser and the cross-pane switch technique reused here.
+
 ---
 
 ### 3.6 Keyboard and Input Event Handling (Deep Dive)
@@ -1755,6 +1935,14 @@ ASCII Table 5: How the fork features map onto this design
 |          |                            | restores by index; newest shown at the   |
 |          |                            | bottom (tac). Trashed-CWD pitfall fixed  |
 |          |                            | shell-side (see Problems doc).           |
+| Shared   | Browser Event Loop         | One gated C line (-DHIST_LOG, NNN_HIST)   |
+| history  | (begin:, 3.4.8) + Plugins/ | appends each chdir to a shared log. The   |
+|          | Pipe (3.5.9) + Sessions    | nnn-history plugin (;h) navigates via     |
+|          | (3.5.7, 3.5.12)            | NNN_PIPE and, for the recent 20 dirs open |
+|          |                            | in a tab, offers switch-to-tab (this      |
+|          |                            | instance via pipe, other pane via tmux,   |
+|          |                            | like ctx_switcher). Cross tab/session/    |
+|          |                            | instance.                                |
 +----------+----------------------------+------------------------------------------+
 ```
 

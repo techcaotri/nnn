@@ -5220,6 +5220,65 @@ END:
 }
 #endif
 
+#ifdef HIST_LOG
+/*
+ * Append the current directory to the shared visit log (cfgpath/.dirhistory) so
+ * directory history can be shared across all contexts, sessions and running
+ * nnn instances (the nnn-history plugin reads it). Built in with O_HIST
+ * (-DHIST_LOG) and enabled at runtime with NNN_HIST=global|1 (OFF by default).
+ *
+ * One atomic O_APPEND write per real chdir. Record (TSV):
+ *   ts_nanos \t instance_id \t session \t ctx \t path
+ * instance_id is $TMUX_PANE when set (the dual-pane setup), else the pid.
+ * Failures are silent and never disrupt navigation.
+ */
+static void record_visit(const char *path)
+{
+	static int enabled = -1; /* -1 unknown, 0 off, 1 on */
+
+	if (enabled == -1) {
+		const char *e = getenv("NNN_HIST");
+		enabled = (e && (!strcmp(e, "global") || !strcmp(e, "1"))) ? 1 : 0;
+	}
+	if (enabled != 1 || !path || !*path)
+		return;
+
+	char hpath[PATH_MAX];
+	mkpath(cfgpath, ".dirhistory", hpath);
+
+	int fd = open(hpath, O_WRONLY | O_APPEND | O_CREAT, 0600);
+	if (fd == -1)
+		return;
+
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+
+	char idbuf[32];
+	const char *id = getenv("TMUX_PANE");
+	if (!id || !*id) {
+		snprintf(idbuf, sizeof idbuf, "%d", (int)getpid());
+		id = idbuf;
+	}
+
+#ifndef NOSSN
+	const char *ssn = curssn[0] ? curssn : "-";
+#else
+	const char *ssn = "-";
+#endif
+
+	char line[PATH_MAX + 96];
+	int len = snprintf(line, sizeof line, "%lld\t%s\t%s\t%d\t%s\n",
+			   (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec,
+			   id, ssn, cfg.curctx + 1, path);
+
+	if (len > 0 && len < (int)sizeof line) {
+		ssize_t w = write(fd, line, (size_t)len);
+		(void)w;
+	}
+	close(fd);
+}
+#endif
+
 static uchar_t get_free_ctx(void)
 {
 	uchar_t r = cfg.curctx;
@@ -8559,6 +8618,11 @@ begin:
 	if (cd)
 		save_session(curssn[0] ? curssn : "@", NULL);
 #endif
+#endif
+#ifdef HIST_LOG
+	/* Record every real directory change to the shared visit log. */
+	if (cd)
+		record_visit(path);
 #endif
 	cd = TRUE;
 
