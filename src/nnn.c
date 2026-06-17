@@ -3596,6 +3596,15 @@ static char *g_dnd_drop_buf;    /* captured paste/drop bytes (dropped paths/URIs
 static size_t g_dnd_drop_len, g_dnd_drop_cap;
 static bool g_dnd_drop_collecting; /* receiving a structured OSC-72 drop (bare kitty) */
 static int g_dnd_drop_idx;         /* offered-mime index requested for the drop */
+static struct timespec g_dnd_end_ts; /* when the last drag ended (for self-drop guard) */
+
+#ifdef CLOCK_MONOTONIC_RAW
+#define DND_CLOCK CLOCK_MONOTONIC_RAW
+#elif defined(CLOCK_MONOTONIC)
+#define DND_CLOCK CLOCK_MONOTONIC
+#else
+#define DND_CLOCK CLOCK_REALTIME
+#endif
 
 /* Bracketed-paste markers, registered via define_key() so ncurses returns the
  * whole sequence as one keycode (with status KEY_CODE_YES). A GUI file drop the
@@ -3637,6 +3646,22 @@ static void dnd_release_tmux_mouse(void)
 		dnd_tmux_mouse(TRUE);
 		g_dnd_tmux_grabbed = FALSE;
 	}
+}
+
+/* TRUE within ~600ms of a drag ending: used to neutralise a drop onto our own
+ * window (the release click that would otherwise open a file, and the spurious
+ * re-offer the terminal sends right after). */
+static bool dnd_recent_drag(void)
+{
+	struct timespec now;
+	long long ms;
+
+	if (!g_dnd_end_ts.tv_sec && !g_dnd_end_ts.tv_nsec)
+		return FALSE;
+	clock_gettime(DND_CLOCK, &now);
+	ms = (long long)(now.tv_sec - g_dnd_end_ts.tv_sec) * 1000
+	   + (now.tv_nsec - g_dnd_end_ts.tv_nsec) / 1000000;
+	return (ms >= 0 && ms < 600);
 }
 
 /* Opt-in only: enabling alters terminal mouse gestures, so require NNN_DND_OSC72=1. */
@@ -3885,6 +3910,10 @@ static void dnd_osc72_offer(void)
 		dnd_log("offer ignored (drag already active)");
 		return;
 	}
+	if (dnd_recent_drag()) { /* spurious re-offer right after a drop onto our own window */
+		dnd_log("offer ignored (just ended)");
+		return;
+	}
 	if (!dnd_prepare_data()) {
 		dnd_log("offer -> nothing to drag");
 		return;
@@ -4121,6 +4150,7 @@ static void dnd_osc72_event(const char *body)
 		if (x == 5) /* terminal requests the data */
 			dnd_osc72_send_request();
 		else if (x == 4) { /* drag finished */
+			clock_gettime(DND_CLOCK, &g_dnd_end_ts);
 			dnd_clear_data();
 			dnd_log("drag finished");
 		}
@@ -9694,6 +9724,19 @@ nochange:
 					rightclicksel = 1;
 					presel = SELECT;
 					goto nochange;
+				}
+
+				/*
+				 * Neutralise a drag dropped back onto our own window: while a
+				 * drag is in flight (or just ended), the press that ends it
+				 * must not register as a double-click and open the file -- that
+				 * opener would otherwise swallow the in-flight OSC-72 events.
+				 * Reset the click timing and just keep the selection.
+				 */
+				if (g_dnd_b64 || dnd_recent_drag()) {
+					mousetimings[0].tv_sec = mousetimings[1].tv_sec = 0;
+					mousedent[0] = mousedent[1] = -1;
+					break;
 				}
 
 				currentmouse ^= 1;
