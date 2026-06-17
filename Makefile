@@ -26,6 +26,7 @@ O_BENCH := 0  # benchmark mode (stops at first user input)
 O_NOSSN := 0  # disable session support
 O_SSN_ON_CD := 0  # auto-save session on every directory change
 O_FZ_CPMV := 0  # FileZilla-style copy/move conflict handling via cpmv plugin
+O_HIST := 0  # log directory visits to a shared history (nnn-history plugin)
 O_NOUG := 0  # disable user, group name in status bar
 O_NOX11 := 0  # disable X11 integration
 O_NOSORT := 0  # disable sorting entries on dir load
@@ -138,6 +139,10 @@ endif
 
 ifeq ($(strip $(O_FZ_CPMV)),1)
 	CPPFLAGS += -DFZ_CPMV
+endif
+
+ifeq ($(strip $(O_HIST)),1)
+	CPPFLAGS += -DHIST_LOG
 endif
 
 ifeq ($(strip $(O_NOUG)),1)
