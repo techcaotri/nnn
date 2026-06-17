@@ -4306,6 +4306,21 @@ static void dnd_consume_paste(void)
 }
 
 /*
+ * Bring our window forward when files are dropped in. A pty program cannot
+ * raise/focus its own OS window (kitty implements no window-manipulation escape,
+ * and X11 focus needs a display connection -- the very reason for OSC-72). Best
+ * effort: BEL makes kitty set the window urgency hint (taskbar/visual flash),
+ * and `kitten @ focus-window` actually focuses it IF kitty remote control is
+ * enabled (allow_remote_control). F_NOWAIT|F_NOTRACE: no curses suspend, errors
+ * silenced when remote control is off or the kitten is absent.
+ */
+static void dnd_focus_window(void)
+{
+	dnd_osc72_write("\a"); /* window attention (flash) */
+	spawn("kitten @ focus-window", NULL, NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
+}
+
+/*
  * Turn the captured paste/drop bytes into existing local paths and, if any,
  * ask copy or move and run it into the current directory. Handles newline- and
  * (shell-escaped) space-separated paths, quotes, and file:// URIs. Returns TRUE
@@ -4402,6 +4417,8 @@ static bool dnd_handle_drop(void)
 		return FALSE; /* not a file drop -- swallow the paste */
 	}
 
+	dnd_focus_window(); /* a real drop arrived: pull our window forward */
+
 	r = get_input("Drop: 'c'opy or 'm'ove file(s)?");
 	if (r != 'c' && r != 'm') {
 		free(out);
@@ -4456,7 +4473,14 @@ try_quit:
 
 		/* Handle Alt+key */
 		if (c == ESC) {
-			timeout(0);
+			/*
+			 * Peek the next byte. With OSC-72 DnD active, the terminal's
+			 * inbound "ESC ] 72 ; ... ST" events can be split across reads
+			 * (notably through tmux); a 0ms peek would miss the ']', treat
+			 * the ESC as a lone Escape, and let the "72;t=..." body leak as
+			 * keystrokes. Wait briefly so the whole sequence is recognised.
+			 */
+			timeout(g_dnd_on ? 100 : 0);
 			i = get_wch(&c);
 			if (i != ERR) {
 				/* Inbound kitty OSC-72 drag-and-drop event (ESC ]) */
