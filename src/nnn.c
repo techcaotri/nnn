@@ -3578,6 +3578,7 @@ static inline int handle_event(void)
 static bool g_dnd_on;        /* drag offering enabled with the terminal */
 static char *g_dnd_b64;      /* base64 text/uri-list for the in-flight drag */
 static size_t g_dnd_b64len;
+static int g_dnd_count;      /* number of files in the in-flight drag */
 
 static bool dnd_in_tmux(void)
 {
@@ -3752,6 +3753,8 @@ static bool dnd_prepare_data(void)
 		paths[n++] = hov;
 	}
 
+	g_dnd_count = n;
+
 	for (i = 0; i < n; ++i) {
 		const char *s = paths[i];
 		size_t need = 7 + strlen(s) * 3 + 2;
@@ -3813,7 +3816,7 @@ static void dnd_osc72_offer(void)
 	}
 
 	chunks = g_dnd_b64len / 4096 + 1;
-	cap = g_dnd_b64len + chunks * 48 + 256;
+	cap = g_dnd_b64len + chunks * 48 + 512; /* + headroom for the icon */
 	b = malloc(cap);
 	if (!b)
 		return;
@@ -3835,8 +3838,20 @@ static void dnd_osc72_offer(void)
 		b[len++] = '\\';
 		off += n;
 	}
-	/* end-of-data marker (no payload), then start the drag */
+	/* end-of-data marker (no payload) */
 	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=p:x=0\x1b\\");
+	/* a small UTF-8 text icon so the drag has a visual (like Yazi) */
+	{
+		char icon[64], ib64[128];
+		int in = snprintf(icon, sizeof icon, "%d file(s)",
+				  g_dnd_count > 0 ? g_dnd_count : 1);
+		size_t il = dnd_b64((uchar_t *)icon, (size_t)in, ib64);
+
+		ib64[il] = '\0';
+		len += (size_t)snprintf(b + len, cap - len,
+			"\x1b]72;t=p:x=-1:y=0:X=6:Y=4:o=0:m=0;%s\x1b\\", ib64);
+	}
+	/* start the drag */
 	len += (size_t)snprintf(b + len, cap - len, "\x1b]72;t=P:x=-1\x1b\\");
 	b[len] = '\0';
 
