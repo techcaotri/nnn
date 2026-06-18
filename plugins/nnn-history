@@ -140,7 +140,7 @@ emit() { # $1=path  $2=do_switch(1/0)
     while IFS=$'\t' read -r tgt ctx; do
         [ -n "${ctx:-}" ] || continue
         if [ "$tgt" = C ]; then label="here"; else label="$OTHER_NAME"; fi
-        printf 'SW\t%s\t%s\t%s\t> switch to [%s ctx%s]  %s\n' "$tgt" "$ctx" "$path" "$label" "$ctx" "$path"
+        printf 'SW\t%s\t%s\t%s\t> switch [%s ctx%s]  %s\n' "$tgt" "$ctx" "$path" "$label" "$ctx" "$path"
     done < <(tabs_for_path "$path")
 }
 
