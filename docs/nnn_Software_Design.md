@@ -303,6 +303,9 @@ ASCII Table 2.6: External interface contract (selected)
 | NNN_BMS / NNN_PLUG   | Bookmark / plugin key:value maps (parsekvpair)         |
 | NNN_OPENER           | Program used to open files                             |
 | NNN_LIST / NNNLVL    | Listing root / nesting level for nested nnn            |
+| NNN_DND_OSC72        | Opt-in: enable kitty OSC-72 drag-and-drop (3.7)        |
+| NNN_DND_DEBUG        | DnD debug log path (or 1 = /tmp/nnn-dnd.log)           |
+| NNN_DND_MODE         | dragdrop plugin: select nnn-dnd helper vs fallback     |
 | env_cfg[] (src:762)  | The full table of NNN_* names nnn reads/exports        |
 +----------------------+--------------------------------------------------------+
 ```
@@ -1902,7 +1905,170 @@ flowchart LR
     style X stroke-dasharray: 5 5
 ```
 
-#### 3.7.2 State and function inventory
+#### 3.7.2 How the kitty OSC-72 protocol works
+
+kitty's drag-and-drop (added in kitty **0.47.0**) is built on a **single**
+escape code:
+
+```
+OSC 72 ; metadata ; payload ST
+```
+
+where `OSC` = `ESC ]` (bytes `0x1b 0x5d`) and `ST` = `ESC \` (bytes
+`0x1b 0x5c`). `metadata` is a colon-separated list of `key=value` pairs; the
+`payload`'s meaning depends on the metadata. (The spec writes the introducer as
+`OSC _dnd_code` -- here `_dnd_code` is the literal number `72`.)
+
+Wire-format rules:
+
+- **Chunking.** The payload (after encoding) must be <= 4096 bytes. Larger
+  payloads are split: every non-final chunk carries `m=1`, and only the first
+  chunk carries full metadata (later chunks may keep just `m` and `i`).
+- **Encoding.** Binary payloads are base64 (RFC 4648); padding is optional.
+- **Integers** are 32-bit, decimal.
+- **Multiplexers.** If `i=<id>` is set on `t=a`/`t=o`, the terminal echoes the
+  same `i` on every event it returns, so a multiplexer can route responses.
+
+```
+ASCII Table 3.7.2: OSC-72 metadata keys (kitty dnd-protocol spec)
++-----+-----------------------------+---------+-----------------------------------+
+| Key | Value                       | Default | Meaning                           |
++-----+-----------------------------+---------+-----------------------------------+
+| t   | single char (see below)     | a       | event type                        |
+| m   | 0 or 1                      | 0       | chunking: 1 = more chunks follow  |
+| i   | positive int                | 0       | multiplexer routing id            |
+| o   | int                         | 0       | operation (0 reject / 1 copy /    |
+|     |                             |         | 2 move), or image opacity/flags   |
+| x   | int                         | 0       | cell x, or MIME / entry index     |
+| y   | int                         | 0       | cell y, or sub-index              |
+| X   | int                         | 0       | pixel x, or remote/handle flag    |
+| Y   | int                         | 0       | pixel y                           |
++-----+-----------------------------+---------+-----------------------------------+
+```
+
+```
+ASCII Table 3.7.2b: the t (type) values
++------+----------------------------------------------------------------------+
+| t=   | Meaning                                                              |
++------+----------------------------------------------------------------------+
+| a/A  | start / stop accepting drops (drop target)                          |
+| m/M  | drop move (hover) / drop dropped (release)   [terminal -> app]       |
+| r    | request dropped data / data response / end-drop                     |
+| R    | report an error reading dropped data (POSIX error name)             |
+| o    | start offering drags / start a drag (drag source)                  |
+| p    | present (pre-send) data for a drag offer                            |
+| P    | change drag image / start the drag (t=P:x=-1)                       |
+| e    | a drag-offer status event (accepted/action/dropped/finished/data)  |
+| E    | a drag-offer error, or the OK result (t=E;OK starts the drag)       |
+| k    | data for uri-list items in a drag offer (remote dragging)          |
+| q    | query whether the terminal supports the protocol                   |
++------+----------------------------------------------------------------------+
+```
+
+There are two directions, each with its own handshake.
+
+**(a) Drop target (terminal -> app).** The app sends `t=a` (optionally with a
+space-separated MIME list) to start accepting drops. While a drag hovers, the
+terminal streams `t=m:x:y:X:Y:o` move events (with the offered MIME list on the
+first one); the app answers `t=m:o=<1|2>;<accepted MIME list>` to accept (or
+`o=0` to reject). On release the terminal sends `t=M;<MIME list>`; the app
+requests a MIME by 1-based index with `t=r:x=idx`, receives `t=r:x=idx;<base64>`
+chunks ending in an empty `m=0` payload, and finishes with `t=r:o=<operation>`.
+
+```mermaid
+%% Drop-target handshake (terminal -> app)
+sequenceDiagram
+    autonumber
+    participant A as "app (nnn)"
+    participant T as "terminal (kitty)"
+    A->>T: t=a (+ accepted MIME list) -- EnableDrop
+    T->>A: t=m:x:y hover (offered MIME list)
+    A->>T: t=m:o=1 text/uri-list (accept as copy)
+    T->>A: t=M drop released (full MIME list)
+    A->>T: t=r:x=idx (request that MIME)
+    T->>A: t=r:x=idx base64 data (chunked, ends m=0 empty)
+    A->>T: t=r:o=1 (done, operation = copy)
+```
+
+**(b) Drag source (app -> terminal).** The app sends `t=o:x=1` (EnableDrag, with
+an optional machine id). When the user gestures, the terminal sends back a bare
+`t=o` offer; the app replies `t=o:o=<flags>;<MIME list>`, pre-sends data with
+`t=p:x=idx` (0-based MIME index), optionally adds drag images, then starts the
+drag with `t=P:x=-1`. The terminal replies `t=E;OK` and afterward reports
+progress through `t=e` status events. Pre-sending `text/uri-list` lets the drag
+work without a data round-trip.
+
+```
+ASCII Table 3.7.2c: t=e drag-source status events
++-----------------+-----------------------------------------------------------+
+| Event           | Meaning                                                   |
++-----------------+-----------------------------------------------------------+
+| t=e:x=1:y=idx   | accepted by a client (idx = the likely MIME)             |
+| t=e:x=2:o=O     | the likely operation changed to O                        |
+| t=e:x=3         | dropped onto a client (data requests likely to follow)   |
+| t=e:x=4:y=0|1   | finished (y=1 = canceled by the user)                   |
+| t=e:x=5:y=idx   | the terminal requests the data for MIME index idx        |
++-----------------+-----------------------------------------------------------+
+```
+
+**Drag images / icons.** Images are pre-sent with a negative `idx` (`-1`, `-2`,
+...). The `y` key picks the format: `y=24`/`y=32` raw RGB/RGBA, `y=100` PNG, and
+**`y=0` UTF-8 text** that the terminal renders itself -- then `X`/`Y` scale the
+text as `base_font_size * X/Y` and `o` is opacity (`o/1024`). nnn uses the `y=0`
+text form with a short `N file(s)` label.
+
+**Machine id (local vs. remote).** The optional machine id on `t=a`/`t=o` lets
+the terminal decide whether source and destination are the same machine. It is
+`1:<HMAC-SHA256 of /etc/machine-id, key "tty-dnd-protocol-machine-id", hex>`
+(RFC 2104 HMAC, RFC 6234 SHA-256) -- hashed so the real id never leaks. If the
+ids differ (or the version is unknown), the terminal treats the transfer as
+**remote** and streams file **contents** (`t=k` for drag-out;
+`X=1`/directory-handle responses for drop-in) instead of handing over the path.
+Sending an **empty** machine id forces the **local**, path-only fast path --
+exactly what nnn does, since it has no file-streaming implementation.
+
+**Same-window security rule.** For security, the terminal replies `EPERM` to a
+data request when the drag **originated in the same window** as the drop: a
+self-drop is meant to transfer nothing. This is the protocol-level reason a
+self-drop in nnn must be a pure no-op (see 3.7.8).
+
+**Capability detection.** A client may probe support with `t=q:i=<echo>`
+followed by a primary device-attributes (DA1) query; if the DA1 reply arrives
+first, the terminal does not support the protocol. nnn skips this probe and
+instead treats the whole feature as **opt-in** (`NNN_DND_OSC72=1`), assuming a
+kitty-class terminal.
+
+#### 3.7.3 What nnn implements vs. the full protocol
+
+nnn implements the **local, `text/uri-list`** subset that covers
+dragging/dropping real files on one machine, and deliberately omits the heavier
+remote- and directory-streaming machinery:
+
+```
+ASCII Table 3.7.3: protocol coverage in nnn
++-------------------------------+----------+---------------------------------------+
+| Protocol capability           | In nnn?  | Notes                                 |
++-------------------------------+----------+---------------------------------------+
+| Drag-out (t=o / p / P / e/E)  | yes      | local, empty machine-id, atomic batch |
+| text/uri-list + pre-send      | yes      | the only MIME nnn offers/accepts      |
+| Text drag icon (y=0)          | yes      | "N file(s)"                           |
+| Drop-in (t=a / m / M / r)     | yes      | bare kitty only (tmux: see below)     |
+| Bracketed-paste drop fallback | yes      | nnn-specific, for tmux + portability  |
+| Remote file streaming (t=k)   | no       | the empty machine-id avoids it        |
+| Remote drop (X=1, dir handles)| no       | local paths only                      |
+| Image / PNG thumbnails        | no       | text icon only                        |
+| Directory-traversal responses | no       | cp -R handles directories locally     |
+| Protocol query (t=q) + DA1    | no       | replaced by the NNN_DND_OSC72 opt-in  |
+| Multiplexer i key             | no       | tmux passthrough is used instead      |
++-------------------------------+----------+---------------------------------------+
+```
+
+The single most important simplification is the **empty machine id**: by always
+declaring the transfer local, nnn never has to serve file contents or traverse
+directories over the wire -- the terminal uses the `file://` path directly and
+the OS performs the real copy/move.
+
+#### 3.7.4 State and function inventory
 
 ```
 ASCII Table 3.7.2: DnD globals (implicit "DnD session" object, src/nnn.c:3589+)
@@ -1945,7 +2111,7 @@ ASCII Table 3.7.2b: DnD functions grouped by responsibility
 +------------------+--------------------------------------------------------------+
 ```
 
-#### 3.7.3 Drag-OUT (nnn is the drag source)
+#### 3.7.5 Drag-OUT (nnn is the drag source)
 
 `dnd_osc72_enable()` announces EnableDrag once at `browse()` start with an
 **empty machine-id** (local drag). When the user mouse-drags, the terminal sends
@@ -1976,7 +2142,7 @@ The two non-obvious correctness rules (see Problems doc 2.5) are encoded here:
 the base64 is **unpadded** (`dnd_b64`), and the EnableDrag machine-id is **empty**
 so kitty treats the drag as local and never asks for file contents.
 
-#### 3.7.4 Drop-IN (nnn is the drop target) -- two mechanisms
+#### 3.7.6 Drop-IN (nnn is the drop target) -- two mechanisms
 
 Inbound drop events are **not routed through tmux**, so nnn uses two paths that
 converge on one handler:
@@ -2022,7 +2188,7 @@ writes the NUL-separated existing paths to a temp file and runs the same
 `xargs -0 ... cp/mv ... .` command `opstr()` builds for selection copy, so
 conflict handling and the `cp`/`mv` flags are identical to a normal paste.
 
-#### 3.7.5 Inbound-event integration with nextsel (the fragile boundary)
+#### 3.7.7 Inbound-event integration with nextsel (the fragile boundary)
 
 OSC-72 events arrive interleaved with keystrokes. nnn intercepts them in
 `nextsel()` before the `bindings[]` lookup. There are **three** ways an event's
@@ -2050,7 +2216,7 @@ ASCII Table 3.7.5: Inbound OSC-72 entry points in nextsel()
 the payload, then switches on `t`: `o` (drag offer), `e`/`E` (drag status),
 `m`/`M`/`r` (drop hover/release/data).
 
-#### 3.7.6 Lifecycle, robustness, and self-drop neutralisation
+#### 3.7.8 Lifecycle, robustness, and self-drop neutralisation
 
 ```
 ASCII Table 3.7.6: DnD lifecycle hooks and the invariants they protect
@@ -2071,17 +2237,17 @@ ASCII Table 3.7.6: DnD lifecycle hooks and the invariants they protect
 
 The self-drop case is the subtlest: dropping a drag back on nnn's own window
 must do nothing. `dnd_recent_drag()` suppresses the release click (so no
-`SEL_OPEN`) and the spurious follow-up offer, while the bare-`]` handling (3.7.5)
+`SEL_OPEN`) and the spurious follow-up offer, while the bare-`]` handling (3.7.7)
 stops the inbound events leaking into the `SEL_PROMPT` prompt.
 
-#### 3.7.7 Focus on drop -- a hard limitation
+#### 3.7.9 Focus on drop -- a hard limitation
 
 `dnd_focus_window()` can only **request** attention: a pty app cannot focus its
 own OS window (kitty has no window-manipulation escape; X11 focus needs a display
 connection; WMs block focus-stealing). It emits BEL (kitty urgency hint) and
 tries `kitten @ focus-window` (works only with `allow_remote_control`).
 
-#### 3.7.8 The nnn-dnd helper (Approach B, complementary)
+#### 3.7.10 The nnn-dnd helper (Approach B, complementary)
 
 `make O_DND=1` also builds `src/nnn-dnd.c`, a small **libX11** helper used by the
 `dragdrop` plugin for terminals without OSC-72. In source mode it owns a real
@@ -2090,6 +2256,38 @@ receives a drop and prints the paths. The OSC-72 path (in-process, kitty) and th
 helper path (out-of-process, any X11 terminal) are complementary, selected by
 the plugin and `NNN_DND_MODE`. See the brainstorm doc for the full approach
 comparison.
+
+#### 3.7.11 References and further reading
+
+Primary sources for the kitty OSC-72 protocol:
+
+- kitty drag-and-drop protocol spec --
+  [sw.kovidgoyal.net/kitty/dnd-protocol](https://sw.kovidgoyal.net/kitty/dnd-protocol/)
+- kitty `dnd` kitten (the reference client implementation) --
+  [sw.kovidgoyal.net/kitty/kittens/dnd](https://sw.kovidgoyal.net/kitty/kittens/dnd/)
+- kitty 0.47 changelog (feature announcement) --
+  [sw.kovidgoyal.net/kitty/changelog](https://sw.kovidgoyal.net/kitty/changelog/)
+- Yazi's implementation, which nnn's OSC-72 path mirrors (PR) --
+  [github.com/sxyazi/yazi/pull/4005](https://github.com/sxyazi/yazi/pull/4005)
+- kitty source for the wire codec: `kittens/dnd/` and `tools/tui/loop/` in
+  [github.com/kovidgoyal/kitty](https://github.com/kovidgoyal/kitty)
+
+Supporting standards:
+
+- base64 -- [RFC 4648](https://www.rfc-editor.org/rfc/rfc4648)
+- `text/uri-list` -- [RFC 2483 section 5](https://www.rfc-editor.org/rfc/rfc2483)
+- HMAC -- [RFC 2104](https://www.rfc-editor.org/rfc/rfc2104); SHA-256 --
+  [RFC 6234](https://www.rfc-editor.org/rfc/rfc6234)
+- Primary Device Attributes (DA1) --
+  [vt100.net/docs/vt510-rm/DA1.html](https://vt100.net/docs/vt510-rm/DA1.html)
+
+Within this repository:
+
+- nnn's implementation: this section (3.7) and the source map (Appendix A).
+- The full debugging narrative behind every fix:
+  [nnn_Problems_And_Solutions.md](nnn_Problems_And_Solutions.md) (Problems 2-8).
+- Approach comparison (OSC-72 vs. the libX11 helper vs. other options):
+  [Brainstorm_nnn_Support_Drag_and_Drop.md](Brainstorm_nnn_Support_Drag_and_Drop.md).
 
 ---
 
