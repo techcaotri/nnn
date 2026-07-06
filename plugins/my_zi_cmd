@@ -16,7 +16,16 @@ CTX=+
 
 if type zoxide >/dev/null 2>&1; then
 	if type fzf >/dev/null 2>&1; then
-		entry="$(zoxide query -i --)"
+		# Display inline at 2/3 terminal height.
+		# List occupies left 2/3 of width; preview pane on the right
+		# shows the full path and directory contents.
+		entry="$(zoxide query -l -- \
+			| fzf --no-sort \
+			      --layout=reverse \
+			      --prompt='zoxide > ' \
+			      --height=75% \
+			      --preview='echo {}; echo; ls -A {} 2>/dev/null || echo "(not found)"' \
+			      --preview-window=right:50%:wrap)"
 	else
 		printf "jump to : "
 		read -r dir
