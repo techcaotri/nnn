@@ -4,7 +4,7 @@
 <a href="https://github.com/jarun/nnn/releases/latest"><img src="https://img.shields.io/github/release/jarun/nnn.svg?maxAge=600&label=rel" alt="Latest release" /></a>
 <a href="https://repology.org/project/nnn/versions"><img src="https://repology.org/badge/tiny-repos/nnn.svg?header=repos" alt="Availability"></a>
 <a href="https://circleci.com/gh/jarun/workflows/nnn"><img src="https://img.shields.io/circleci/project/github/jarun/nnn.svg?label=CircleCI" alt="Circle CI Status" /></a>
-<a href="https://github.com/jarun/nnn/actions"><img src="https://github.com/jarun/nnn/actions/workflows/ci.yml/badge.svg?branch=master" alt="GitHub CI Status" /></a>
+<a href="https://github.com/jarun/nnn/actions"><img src="https://img.shields.io/github/jarun/nnn/actions/workflows/ci.yml/badge.svg?branch=master" alt="GitHub CI Status" /></a>
 <a href="https://en.wikipedia.org/wiki/Privacy-invasive_software"><img src="https://img.shields.io/badge/privacy-✓-crimson?maxAge=2592000" alt="Privacy Awareness" /></a>
 <a href="https://github.com/jarun/nnn/blob/master/LICENSE"><img src="https://img.shields.io/badge/©-BSD%202--Clause-important.svg?maxAge=2592000" alt="License" /></a>
 </p>
@@ -165,3 +165,284 @@ Don't memorize! Arrows, <kbd>/</kbd>, <kbd>q</kbd> suffice. <kbd>Tab</kbd> creat
 - and other contributors
 
 Visit the [Tracker](https://github.com/jarun/nnn/issues/1546) thread for a list of features in progress and anything up for grabs. Feel free to [discuss](https://github.com/jarun/nnn/discussions) new ideas or enhancement requests.
+
+---
+
+# 🚀 Fork Enhancements
+
+This fork adds three major features on top of upstream nnn: **native Drag-and-Drop**, an **unlimited cross-instance directory history**, and a **CWD guard** that protects against a subtle Unix shell trap. All are opt-in and designed to minimize merge friction with upstream.
+
+---
+
+## ◈ Native Drag-and-Drop (DnD)
+
+Drag files **OUT** of nnn into GUI apps (browsers, file managers, chat uploads, image editors), and drop files **IN** from GUI apps. A TUI owns no window, so drag-and-drop must be delegated. This fork provides **two complementary approaches**, automatically chosen at runtime.
+
+### Why a TUI Cannot "Just Drag" by Itself
+
+Drag-and-drop on X11 (XDND) and Wayland (`wl_data_device`) is a window-to-window conversation — the X server delivers DnD messages to the window under the pointer. That window belongs to the **terminal emulator**, not to nnn. nnn is a pty-bound process, and everything it receives arrives as bytes through the pty with no drawing surface the display server can address. So every TUI delegates DnD to something that does own a window — either a small helper GUI process (Approach B) or the terminal emulator itself via escape codes (Approach D).
+
+### Key Binding
+
+<kbd>D</kbd> — `SEL_DRAGDROP`: prompt for **(d)rag out** or **\(r)eceive** (drop in).
+
+### Approach B — `nnn-dnd`: Bundled Native XDND Helper (libX11)
+
+A small C helper ([src/nnn-dnd.c](src/nnn-dnd.c), ~900 lines) that implements the XDND protocol version 5 directly on **libX11** — no GTK/Qt dependency. It is a CLI-compatible drop-in replacement for `dragon`/`ripdrag`.
+
+**How it works:**
+
+| Direction | Flow |
+|-----------|------|
+| **Drag OUT** | nnn spawns `nnn-dnd` detached with the selection; the helper creates a small window, owns `XdndSelection`, and drives the XDND handshake (XdndEnter → XdndPosition → XdndDrop → serve `text/uri-list`). nnn never blocks. |
+| **Drop IN** | `nnn-dnd --target` creates an `XdndAware` window; on drop it parses the received `file://` URIs, prints plain paths, and the core (or plugin) appends them to `NNN_SEL` and shows them via `NNN_PIPE` list mode. |
+
+**Build:** `make O_DND=1` — the default build is unchanged and links no new library. With `O_DND=1`, the Makefile also compiles `nnn-dnd` (links `-lX11` only — nnn itself gains no new dependency).
+
+**CLI (dragon-compatible subset):**
+
+| Flag | Meaning |
+|------|---------|
+| `(none) FILE...` | Source mode: offer files for dragging out |
+| `-t, --target` | Target mode: receive a drop, print paths to stdout |
+| `-x, --and-exit` | Exit after the first completed drag or drop |
+| `-a, --all` | Offer all files as a single combined drag |
+| `-p, --print-path` | Print plain paths instead of `file://` URIs |
+| `-T, --on-top` | Keep the helper window always on top |
+| `-I, --stdin` | Read file list from stdin (NUL or newline) |
+
+**Wayland:** The helper works on most Wayland desktops via XWayland (the compositor bridges XDND to native Wayland). For pure-Wayland setups, it falls back to `ripdrag` (GTK4).
+
+### Approach D — kitty OSC-72 Terminal Protocol (in-process, no helper)
+
+An in-process escape-code protocol. nnn writes OSC 72 escape sequences to the terminal, and **kitty** (≥ 0.47.1) performs the real window-system drag on its behalf. **Zero helper, zero libX11, and it works over SSH and inside tmux.**
+
+**Protocol overview (drag-OUT direction):**
+
+```
+EnableDrag (once at startup) → user mouse-drags on terminal
+→ kitty sends inbound OFFER → nnn answers agree + present + start
+→ kitty performs the OS drag
+```
+
+The protocol is **mouse-gesture-driven and bidirectional**: nnn declares itself a drag source once; the **user's mouse gesture** triggers the drag; the terminal sends nnn an inbound offer that nnn must answer.
+
+**Prerequisites:**
+
+- **kitty ≥ 0.47.1** (Ghostty has accepted the protocol).
+- **Opt-in** via `NNN_DND_OSC72=1` (because enabling it changes the terminal's mouse-gesture handling).
+- Inside **tmux**: additionally requires `set -g allow-passthrough on` (tmux 3.3+).
+- **Debug mode:** `NNN_DND_DEBUG=/tmp/nnn-dnd.log` (or `=1` for the default log path) traces all inbound/outbound OSC-72 events to a file without corrupting the curses screen.
+
+**Five bugs discovered and fixed during implementation (see [docs/nnn_Problems_And_Solutions.md](docs/nnn_Problems_And_Solutions.md) Problems 2–7):**
+
+| # | Mistake | Effect | Fix |
+|---|---------|--------|-----|
+| 1 | Emitted drag on keypress instead of mouse gesture | Garbage + EPERM | Reimplemented as gesture-driven (bidirectional) |
+| 2 | Wrote agree/present/start as separate writes | Interleaved bytes corrupt the drag build | Single atomic write |
+| 3 | Emitted padded base64 (`=`) | kitty rejects padding; "error decoding base64" | Unpadded base64 |
+| 4 | Advertised real hostname as machine-id | kitty treats drag as remote, asks for file contents → stall | Empty machine-id (local) |
+| 5 | No drag icon | No visual feedback | Text icon label |
+
+**Additional fixes for robustness:**
+
+- **Post-subprocess resync** — opening a file runs a curses-suspending subprocess that makes kitty forget nnn is a drag source; a `g_dnd_resync` flag re-sends EnableDrag on return.
+- **tmux pane-border protection** — dragging across a tmux pane boundary would resize panes; during an in-flight drag, tmux mouse is temporarily toggled off and restored on drag-end.
+- **Self-drop prevention** — dropping a drag back onto nnn's own pane is a no-op (suppressed click, consumed bare `]` OSC-72 events).
+- **Window focus** — on drop, emits BEL (urgency hint, always works) + attempts `kitten @ focus-window` (if kitty remote control is enabled).
+
+### Drop-IN (Files INTO nnn from GUI apps)
+
+Two capture paths converge on one copy/move handler:
+
+| Mechanism | Works in tmux? | Notes |
+|-----------|---------------|-------|
+| **Native OSC-72** (`EnableDrop`) | No | tmux does not route inbound drop events to the pane; used in bare kitty only |
+| **Bracketed-paste capture** (always active) | Yes | kitty wraps the drop-paste in `ESC[200~`…`ESC[201~`; tmux forwards it. Portable. |
+
+On drop, nnn parses paths (handles `file://` URI percent-decoding, newline/space separated, quotes, backslash escapes), keeps only existing paths, asks **c**opy or **m**ove, then reuses the exact NUL-separated `xargs -0 cp/mv ... .` command that selection copy uses. A paste with **no** real files is silently swallowed — plain text pastes no longer leak as keystrokes.
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `NNN_DND_OSC72=1` | Enable kitty OSC-72 drag-and-drop (opt-in; changes terminal mouse gestures) |
+| `NNN_DND_DEBUG=1` or `NNN_DND_DEBUG=/path/to/log` | Log all inbound/outbound OSC-72 events for diagnosis |
+| `O_DND=1` (build flag) | Build the `nnn-dnd` XDND helper alongside nnn |
+
+---
+
+## ◈ Unlimited Cross-Instance Directory History
+
+An **append-only shared visit log** that records every directory change across **all 8 contexts (tabs), both tmux panes, and across sessions**. Navigable via an fzf picker plugin.
+
+### How It Works
+
+- **One C hook** at the `begin:` choke point in `browse()` appends a TSV record (`timestamp | instance_id | session | ctx | path`) to `~/.config/nnn/.dirhistory` on every real directory change.
+- **All nnn instances** write to the **same file** → the history is global across panes and restarts.
+- **Lockless append** (single `write()` in `O_APPEND` mode, atomic for records < `PIPE_BUF`).
+
+### The Picker Plugin — `nnn-history` (bound to `;h`)
+
+1. Reads the shared log, deduplicates by path (keeping newest visit).
+2. Labels entries by source: `[live L ctx3]` / `[past R ctx1]`.
+3. Shows newest at the bottom (fzf), lets the user filter by pane/session/context.
+4. On selection, writes `0c<path>` to `$NNN_PIPE` → instance jumps there.
+
+### Compaction
+
+Run `nnn-history --compact` (opportunistically when the file exceeds a threshold): takes `flock` on `.dirhistory.lock`, keeps the last N unique paths, atomic `rename()`.
+
+### Build and Config
+
+- **Build:** `make O_HIST=1` enables the visit-recorder C hook.
+- **Env:** `NNN_HIST=global` turns it on; unset = off (upstream behaviour).
+- **Plugin binding:** add `;h:nnn-history` to `NNN_PLUG`.
+- **Path:** `~/.config/nnn/.dirhistory` (file mode `0600` for privacy).
+
+For the full design, see [docs/Brainstorm_nnn_Support_Unlimited_History.md](docs/Brainstorm_nnn_Support_Unlimited_History.md).
+
+---
+
+## ◈ CWD Guard — Shell Protection Against the Trash Displacement Trap
+
+A **shell prompt hook** that detects when your terminal's real working directory has been silently moved (e.g., into the Trash after an nnn delete and re-create) and auto-repairs it.
+
+### The Problem (Unix quirk, not an nnn bug)
+
+A shell's "current directory" is an **open handle to a directory inode**, not a path string. When `NNN_TRASH=1` routes deletes through `trash-put`, the directory is **moved** (renamed) into the Trash. On the same filesystem this preserves the inode — and the terminal's CWD **silently follows it into the Trash**. Re-creating the directory at the original path creates a new inode; the old terminal is still attached to the trashed inode, so everything it writes lands in the Trash. The bash/fish builtin `pwd -P` does not call `getcwd()` when the `$PWD` string names a valid directory — it looks correct but is wrong.
+
+### The Fix
+
+A guard that runs **before every prompt**, compares the inode the shell is really in against the inode `$PWD` names, and on mismatch **warns** and (by default) **re-attaches** to `$PWD` via `cd "$PWD"`.
+
+**Installed:**
+
+| File | Shell | Role |
+|------|-------|------|
+| `~/.config/fish/conf.d/nnn_cwd_guard.fish` | fish | Primary fix, runs on `fish_prompt` event |
+| `~/.dotfiles/nnn/nnn_config.sh` (appended block) | bash | Via `PROMPT_COMMAND`; no-op when imported through `bass` |
+
+**Toggles:**
+
+| Variable | Effect |
+|----------|--------|
+| `NNN_CWD_GUARD=0` | Disable the guard entirely |
+| `NNN_CWD_GUARD_AUTOCD=0` | Warn only — do NOT auto re-attach |
+| (unset / default) | Enabled, with auto re-attach |
+
+The guard uses `stat -c '%d:%i'` inode comparison with `stat -L` on `$PWD` (symlink-safe), so normal navigation and symlinked directories never trigger it. It only acts on a genuine inode mismatch. For the full investigation, see [docs/nnn_Problems_And_Solutions.md](docs/nnn_Problems_And_Solutions.md) Problem 1.
+
+---
+
+## ◈ Build Scripts
+
+This fork provides two convenience build scripts in the project root that encode the preferred feature set.
+
+### `build.sh` — Production Build
+
+```sh
+make -j$((`nproc`-2)) 0_NERD=1 O_EMOJI=1 O_PCRE=1 O_CTX8=1 O_QSORT=1 \
+  O_SSN_ON_CD=1 O_FZ_CPMV=1 O_HIST=1 O_DND=1
+```
+
+**What each flag enables:**
+
+| Flag | Feature | What it does |
+|------|---------|--------------|
+| `0_NERD=1` | Nerdfont icons | File-type icons using Nerd Font glyphs in the terminal. Requires a Nerd Font installed. Mutually exclusive with `O_ICONS` and `O_EMOJI`. |
+| `O_EMOJI=1` | Emoji icons | File-type icons using emoji characters. Mutually exclusive with `O_ICONS` and `O_NERD`. |
+| `O_PCRE=1` | PCRE regex | Links with PCRE2 for Perl-compatible regex in filters (`/` search). Without it, nnn uses POSIX regex (BRE/ERE). |
+| `O_CTX8=1` | 8 contexts | Enables all 8 contexts (tabs/workspaces). Without it, nnn uses 4 contexts. |
+| `O_QSORT=1` | Quick sort | Uses Alexey Tourbin's optimized QSORT implementation for faster sorting of large directories. |
+| `O_SSN_ON_CD=1` | Session auto-save | Automatically saves the session on every directory change, so nnn always restores to the last state after a crash or restart. |
+| `O_FZ_CPMV=1` | FileZilla-style copy/move | Enables conflict-resolution prompts (overwrite/skip/rename) during copy/move via the `cpmv` plugin. |
+| `O_HIST=1` | Shared directory history | Enables the visit-recorder C hook — appends every directory change to the shared `.dirhistory` log used by the `nnn-history` plugin. See § Unlimited Cross-Instance Directory History. |
+| `O_DND=1` | Drag-and-drop helper | Builds the `nnn-dnd` XDND helper binary alongside nnn. Links `-lX11`. The `NNN_DND_OSC72=1` env var is separate and handled at runtime. |
+
+**Additional parameters:**
+- `-j$((\`nproc\`-2))` — parallel build using all but 2 CPU cores (leaves headroom for the desktop).
+- `NNN_DND_OSC72=1` is **already compiled in** (always-on code path, no link dependency) — the env var at runtime gates whether the protocol is active; no rebuild needed to toggle it.
+- `NNN_DND_DEBUG=1` — enables the DnD debug log output (set to `1` for default path `/tmp/nnn-dnd.log`, or a custom path).
+
+**Prerequisites:**
+- **C compiler** (gcc/clang) with `-std=c11` support.
+- **libX11** (for `O_DND=1`): `libx11-dev` (Debian/Ubuntu) or `libX11-devel` (Fedora).
+- **libpcre2** (for `O_PCRE=1`): `libpcre2-dev` (Debian/Ubuntu) or `pcre2-devel` (Fedora).
+- **libreadline** (default, unless `O_NORL=1`): `libreadline-dev`.
+- **Nerd Font** (for `O_NERD=1`): e.g., `ttf-firacode-nerd` or `fonts-nerd-fonts`.
+
+### `build_debug.sh` — Debug Build
+
+```sh
+make -j$((`nproc`-2)) 0_NERD=1 O_EMOJI=1 O_PCRE=1 O_CTX8=1 O_QSORT=1 \
+  O_SSN_ON_CD=1 O_FZ_CPMV=1 O_HIST=1 O_DEBUG=1 -f Makefile_debug
+```
+
+**Differences from `build.sh`:**
+
+| Aspect | `build.sh` (production) | `build_debug.sh` (debug) |
+|--------|------------------------|--------------------------|
+| Makefile | `Makefile` | `Makefile_debug` |
+| `O_DEBUG` | not set | `O_DEBUG=1` → `-DDEBUG` + `-g3` |
+| `O_DND` | `=1` (builds nnn-dnd) | not set (DnD helper excluded) |
+| `NNN_DND_OSC72` | set at build time | not set (add at runtime if needed) |
+| Binary size | stripped, optimized (`-O3`) | unstripped, debug symbols (`-g3`), with `-DDEBUG` preprocessor flag |
+| Use case | Everyday use, full features | gdb/valgrind debugging, core dumps, development |
+
+**Usage:**
+```sh
+# Production (full-featured, optimized):
+./build.sh
+
+# Debug (with debug symbols, no DnD helper):
+./build_debug.sh
+
+# Run with DnD enabled at runtime (either build can do this):
+NNN_DND_OSC72=1 ./nnn
+
+# Run with DnD debug tracing:
+NNN_DND_OSC72=1 NNN_DND_DEBUG=/tmp/nnn-dnd.log ./nnn
+
+# Run with shared history:
+NNN_HIST=global ./nnn
+```
+
+**Clean builds:**
+```sh
+make clean              # Clean the production Makefile
+make -f Makefile_debug clean  # Clean the debug Makefile
+```
+
+---
+
+## ◈ Dual-Pane tmux Setup
+
+The repo includes scripts for a dual-pane tmux layout (`start_dual_nnn.sh`) that launches two nnn instances side-by-side — `nnn_left` (`-s left`) and `nnn_right` (`-s right`). They share a common `NNN_FIFO` (`/tmp/nnn.fifo`) and `NNN_PLUG` configuration, enabling:
+
+- **Cross-pane directory history** — both panes record to the same `.dirhistory`; the `nnn-history` picker can jump to a directory visited by the other pane.
+- **Cross-pane DnD** — OSC-72 drag-out works inside tmux with `allow-passthrough on` (the outbound escapes reach kitty through tmux's DCS passthrough wrapper).
+
+---
+
+## ◈ Problem & Solution Log
+
+A running log of real problems hit while using this nnn setup, with investigations and fixes, is kept in [docs/nnn_Problems_And_Solutions.md](docs/nnn_Problems_And_Solutions.md). Covered issues:
+
+1. **New files silently land inside the Trash** after deleting and re-creating a directory (CWD guard fix)
+2. **Native drag-and-drop never produced a drag** (5 protocol-level bugs: keypress-vs-gesture, interleaved writes, padded base64, machine-id, no icon)
+3. **Drag stops working after opening a file** (EnableDrag lost on curses suspend)
+4. **Dragging across tmux pane border resizes panes** (mouse grab conflict)
+5. **Dropping files INTO nnn typed strange key sequences** (bracketed paste + native drop paths)
+6. **Dropped file doesn't bring nnn to front** (pty cannot focus own window; BEL + kitten fallback)
+7. **Self-drop opened the `>>>` prompt** (bare `]` consumed by ncurses before OSC-72 parser)
+8. **"Too many open files" on fresh start** (exhausted `fs.inotify.max_user_instances`, not fd limit)
+
+---
+
+## ◈ Design Documents
+
+- [docs/Brainstorm_nnn_Support_Drag_and_Drop.md](docs/Brainstorm_nnn_Support_Drag_and_Drop.md) — Full brainstorm, protocol deep-dives, XDND state machines, OSC-72 implementation guide.
+- [docs/Brainstorm_nnn_Support_Unlimited_History.md](docs/Brainstorm_nnn_Support_Unlimited_History.md) — Shared visit log design, plugin architecture, compaction strategy.
+- [docs/Brainstorm_nnn_Update.md](docs/Brainstorm_nnn_Update.md) — General fork update notes.
+- [docs/nnn_Problems_And_Solutions.md](docs/nnn_Problems_And_Solutions.md) — Running log of real problems and their fixes.
