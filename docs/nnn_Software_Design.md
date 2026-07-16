@@ -1587,6 +1587,47 @@ ASCII Table 15: Session-management safety rails
 +----------------------------------+------------------------------------------+
 ```
 
+##### 3.5.13.8 Preview: fitting 8 contexts into a narrow pane
+
+A full session preview is ~40 lines, but the preview pane is short and narrow --
+it sits beside the list, inside what is already one half of a tmux split. Two
+measures keep it usable, because scrolling alone is a poor answer to "I cannot
+see my 8 paths".
+
+**Layout.** The decoded view is ordered so the **8 context paths form one block
+at the top** (~14 lines including the header), which fits without scrolling;
+the per-context `cursor`/`last`/`filter` details follow underneath. `$HOME` is
+abbreviated to `~` (~13 columns back per line), the context that was current is
+marked `*` (read from `settings.curctx`, 3.5.13.4), and directories that no
+longer exist are flagged `[missing]`.
+
+```
+ASCII Table 16: Preview keys (fzf --bind)
++-------------------+--------------------------------------------------------+
+| Key               | Action                                                 |
++-------------------+--------------------------------------------------------+
+| alt-j / alt-k     | preview-down / preview-up (one line)                   |
+| alt-u / alt-d     | preview-half-page-up / -down                           |
+| alt-b / alt-f     | preview-page-up / -down                               |
+| alt-g / alt-G     | preview-top / preview-bottom                           |
+| alt-p             | cycle preview size (down,75% -> right,80% -> default)  |
+| alt-z             | toggle-preview-wrap                                    |
+| alt-h             | toggle-preview (hide/show)                             |
+| shift-up/down     | fzf's own preview scroll, where the terminal passes it |
++-------------------+--------------------------------------------------------+
+```
+
+**Why alt-*.** `ctrl-{s,d,r,y,b,x,w}` are already bound to the actions, and
+shift+arrow / wheel are unreliable through tmux and some terminals -- so the
+dependable bindings are `alt-*`, with fzf's own defaults left in place as a
+bonus. `NNN_SSN_PREVIEW` overrides the geometry (any `--preview-window` spec).
+
+**One subtlety.** `change-preview-window(A|B|C)` applies the listed geometries in
+order, so if `A` equals the *current* geometry the first keypress is a visible
+no-op. The cycle therefore **excludes** the active window (and `hidden`, which is
+`alt-h`'s job) and ends on `$PREVIEW_WIN`, so every press changes something and
+the cycle returns to the configured default.
+
 ---
 
 ### 3.6 Keyboard and Input Event Handling (Deep Dive)

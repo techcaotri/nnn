@@ -34,8 +34,21 @@
 #   NNN_SSN_KEEP    number of snapshots kept per session (default 20, 0 = keep all)
 #   NNN_SSN_GIT     1 = git-commit sessions/ after each snapshot (config dir is
 #                   already a git repo/submodule in this setup). Default 0.
+#   NNN_SSN_PREVIEW preview geometry, any fzf --preview-window spec
+#                   (default "right,60%,wrap"; try "down,70%,wrap" if the pane
+#                   is wide but short).
 #   NNN_SSN_PIPE    exported by nnn itself when built with O_SSN_PIPE=1.
 #   NNN_SESSION     exported by nnn itself: the active session name.
+#
+# Keys in the manager:
+#   ENTER activate   ctrl-s snapshot  ctrl-b snapshot history  ctrl-r rename
+#   ctrl-y duplicate ctrl-d delete    ctrl-x cd to its dir     ctrl-w workspace
+# Preview (a session is taller than the pane, so it scrolls):
+#   alt-j / alt-k    scroll one line          alt-u / alt-d  half page
+#   alt-b / alt-f    full page                alt-g / alt-G  top / bottom
+#   alt-p            cycle preview size       alt-z          toggle wrap
+#   alt-h            hide/show the preview    (shift-up/down and the wheel work
+#                                              too where the terminal allows)
 #
 # Usage:
 #   nnn-sessions                interactive manager (bind e.g. S:nnn-sessions -> ;S)
@@ -136,6 +149,18 @@ parse_session() {
     done
 }
 
+# session_curctx <file> -- the 0-based context that was current when saved.
+# The global cfg is the 4-byte `settings` bitfield right after the header, and
+# settings.curctx sits at bits 13..15 (13 single-bit fields precede it).
+# Defined here, with the other parsers, because decode_to_text() needs it and
+# the --preview entry point runs before the later sections are parsed.
+session_curctx() {
+    local cfg
+    cfg=$(od -An -tu4 -j "$HDR_LEN" -N "$SETTINGS_SIZE" -v -- "$1" 2>/dev/null | tr -d ' \n')
+    [ -n "${cfg:-}" ] || { echo 0; return; }
+    echo $(( (cfg >> 13) & 7 ))
+}
+
 # How many contexts are active in a session file (cheap: header only).
 ctx_count() {
     local f="$1"
@@ -152,20 +177,37 @@ ctx_count() {
 
 # ---------------------------------------------------------------------------
 # Decoded text mirror / preview -- shows ALL 8 contexts
+#
+# Layout matters: the preview pane is narrow and short (it sits beside the list,
+# often inside an already-split tmux pane). So all 8 context PATHS are printed
+# as one compact block at the TOP, where they fit without scrolling, and the
+# per-context details (cursor/last/filter) follow underneath. The fzf preview
+# scroll keys (alt-j/k, alt-u/d, alt-g/G) reach the rest.
 # ---------------------------------------------------------------------------
+
+# Abbreviate $HOME to '~' -- buys ~13 columns per line in this setup.
+tilde() {
+    case "$1" in
+        "$HOME") printf '~' ;;
+        "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 decode_to_text() {
     local f="$1" label="${2:-$(basename -- "$1")}"
     local -a paths names lasts fltrs
-    local i ctx cpath cname clast cfltr
+    local i ctx cpath cname clast cfltr cur mark n=0 details d
 
     printf 'session : %s\n' "$label"
     if [ ! -f "$f" ]; then
         printf 'file    : %s (missing)\n' "$f"
         return
     fi
-    printf 'file    : %s\n' "$f"
-    printf 'size    : %s bytes\n' "$(stat -c '%s' -- "$f" 2>/dev/null || echo '?')"
-    printf 'saved   : %s\n' "$(stat -c '%y' -- "$f" 2>/dev/null | cut -d'.' -f1)"
+    printf 'file    : %s\n' "$(tilde "$f")"
+    printf 'saved   : %s  (%s bytes)\n' \
+        "$(stat -c '%y' -- "$f" 2>/dev/null | cut -d'.' -f1)" \
+        "$(stat -c '%s' -- "$f" 2>/dev/null || echo '?')"
 
     if ! is_session "$f"; then
         printf '\n[!] not a session file, or unsupported version (expected v1).\n'
@@ -177,26 +219,43 @@ decode_to_text() {
         [ -n "${ctx:-}" ] || continue
         paths[ctx]="$cpath"; names[ctx]="$cname"
         lasts[ctx]="$clast"; fltrs[ctx]="$cfltr"
+        n=$((n + 1))
     done < <(parse_session "$f")
 
-    printf '\ncontexts (all %s):\n' "$CTX_MAX"
+    cur=$(( $(session_curctx "$f") + 1 ))   # 1-based context that was current
+
+    # --- block 1: every context's path, one line each (always on screen) ----
+    printf '\ncontexts (%s of %s active, * = current):\n' "$n" "$CTX_MAX"
     for i in $(seq 1 "$CTX_MAX"); do
+        if [ "$i" = "$cur" ]; then mark='*'; else mark=' '; fi
         cpath="${paths[i]:-}"
         if [ -z "$cpath" ]; then
-            printf '  %s  -\n' "$i"
-            continue
+            printf ' %s %s  -\n' "$mark" "$i"
+        elif [ -d "$cpath" ]; then
+            printf ' %s %s  %s\n' "$mark" "$i" "$(tilde "$cpath")"
+        else
+            # A restore would land nowhere -- worth flagging.
+            printf ' %s %s  %s  [missing]\n' "$mark" "$i" "$(tilde "$cpath")"
         fi
-        # Mark directories that no longer exist -- a restore would land nowhere.
-        if [ -d "$cpath" ]; then printf '  %s  %s\n' "$i" "$cpath"
-        else                     printf '  %s  %s   [missing]\n' "$i" "$cpath"
-        fi
-        [ -n "${names[i]:-}" ] && printf '        cursor: %s\n' "${names[i]}"
-        [ -n "${lasts[i]:-}" ] && printf '        last  : %s\n' "${lasts[i]}"
+    done
+
+    # --- block 2: details, only for contexts that have any ------------------
+    details=''
+    for i in $(seq 1 "$CTX_MAX"); do
+        [ -n "${paths[i]:-}" ] || continue
+        d=''
+        [ -n "${names[i]:-}" ] && d+="      cursor: ${names[i]}"$'\n'
+        [ -n "${lasts[i]:-}" ] && d+="      last  : $(tilde "${lasts[i]}")"$'\n'
         # c_fltr[0] is the filter TYPE byte ('/' = FILTER); [1..] is the pattern.
         # A bare type byte with no pattern means no active filter.
         [ -n "${fltrs[i]:-}" ] && [ "${#fltrs[i]}" -gt 1 ] && \
-            printf '        filter: %s\n' "${fltrs[i]:1}"
+            d+="      filter: ${fltrs[i]:1}"$'\n'
+        [ -n "$d" ] && details+="  ctx $i"$'\n'"$d"
     done
+    if [ -n "$details" ]; then
+        printf '\ndetails (alt-j/k line, alt-u/d half-page, alt-g/G ends):\n'
+        printf '%s' "$details"
+    fi
 }
 
 # Preview entry point used by fzf (kept as a self re-invocation so fzf can call it)
@@ -275,16 +334,6 @@ faithful_load() {
     [ -n "${NNN_SSN_PIPE:-}" ] || return 1
     [ -n "${NNN_PIPE:-}" ] || return 1
     printf '%s' "0s$1" > "$NNN_PIPE"
-}
-
-# session_curctx <file> -- the 0-based context that was current when saved.
-# The global cfg is the 4-byte `settings` bitfield right after the header, and
-# settings.curctx sits at bits 13..15 (13 single-bit fields precede it).
-session_curctx() {
-    local cfg
-    cfg=$(od -An -tu4 -j "$HDR_LEN" -N "$SETTINGS_SIZE" -v -- "$1" 2>/dev/null | tr -d ' \n')
-    [ -n "${cfg:-}" ] || { echo 0; return; }
-    echo $(( (cfg >> 13) & 7 ))
 }
 
 # quick_switch <file> -- cd the CURRENT context to the session's saved current
@@ -478,6 +527,39 @@ mkdir -p -- "$BACKUPS_DIR" "$SNAP_DIR" 2>/dev/null
 
 SELF="$0"
 
+# ---------------------------------------------------------------------------
+# Preview window: scrolling, resizing and wrapping.
+#
+# A session preview is taller than the pane (8 context paths plus per-context
+# details), and the pane itself is usually one half of a tmux split, so the
+# preview must be scrollable and growable.
+#
+# alt-* is used throughout because ctrl-{s,d,r,y,b,x,w} are already taken by the
+# actions, and because shift+arrow / mouse wheel are unreliable through tmux and
+# some terminals. fzf's own shift-up/shift-down and wheel bindings still work
+# where the terminal passes them through -- these are the dependable additions.
+#
+# NNN_SSN_PREVIEW overrides the default preview geometry (any fzf
+# --preview-window spec), e.g. "down,70%,wrap" for a wide-but-short pane.
+# ---------------------------------------------------------------------------
+PREVIEW_WIN="${NNN_SSN_PREVIEW:-right,60%,wrap}"
+
+PREVIEW_BINDS="--bind=alt-j:preview-down,alt-k:preview-up"
+PREVIEW_BINDS="$PREVIEW_BINDS,alt-d:preview-half-page-down,alt-u:preview-half-page-up"
+PREVIEW_BINDS="$PREVIEW_BINDS,alt-f:preview-page-down,alt-b:preview-page-up"
+PREVIEW_BINDS="$PREVIEW_BINDS,alt-g:preview-top,alt-G:preview-bottom"
+PREVIEW_BINDS="$PREVIEW_BINDS,alt-z:toggle-preview-wrap,alt-h:toggle-preview"
+# Grow the preview: tall-bottom -> wide-right -> back to the default.
+# The cycle deliberately EXCLUDES the current geometry and 'hidden': fzf applies
+# the listed windows in order, so leading with the active one would make the
+# first press a no-op, and hiding is alt-h's job. The last entry returns to
+# $PREVIEW_WIN so the cycle ends where the user configured it.
+PREVIEW_BINDS="$PREVIEW_BINDS,alt-p:change-preview-window(down,75%,wrap|right,80%,wrap|$PREVIEW_WIN)"
+# Wheel over the preview, where the terminal reports it.
+PREVIEW_BINDS="$PREVIEW_BINDS --bind=shift-up:preview-up,shift-down:preview-down"
+
+PREVIEW_HELP='preview: alt-j/k line  alt-u/d half-page  alt-g/G ends  alt-p size  alt-z wrap  alt-h hide'
+
 # Build the live-session rows:  kind \t name \t file \t display
 build_sessions() {
     local f name n mark disp
@@ -521,13 +603,15 @@ backups_view() {
             printf 'No snapshots yet for "%s". Take one with ctrl-s.\n' "$name"; pause; return
         fi
 
+        # shellcheck disable=SC2086
         chosen=$(printf '%s\n' "$menu" | fzf \
             --delimiter='\t' --with-nth=4 \
             --prompt="snapshots of $name > " \
-            --header=$'ENTER restore   ctrl-d delete   ESC back' \
+            --header="ENTER restore   ctrl-d delete   ESC back"$'\n'"$PREVIEW_HELP" \
             --expect=ctrl-d \
             --preview="'$SELF' --preview B {3} '$name @ {2}'" \
-            --preview-window=right,60%,wrap) || return
+            --preview-window="$PREVIEW_WIN" \
+            $PREVIEW_BINDS) || return
         key=$(printf '%s\n' "$chosen" | head -1)
         chosen=$(printf '%s\n' "$chosen" | sed -n '2p')
         [ -n "$chosen" ] || return
@@ -555,15 +639,18 @@ while :; do
 
     HEADER="ENTER activate  ctrl-s snapshot  ctrl-b history  ctrl-r rename  ctrl-y duplicate"
     HEADER="$HEADER"$'\n'"ctrl-d delete   ctrl-x cd to its dir  ctrl-w save workspace  ESC quit"
+    HEADER="$HEADER"$'\n'"$PREVIEW_HELP"
     [ -n "${NNN_SSN_PIPE:-}" ] || HEADER="$HEADER"$'\n'"[!] O_SSN_PIPE=0: activate can only cd (rebuild with O_SSN_PIPE=1)"
 
+    # shellcheck disable=SC2086
     CHOSEN=$(printf '%s\n' "$MENU" | fzf \
         --delimiter='\t' --with-nth=4 \
         --prompt='sessions > ' \
         --header="$HEADER" \
         --expect=ctrl-s,ctrl-d,ctrl-r,ctrl-y,ctrl-b,ctrl-x,ctrl-w \
         --preview="'$SELF' --preview {1} {3} {2}" \
-        --preview-window=right,60%,wrap) || exit 0
+        --preview-window="$PREVIEW_WIN" \
+        $PREVIEW_BINDS) || exit 0
 
     KEY=$(printf '%s\n' "$CHOSEN" | head -1)
     SEL=$(printf '%s\n' "$CHOSEN" | sed -n '2p')
