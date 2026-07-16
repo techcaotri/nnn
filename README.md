@@ -170,7 +170,7 @@ Visit the [Tracker](https://github.com/jarun/nnn/issues/1546) thread for a list 
 
 # 🚀 Fork Enhancements
 
-This fork adds three major features on top of upstream nnn: **native Drag-and-Drop**, an **unlimited cross-instance directory history**, and a **CWD guard** that protects against a subtle Unix shell trap. All are opt-in and designed to minimize merge friction with upstream.
+This fork adds four major features on top of upstream nnn: **native Drag-and-Drop**, an **unlimited cross-instance directory history**, **session backup/restore and management**, and a **CWD guard** that protects against a subtle Unix shell trap. All are opt-in and designed to minimize merge friction with upstream — every C addition sits behind a build flag, so the default build stays byte-for-byte upstream.
 
 ---
 
@@ -304,6 +304,166 @@ For the full design, see [docs/Brainstorm_nnn_Support_Unlimited_History.md](docs
 
 ---
 
+## ◈ Session Backup, Restore and Management
+
+Upstream nnn can *save*, *load* and *restore* one session at a time — and `save_session()` opens the file with `O_TRUNC`, so **every save silently overwrites the previous state** with no history. There is no way to list sessions, see what is inside one, rename or delete them, or roll back a session you just clobbered.
+
+This fork adds the missing management layer: an fzf-driven manager (<kbd>;</kbd><kbd>S</kbd>) over a **versioned backup store**, plus **whole-workspace** capture of the dual-pane setup.
+
+### The Key Insight
+
+Because this fork builds with `O_SSN_ON_CD` (auto-save on every directory change), the on-disk session file is a **live mirror** of the running instance. So:
+
+- a plain **file copy is an accurate point-in-time backup** — no IPC, no cooperation from the running process;
+- **swapping the file and reloading is an accurate restore**.
+
+That is why the whole feature needs almost no C: only *faithful reload* does, and even that is one small gated pipe op.
+
+### The Manager — `nnn-sessions` (bound to `;S`)
+
+Lists every session with its context count, save time, and markers for the **active** session and the one the **other pane** owns.
+
+| Key | Action |
+|-----|--------|
+| <kbd>Enter</kbd> | **Activate** the session (full fidelity — see below) |
+| <kbd>Ctrl</kbd>+<kbd>s</kbd> | **Snapshot** it into the versioned backup store |
+| <kbd>Ctrl</kbd>+<kbd>b</kbd> | Browse its **snapshot history** (drill in; <kbd>Enter</kbd> restores, <kbd>Ctrl</kbd>+<kbd>d</kbd> deletes) |
+| <kbd>Ctrl</kbd>+<kbd>r</kbd> | **Rename** (moves its backups too) |
+| <kbd>Ctrl</kbd>+<kbd>y</kbd> | **Duplicate** under a new name |
+| <kbd>Ctrl</kbd>+<kbd>d</kbd> | **Delete** (snapshots first, so it is never lost outright) |
+| <kbd>Ctrl</kbd>+<kbd>x</kbd> | **cd** into that session's current directory (borrow it, don't adopt it) |
+| <kbd>Ctrl</kbd>+<kbd>w</kbd> | Capture the **whole workspace** (left + right + @) under a label |
+| <kbd>Esc</kbd> | Quit |
+
+### Preview — All 8 Contexts at a Glance
+
+The preview decodes the binary session and prints **all 8 context paths as one block at the top**, so they are visible without scrolling; the per-context details follow underneath. `$HOME` is shortened to `~`, `*` marks the context that was current, and directories that no longer exist are flagged `[missing]` (a restore would land nowhere).
+
+```
+session : left
+file    : ~/.config/nnn/sessions/left
+saved   : 2026-07-16 15:58:05  (1472 bytes)
+
+contexts (8 of 8 active, * = current):
+   1  ~/Downloads
+   2  ~/Dev
+   3  ~/Dev/acme/widget-platform/WIP/Documents/Concepts_Diagrams
+   4  ~/Dev/acme/widget-platform/Sources/tooling/com.acme.architecture.adl
+   5  ~/Dev/Playground_Mermaid/mermaid-to-drawio
+ * 6  ~/Dev/Playground_Terminal/nnn/docs
+   7  ~/Dev/old-experiment              [missing]
+   8  ~
+
+details (alt-j/k line, alt-u/d half-page, alt-g/G ends):
+  ctx 1
+      cursor: some-download.deb
+      last  : ~
+      filter: n
+  ctx 2
+      cursor: scrcpy
+      last  : ~/Dev/scrcpy
+      filter: ndou
+  ...
+```
+
+A session preview is taller than the pane (which is usually already half a tmux split), so the preview scrolls:
+
+| Key | Action |
+|-----|--------|
+| <kbd>Alt</kbd>+<kbd>j</kbd> / <kbd>Alt</kbd>+<kbd>k</kbd> | Scroll one line down / up |
+| <kbd>Alt</kbd>+<kbd>u</kbd> / <kbd>Alt</kbd>+<kbd>d</kbd> | Half page up / down |
+| <kbd>Alt</kbd>+<kbd>b</kbd> / <kbd>Alt</kbd>+<kbd>f</kbd> | Full page up / down |
+| <kbd>Alt</kbd>+<kbd>g</kbd> / <kbd>Alt</kbd>+<kbd>G</kbd> | Jump to top / bottom |
+| <kbd>Alt</kbd>+<kbd>p</kbd> | Cycle preview size (tall-bottom → wide-right → default) |
+| <kbd>Alt</kbd>+<kbd>z</kbd> | Toggle line wrap |
+| <kbd>Alt</kbd>+<kbd>h</kbd> | Hide / show the preview |
+
+`Alt`-based because <kbd>Ctrl</kbd>+<kbd>s/d/r/y/b/x/w</kbd> are taken by the actions, and <kbd>Shift</kbd>+arrows are unreliable through tmux. fzf's own <kbd>Shift</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> and mouse wheel still work where the terminal passes them through.
+
+### Activate: Faithful vs Quick
+
+| Aspect | **Faithful** (<kbd>Enter</kbd>) | **Quick cd** (<kbd>Ctrl</kbd>+<kbd>x</kbd>) |
+|--------|---------------------------------|---------------------------------------------|
+| Restores directories | all 8 contexts | current context only |
+| Restores sort / hidden / filter / cursor / colors | yes | no |
+| Adopts the session name | yes (`curssn` ← name) | no (you stay on yours) |
+| Needs a build flag | `O_SSN_PIPE=1` | no — works on any build |
+
+Faithful activate writes `0s<name>` to `$NNN_PIPE`; nnn then runs the very same `load_session()` the built-in <kbd>^S</kbd> <kbd>l</kbd> menu uses. Without `O_SSN_PIPE` the manager says so in its header and degrades to the quick cd.
+
+> **Note — one op per plugin run.** nnn reads **exactly one** pipe message per plugin invocation; a second write *deadlocks* it. That is why quick cd moves only the current context (resolved from `settings.curctx` in the saved session) instead of replaying all eight.
+
+### The Backup Store
+
+```
+~/.config/nnn/sessions/
+  left, right, @                     live sessions (mirror the instances)
+  .backups/
+    left/
+      2026-07-16T15-48-12            timestamped snapshot (binary blob)
+      2026-07-16T15-48-12.txt        decoded, greppable mirror
+      2026-07-15T18-02-40            ... older snapshots, pruned to NNN_SSN_KEEP
+      2026-07-15T18-02-40.txt
+    right/
+      ...
+  .snapshots/
+    before-refactor.tar              whole workspace: left + right + @
+    daily-2026-07-16.tar
+```
+
+- **Atomic writes** — everything is written as `.tmp` in the same directory then `rename()`d, so a crash never leaves a half-written snapshot.
+- **Decoded `.txt` mirror** — each snapshot is stored beside a human-readable decode, so backups are greppable and survive the binary format being opaque.
+- **Retention** — the newest `NNN_SSN_KEEP` snapshots per session are kept (blob and mirror pruned as a pair).
+- **Git backend (optional)** — the nnn config dir is already a git submodule, so `NNN_SSN_GIT=1` commits `sessions/` after each snapshot for unlimited, diffable history (the `.txt` mirrors make the diffs meaningful).
+
+### Whole-Workspace Snapshots
+
+The dual-pane setup is really *one* workspace: `left` + `right` + `@`. <kbd>Ctrl</kbd>+<kbd>w</kbd> captures all three into a single labelled tar; selecting a workspace row and pressing <kbd>Enter</kbd> lays them back and reloads **both** tmux panes (via each pane's own pipe, falling back to `^S l` keystrokes).
+
+### Safety Rails
+
+- **Restore snapshots the current state first** — restoring is itself undoable.
+- **Delete snapshots first** — a deleted session is always recoverable from its history.
+- **Warns before adopting the other pane's session** — with `O_SSN_ON_CD`, both panes would otherwise auto-save onto the same file.
+- **Rejects non-session files** by checking the format version (your `load_nnn_session.sh` in `sessions/` is correctly ignored).
+- **Never hangs automation** — the confirm prompt no-ops without a controlling terminal.
+
+### Scripting / Cron
+
+| Command | Purpose |
+|---------|---------|
+| `nnn-sessions --list` | `<name> <ctx-count> <snapshots>` per session |
+| `nnn-sessions --snapshot [name]` | Snapshot a session (defaults to `$NNN_SESSION`) |
+| `nnn-sessions --prune [name]` | Apply the retention limit now |
+| `nnn-sessions --workspace-save <label>` | Capture left + right + @ as one tar |
+| `nnn-sessions --cd <session>` | cd into a session's current directory |
+| `nnn-sessions --activate <session>` | Faithfully load a session |
+
+```sh
+# Daily workspace backup from cron (no terminal needed):
+0 9 * * *  NNN_SSN_KEEP=30 ~/.config/nnn/plugins/nnn-sessions --workspace-save "daily-$(date +\%F)"
+```
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `NNN_SSN_KEEP` | `20` | Snapshots kept per session (`0` = keep everything) |
+| `NNN_SSN_GIT` | `0` | `1` = git-commit `sessions/` after each snapshot |
+| `NNN_SSN_PREVIEW` | `right,60%,wrap` | Preview geometry (any fzf `--preview-window` spec, e.g. `down,70%,wrap`) |
+| `NNN_SSN_PIPE` | *(set by nnn)* | Exported when built with `O_SSN_PIPE=1`; the plugin feature-detects on it |
+| `NNN_SESSION` | *(set by nnn)* | Exported active session name; used for the `[active]` marker and warnings |
+
+### Build and Config
+
+- **Build:** `make O_SSN_PIPE=1` adds the `s` pipe op (58 lines of C, entirely `#ifdef`-gated). Pair it with `O_SSN_ON_CD=1` — the live-mirror behaviour the backups rely on.
+- **Plugin binding:** add `S:nnn-sessions` to `NNN_PLUG` (invoke with `;S`).
+- **Store:** `~/.config/nnn/sessions/.backups/` and `.snapshots/`.
+
+For the full design — approach scorecard, the binary session format, class/collaboration diagrams and the phased plan — see [docs/Brainstorm_nnn_Support_Sessions_Management.md](docs/Brainstorm_nnn_Support_Sessions_Management.md) and §3.5.13 of [docs/nnn_Software_Design.md](docs/nnn_Software_Design.md).
+
+---
+
 ## ◈ CWD Guard — Shell Protection Against the Trash Displacement Trap
 
 A **shell prompt hook** that detects when your terminal's real working directory has been silently moved (e.g., into the Trash after an nnn delete and re-create) and auto-repairs it.
@@ -343,7 +503,8 @@ This fork provides two convenience build scripts in the project root that encode
 
 ```sh
 make -j$((`nproc`-2)) 0_NERD=1 O_EMOJI=1 O_PCRE=1 O_CTX8=1 O_QSORT=1 \
-  O_SSN_ON_CD=1 O_FZ_CPMV=1 O_HIST=1 O_DND=1
+  O_SSN_ON_CD=1 O_SSN_PIPE=1 O_FZ_CPMV=1 O_HIST=1 O_DND=1 \
+  NNN_DND_OSC72=1 NNN_DND_DEBUG=1
 ```
 
 **What each flag enables:**
@@ -355,7 +516,8 @@ make -j$((`nproc`-2)) 0_NERD=1 O_EMOJI=1 O_PCRE=1 O_CTX8=1 O_QSORT=1 \
 | `O_PCRE=1` | PCRE regex | Links with PCRE2 for Perl-compatible regex in filters (`/` search). Without it, nnn uses POSIX regex (BRE/ERE). |
 | `O_CTX8=1` | 8 contexts | Enables all 8 contexts (tabs/workspaces). Without it, nnn uses 4 contexts. |
 | `O_QSORT=1` | Quick sort | Uses Alexey Tourbin's optimized QSORT implementation for faster sorting of large directories. |
-| `O_SSN_ON_CD=1` | Session auto-save | Automatically saves the session on every directory change, so nnn always restores to the last state after a crash or restart. |
+| `O_SSN_ON_CD=1` | Session auto-save | Automatically saves the session on every directory change, so nnn always restores to the last state after a crash or restart. Also what makes the on-disk session a **live mirror**, which the session backups rely on. |
+| `O_SSN_PIPE=1` | Session load via pipe | Adds the `NNN_PIPE` op `<ctx>s<name>` → `load_session()`, so the `nnn-sessions` plugin can activate/restore a session at full fidelity (sort, filter, cursor, colors across all 8 contexts). Exports `NNN_SSN_PIPE=1` and `NNN_SESSION` for plugins. Without it the plugin degrades to a directory-only `cd`. See § Session Backup, Restore and Management. |
 | `O_FZ_CPMV=1` | FileZilla-style copy/move | Enables conflict-resolution prompts (overwrite/skip/rename) during copy/move via the `cpmv` plugin. |
 | `O_HIST=1` | Shared directory history | Enables the visit-recorder C hook — appends every directory change to the shared `.dirhistory` log used by the `nnn-history` plugin. See § Unlimited Cross-Instance Directory History. |
 | `O_DND=1` | Drag-and-drop helper | Builds the `nnn-dnd` XDND helper binary alongside nnn. Links `-lX11`. The `NNN_DND_OSC72=1` env var is separate and handled at runtime. |
@@ -376,7 +538,7 @@ make -j$((`nproc`-2)) 0_NERD=1 O_EMOJI=1 O_PCRE=1 O_CTX8=1 O_QSORT=1 \
 
 ```sh
 make -j$((`nproc`-2)) 0_NERD=1 O_EMOJI=1 O_PCRE=1 O_CTX8=1 O_QSORT=1 \
-  O_SSN_ON_CD=1 O_FZ_CPMV=1 O_HIST=1 O_DEBUG=1 -f Makefile_debug
+  O_SSN_ON_CD=1 O_SSN_PIPE=1 O_FZ_CPMV=1 O_HIST=1 O_DEBUG=1 -f Makefile_debug
 ```
 
 **Differences from `build.sh`:**
@@ -406,6 +568,9 @@ NNN_DND_OSC72=1 NNN_DND_DEBUG=/tmp/nnn-dnd.log ./nnn
 
 # Run with shared history:
 NNN_HIST=global ./nnn
+
+# Run with session management (keep 50 snapshots per session, git-backed):
+NNN_SSN_KEEP=50 NNN_SSN_GIT=1 ./nnn
 ```
 
 **Clean builds:**
@@ -422,6 +587,10 @@ The repo includes scripts for a dual-pane tmux layout (`start_dual_nnn.sh`) that
 
 - **Cross-pane directory history** — both panes record to the same `.dirhistory`; the `nnn-history` picker can jump to a directory visited by the other pane.
 - **Cross-pane DnD** — OSC-72 drag-out works inside tmux with `allow-passthrough on` (the outbound escapes reach kitty through tmux's DCS passthrough wrapper).
+- **Cross-pane context switching** — `ctx_switcher` (`Alt-w`) lists the contexts of *both* panes and switches to any of them.
+- **Workspace snapshots** — because each pane auto-saves its session on every `cd`, `nnn-sessions` (`;S`, <kbd>Ctrl</kbd>+<kbd>w</kbd>) captures `left` + `right` + `@` as **one** labelled unit and restores both panes together. See § Session Backup, Restore and Management.
+
+Since both panes auto-save to the *same* session names, the manager warns before letting one pane adopt the other's session (they would otherwise fight over the file).
 
 ---
 
@@ -444,5 +613,7 @@ A running log of real problems hit while using this nnn setup, with investigatio
 
 - [docs/Brainstorm_nnn_Support_Drag_and_Drop.md](docs/Brainstorm_nnn_Support_Drag_and_Drop.md) — Full brainstorm, protocol deep-dives, XDND state machines, OSC-72 implementation guide.
 - [docs/Brainstorm_nnn_Support_Unlimited_History.md](docs/Brainstorm_nnn_Support_Unlimited_History.md) — Shared visit log design, plugin architecture, compaction strategy.
+- [docs/Brainstorm_nnn_Support_Sessions_Management.md](docs/Brainstorm_nnn_Support_Sessions_Management.md) — Session backup/restore/management: approach scorecard, the byte-level binary session format, class/collaboration diagrams, the backup store, faithful-vs-quick restore, and the phased implementation plan.
+- [docs/nnn_Software_Design.md](docs/nnn_Software_Design.md) — HLD/LLD of nnn as built here (event loop, plugin protocol, input pipeline, DnD, and §3.5.13 session management).
 - [docs/Brainstorm_nnn_Update.md](docs/Brainstorm_nnn_Update.md) — General fork update notes.
 - [docs/nnn_Problems_And_Solutions.md](docs/nnn_Problems_And_Solutions.md) — Running log of real problems and their fixes.
