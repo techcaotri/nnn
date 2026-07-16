@@ -26,7 +26,7 @@
    - 6.3 Collaboration Diagram + Participant Summary Table
    - 6.4 The Backup Store (layout, rotation, atomicity)
    - 6.5 Dynamic Behaviour (save, restore, switch, snapshot)
-   - 6.6 Faithful Restore vs Quick Switch (the key decision)
+   - 6.6 Faithful Restore vs Quick cd (the key decision)
    - 6.7 Whole-Workspace Snapshots across the dual panes
    - 6.8 Edge Cases
 7. Step-by-Step Implementation Guidelines
@@ -50,7 +50,7 @@ ASCII Table 1: Requirements
 | R1   | Save a NAMED point-in-time snapshot without clobbering live   | partial |
 | R2   | List all sessions + snapshots with metadata (ctx, paths, mtime)| NO     |
 | R3   | Restore a chosen snapshot into the LIVE instance faithfully   | partial |
-| R4   | Quick paths-only SWITCH to another session (degraded, zero C) | NO      |
+| R4   | Quick cd into another session's dir (degraded, zero C)        | NO      |
 | R5   | Rename / delete / duplicate a session safely (with confirm)   | NO      |
 | R6   | Versioned backups with rotation (keep last N), never lose good| NO      |
 | R7   | Whole-workspace snapshot: left + right + @ as one labelled unit| NO     |
@@ -168,6 +168,31 @@ There is **no session op** -- a plugin cannot ask a running instance to
 `load_session`. That single missing op is the crux of the "faithful live
 restore" problem in Section 6.6.
 
+**One op per plugin run (verified).** `run_plugin()` opens the pipe once and
+calls `readpipe()` **exactly once** (src/nnn.c:7683), then closes the read end
+and blocks in `waitpid()`. So a plugin gets **one** message per invocation, and
+a second write is not merely ignored -- it **deadlocks**: the plugin blocks in
+`open(FIFO, O_WRONLY)` waiting for a reader that will never come, while nnn
+waits for the plugin to exit. This was confirmed experimentally (a two-write
+plugin hangs nnn permanently). Every design below therefore sends **at most one
+message per action**, and the "replay each context" idea is off the table.
+
+```mermaid
+%% Why a plugin gets exactly one pipe op per run
+sequenceDiagram
+    participant P as plugin (child)
+    participant F as FIFO ($NNN_PIPE)
+    participant N as nnn (run_plugin)
+
+    N->>F: open(O_RDONLY)
+    P->>F: open(O_WRONLY) + write op #1
+    F->>N: readpipe() reads op #1
+    N->>F: close(read end)
+    N->>N: waitpid(plugin)
+    P-->>F: open(O_WRONLY) for op #2 -- BLOCKS forever
+    Note over P,N: deadlock#59; nnn never reads again and never returns
+```
+
 ---
 
 ## 3. The Binary Session File Format (byte-level)
@@ -262,7 +287,7 @@ ASCII Table 5: Concern -> mechanism -> needs C?
 | Persist     | cp live file -> backups/<name>/<ts>, prune| No (plugin)       |
 | Curate      | fzf over sessions/, mv/rm/cp             | No (plugin)       |
 | Recover     | faithful: load_session in live instance  | Yes, tiny (pipe s)|
-|             | degraded: repeat 'c' ops per context     | No (plugin)       |
+|             | degraded: ONE 'c' op -> its current dir  | No (plugin)       |
 | Coordinate  | tmux send-keys / per-pane pipe to L and R| No (plugin+tmux)  |
 +-------------+------------------------------------------+-------------------+
 ```
@@ -284,8 +309,9 @@ and upstream-merge friction.
 
 A single `nnn-sessions` plugin (fzf-driven) does everything at the file level:
 list + preview (parse the binary header), save-snapshot (copy live file to a
-timestamped backup), restore (copy back + tell the user to press `^S l`, or drive
-paths via repeated `c` ops), rename/delete/duplicate (`mv`/`rm`/`cp`), rotation.
+timestamped backup), restore (copy back + tell the user to press `^S l`, or cd
+into its current dir with a single `c` op), rename/delete/duplicate
+(`mv`/`rm`/`cp`), rotation.
 
 ```mermaid
 %% Approach A: everything at the file level, no C changes
@@ -294,7 +320,7 @@ flowchart LR
     Fzf --> Act["actions"]
     Act --> Save["save: cp live -> backups/<name>/<ts>"]
     Act --> Ren["rename/delete/dup: mv/rm/cp"]
-    Act --> Restore["restore: cp back<br/>then 'c' ops OR user ^S l"]
+    Act --> Restore["restore: cp back<br/>then one 'c' op OR user ^S l"]
     Save --> Store["backups/ store"]
 ```
 
@@ -551,9 +577,9 @@ flowchart TB
     Mgr -->|"7b: write 0s left"| PipeL
     PipeL -->|"8b: load_session(left)"| Core
     Core -->|"9b: goto begin (all ctx restored)"| LoopL
-    User -->|"5c: choose Quick-switch <name>"| Mgr
-    Mgr -->|"6c: write Nc<path> for each ctx"| PipeL
-    PipeL -->|"7c: chdir per ctx (paths only)"| LoopL
+    User -->|"5c: choose Quick-cd <name>"| Mgr
+    Mgr -->|"6c: write 0c<its current dir>"| PipeL
+    PipeL -->|"7c: chdir this ctx (dir only)"| LoopL
 ```
 
 **Explanation.** Messages 1..4 are common setup (open the manager, preview via the
@@ -561,8 +587,9 @@ parser). Branch **A** (5a..6a) is pure file work -- snapshot the live file, writ
 decoded mirror, prune old backups. Branch **B** (5b..9b) is the *faithful* restore:
 swap the file, then the one gated pipe op makes the live instance re-`load_session`
 so **all** per-context settings/filters/cursor come back. Branch **C** (5c..7c) is
-the zero-C fallback: replay each context's path with the existing `c` op -- fast
-and dependency-free, but paths only.
+the zero-C fallback: a single `c` op into the session's saved current directory
+-- fast and dependency-free, but one context and no settings (one message is all
+the pipe allows, see Section 2).
 
 ```
 ASCII Table 8: Collaboration participants
@@ -690,46 +717,48 @@ sequenceDiagram
     participant Pipe as NNN_PIPE (instance L)
     participant B as browse() loop
 
-    U->>P: choose Quick-switch "project-a"
-    P->>Prev: extract_contexts(sessions/project-a)
-    Prev-->>P: [ctx1=/a, ctx2=/b, ... paths only]
-    loop for each active ctx n
-        P->>Pipe: write "<n>c<path>"
-        Pipe->>B: chdir context n -> path
-    end
-    Note over P,B: settings/filter/cursor NOT restored (paths only)
+    U->>P: choose Quick-cd "project-a"
+    P->>Prev: parse_session + read cfg.curctx
+    Prev-->>P: its current dir (e.g. ctx5 = /a/b)
+    P->>Pipe: write "0c/a/b"   (exactly ONE message)
+    Pipe->>B: chdir this context -> /a/b
+    Note over P,B: one ctx moves#59; settings/filter/cursor NOT restored
 ```
 
 **Explanation.** The two restore paths are complementary. Faithful restore needs
 the gated op but returns the session *exactly* (sort flags, hidden toggle,
-filters, cursor file, colors). Quick switch needs nothing new but only moves each
-context's directory. The manager offers both and labels them honestly so the user
-picks per situation.
+filters, cursor file, colors) for all 8 contexts. Quick cd needs nothing new,
+but the one-op pipe limit (Section 2) means it can only move the **current**
+context, into the directory that session was last sitting in -- which is read
+from `settings.curctx` in the saved global cfg. The manager offers both and
+labels them honestly so the user picks per situation.
 
-### 6.6 Faithful Restore vs Quick Switch (the key decision)
+### 6.6 Faithful Restore vs Quick cd (the key decision)
 
 ```mermaid
 %% Decision: which restore path to use
 flowchart TB
     Q0["User wants another session's state"] --> Q1{"built with O_SSN_PIPE ?"}
-    Q1 -- "no" --> Path2["Quick switch (paths only)<br/>repeat 'c' ops -- always available"]
+    Q1 -- "no" --> Path2["Quick cd (dir only)<br/>one 'c' op -- always available"]
     Q1 -- "yes" --> Q2{"need full fidelity?<br/>(sort/filter/cursor/color)"}
-    Q2 -- "no, just directories" --> Path2
+    Q2 -- "no, just its directory" --> Path2
     Q2 -- "yes" --> Path1["Faithful restore<br/>swap file + 's' op -> load_session"]
     Path2 --> Done["done"]
     Path1 --> Done
 ```
 
 ```
-ASCII Table 10: Faithful restore vs quick switch
+ASCII Table 10: Faithful restore vs quick cd
 +-------------------------+---------------------------+--------------------------+
-| Aspect                  | Faithful restore (s op)   | Quick switch (c ops)     |
+| Aspect                  | Faithful restore (s op)   | Quick cd (one c op)      |
 +-------------------------+---------------------------+--------------------------+
-| Restores paths          | yes (all 8 ctx)           | yes (active ctx)         |
+| Restores paths          | yes (all 8 ctx)           | current ctx only         |
 | Restores sort/hidden    | yes                       | no                       |
 | Restores filter         | yes                       | no                       |
 | Restores cursor file    | yes                       | no                       |
 | Restores colors/cfg     | yes                       | no                       |
+| Adopts the session name | yes (curssn <- name)      | no (stays on yours)      |
+| Pipe messages needed    | 1                         | 1 (the hard limit)       |
 | Needs build flag        | yes (O_SSN_PIPE)          | no                       |
 | C code                  | ~12 lines (gated)         | none                     |
 | Best for                | "resume exactly"          | "just take me there"     |
@@ -844,18 +873,25 @@ testable; you can stop after any phase and still have a working feature.
 11. Test each with confirm prompts; verify the live instance is untouched (state
     is in memory until the next auto-save).
 
-### Phase 4 -- Quick switch (zero C, works today)
+### Phase 4 -- Quick cd (zero C, works today)
 
-12. `quick_switch <name>`: `extract_contexts` -> for each active ctx `n` with path
-    `p`, guard `test -d "$p"` then write `"${n}c${p}"` to `$NNN_PIPE`.
-13. Test from pane L: quick-switch to `right`'s layout; confirm each context's
-    directory follows (accept that filters/sort do not).
+12. `session_curctx <file>`: the saved current context is `settings.curctx`, bits
+    **13..15** of the 4-byte global cfg at offset `HDR_LEN` (13 single-bit fields
+    precede it): `cfg=$(od -An -tu4 -j 264 -N 4 -v file)`, then `(cfg >> 13) & 7`.
+13. `quick_switch <name>`: resolve that context's path, guard `test -d`, and write
+    **exactly one** message `"0c$path"` to `$NNN_PIPE`.
+    **Do not loop over the contexts** -- nnn reads one op per plugin run and a
+    second write deadlocks it (Section 2). This is the single most important
+    constraint in the whole feature.
+14. Test from pane L: quick-cd to `right`; confirm the current context lands in
+    right's saved current directory, that your session name does **not** change,
+    and that nnn stays responsive (no hang).
 
 ### Phase 5 -- Faithful restore: the gated `s` pipe op (the only C)
 
-14. **Makefile / Makefile_debug**: add `O_SSN_PIPE := 0  # session load via NNN_PIPE`
+15. **Makefile / Makefile_debug**: add `O_SSN_PIPE := 0  # session load via NNN_PIPE`
     and `ifeq ($(strip $(O_SSN_PIPE)),1)` -> `CPPFLAGS += -DSSN_PIPE`.
-15. **readpipe()** (src/nnn.c:7530): add, guarded, an op branch:
+16. **readpipe()** (src/nnn.c:7530): add, guarded, an op branch:
     ```c
     #ifdef SSN_PIPE
     } else if (op == 's') {         /* load session by name */
@@ -870,47 +906,47 @@ testable; you can stop after any phase and still have a working feature.
     `load_session(name, &path, &lastdir, &lastname, FALSE)` + `setdirwatch()` +
     `goto begin` -- mirroring the existing `SEL_SESSIONS` load path
     (src/nnn.c:10839).
-16. Export a marker so the plugin can auto-detect: in the `#ifdef SSN_PIPE` init,
+17. Export a marker so the plugin can auto-detect: in the `#ifdef SSN_PIPE` init,
     `setenv("NNN_SSN_PIPE", "1", 1)` (near `setexports`/plugin init).
-17. **build.sh / build_debug.sh**: append `O_SSN_PIPE=1`.
-18. In the plugin, `faithful_restore <name>`: swap the file (Phase 2 helper in
+18. **build.sh / build_debug.sh**: append `O_SSN_PIPE=1`.
+19. In the plugin, `faithful_restore <name>`: swap the file (Phase 2 helper in
     reverse: `cp .backups/<name>/<ts> sessions/<name>`), then, if
     `[ -n "$NNN_SSN_PIPE" ]`, write `"0s${name}"` to `$NNN_PIPE`; else fall back to
     Phase 4 quick switch and print "press ^S l for full restore".
-19. Test: build with `O_SSN_PIPE=1`; restore a backup of `left` that has a filter +
+20. Test: build with `O_SSN_PIPE=1`; restore a backup of `left` that has a filter +
     non-default sort in ctx 3; confirm sort/filter/cursor all return (not just the
     path). Verify the default build (`O_SSN_PIPE=0`) is byte-for-byte unchanged and
     the plugin degrades to quick switch.
 
 ### Phase 6 -- Whole-workspace snapshots (R7)
 
-20. `snapshot_workspace <label>`: `tar -cf .snapshots/<label>.tar -C sessions left
+21. `snapshot_workspace <label>`: `tar -cf .snapshots/<label>.tar -C sessions left
     right @` (whatever exists). `list_workspaces` / preview via `tar -tf`.
-21. `restore_workspace <label>`: `tar -xf` into `sessions/`, then reload both panes.
+22. `restore_workspace <label>`: `tar -xf` into `sessions/`, then reload both panes.
     Locate the sibling pane with the same `tmux` pane-index logic `ctx_switcher`
     uses; per pane, if `NNN_SSN_PIPE`, write `0s left` / `0s right` to that pane's
     `$NNN_PIPE`; else `tmux send-keys` the `^S l` sequence (escape `;` as `'\;'`),
     or relaunch via `start_dual_nnn.sh`.
-22. Test: snapshot the pair, cd around in both panes, restore the label, confirm
+23. Test: snapshot the pair, cd around in both panes, restore the label, confirm
     both panes return to the captured layout.
 
 ### Phase 7 -- Optional git + text-mirror backend (R8)
 
-23. Add `backup_git`: `git -C "$SESSIONS_DIR/.." add -A sessions .backups
+24. Add `backup_git`: `git -C "$SESSIONS_DIR/.." add -A sessions .backups
     .snapshots && git ... commit -m "nnn sessions <ts>"` (the config dir is already
     a submodule). Guard behind a config toggle (`NNN_SSN_GIT=1`).
-24. The `.txt` mirrors from Phase 2 make these commits diffable.
-25. Test: `git log` shows session commits; `git show HEAD:...txt` reads a past
+25. The `.txt` mirrors from Phase 2 make these commits diffable.
+26. Test: `git log` shows session commits; `git show HEAD:...txt` reads a past
     layout.
 
 ### Phase 8 -- Wire-up, docs, and test matrix
 
-26. Update `nnn_config.sh` `NNN_PLUG` (the `S:` binding) and note it in the header
+27. Update `nnn_config.sh` `NNN_PLUG` (the `S:` binding) and note it in the header
     comments alongside the `;h`/`;r`/`;w` notes.
-27. Document the feature in [nnn_Software_Design.md](nnn_Software_Design.md)
+28. Document the feature in [nnn_Software_Design.md](nnn_Software_Design.md)
     (new subsection: components, the `s` pipe op, the backup store, the
     faithful-vs-quick decision) with the diagrams above.
-28. Manual test matrix: single-instance, dual-pane, op-on, op-off, version
+29. Manual test matrix: single-instance, dual-pane, op-on, op-off, version
     mismatch, spaces/unicode names, rotation limit, workspace round-trip.
 
 ```

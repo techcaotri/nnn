@@ -503,6 +503,13 @@ static regex_t archive_re;
 #endif
 #ifndef NOSSN
 static char curssn[NAME_MAX + 1];
+#ifdef SSN_PIPE
+/*
+ * Session name requested by a plugin through the control pipe (op 's').
+ * Set in readpipe(), consumed once in run_plugin(). Empty when idle.
+ */
+static char g_ssnpipe[NAME_MAX + 1];
+#endif
 #endif
 
 /* pthread related */
@@ -7430,6 +7437,14 @@ static void setexports(const char *path)
 	}
 	setenv("NNN_INCLUDE_HIDDEN", xitoa(cfg.showhidden), 1);
 	setenv("NNN_PREFER_SELECTION", xitoa(cfg.prefersel), 1);
+#if !defined(NOSSN) && defined(SSN_PIPE)
+	/*
+	 * Export the active session name so a session-management plugin can mark
+	 * it, snapshot it and warn before activating a session another instance
+	 * owns. Empty when no session is active.
+	 */
+	setenv("NNN_SESSION", curssn, 1);
+#endif
 	setenv("PWD", path, 1);
 }
 
@@ -7471,6 +7486,11 @@ static bool plctrl_init(void)
 	len = xstrsncpy(g_pipepath + len, "nnn-pipe.", TMP_LEN_MAX - len) + len;
 	xstrsncpy(g_pipepath + len - 1, xitoa(getpid()), TMP_LEN_MAX - len);
 	setenv(env_cfg[NNN_PIPE], g_pipepath, TRUE);
+
+#if !defined(NOSSN) && defined(SSN_PIPE)
+	/* Advertise the pipe 's' (load session) op so plugins can feature-detect. */
+	setenv("NNN_SSN_PIPE", "1", TRUE);
+#endif
 
 	return EXIT_SUCCESS;
 }
@@ -7549,6 +7569,23 @@ static char *readpipe(int fd, char *ctxnum, char **path)
 		clearselection();
 		g_state.picker = 0;
 		g_state.picked = 1;
+#if !defined(NOSSN) && defined(SSN_PIPE)
+	} else if (op == 's') {
+		/*
+		 * Load a session by name: '<ctx>s<name>' (<ctx> is ignored).
+		 * Only stash the name here; run_plugin() performs the load once the
+		 * plugin has exited and the screen is ours again. Enables a plugin to
+		 * restore/activate a session exactly like the 'l' option of the
+		 * session menu does. Built in with O_SSN_PIPE (-DSSN_PIPE).
+		 */
+		ssize_t len = read_nointr(fd, g_buf, NAME_MAX);
+
+		if (len <= 0)
+			return NULL;
+
+		g_buf[len] = '\0'; /* Terminate the name read */
+		xstrsncpy(g_ssnpipe, g_buf, NAME_MAX + 1);
+#endif
 	}
 
 	*ctxnum = ctx;
@@ -7653,6 +7690,27 @@ static bool run_plugin(char **path, const char *file, char *runfile, char **last
 	waitpid(p, NULL, 0);
 
 	refresh();
+
+#if !defined(NOSSN) && defined(SSN_PIPE)
+	/*
+	 * A plugin asked to load a session (pipe op 's'). Do it only now: the
+	 * plugin has exited and curses is refreshed, so load_session() can safely
+	 * report failure. It repoints path/lastdir/lastname and refreshes cfg and
+	 * all contexts; the caller in browse() does 'goto begin' right after, which
+	 * repopulates and draws the restored session.
+	 *
+	 * Note: deliberately no save_session() of the outgoing session here. The
+	 * restore flow swaps the session file on disk *before* sending 's', so
+	 * saving first would overwrite the very file we are about to load.
+	 */
+	if (g_ssnpipe[0]) {
+		char ssn[NAME_MAX + 1];
+
+		xstrsncpy(ssn, g_ssnpipe, NAME_MAX + 1);
+		g_ssnpipe[0] = '\0';
+		load_session(ssn, path, lastdir, lastname, FALSE);
+	}
+#endif
 
 	unlink(g_pipepath);
 

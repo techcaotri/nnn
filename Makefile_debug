@@ -26,6 +26,7 @@ O_QSORT := 0  # use Alexey Tourbin's QSORT implementation
 O_BENCH := 0  # benchmark mode (stops at first user input)
 O_NOSSN := 0  # disable session support
 O_SSN_ON_CD := 0  # auto-save session on every directory change
+O_SSN_PIPE := 0  # load a session via NNN_PIPE op 's' (nnn-sessions plugin)
 O_FZ_CPMV := 0  # FileZilla-style copy/move conflict handling via cpmv plugin
 O_HIST := 0  # log directory visits to a shared history (nnn-history plugin)
 O_NOUG := 0  # disable user, group name in status bar
@@ -140,6 +141,10 @@ endif
 
 ifeq ($(strip $(O_SSN_ON_CD)),1)
 	CPPFLAGS += -DSAVE_SESSION_ON_CD
+endif
+
+ifeq ($(strip $(O_SSN_PIPE)),1)
+	CPPFLAGS += -DSSN_PIPE
 endif
 
 ifeq ($(strip $(O_FZ_CPMV)),1)

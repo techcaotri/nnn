@@ -1400,6 +1400,193 @@ process's pipe is not addressable, so the keystroke route -- proven by
 switches contexts across panes directly and is the source of the session-file
 parser and the cross-pane switch technique reused here.
 
+#### 3.5.13 Session Backup, Restore and Management (plugin tie-in)
+
+Design rationale, approach scorecard and phased plan:
+[Brainstorm_nnn_Support_Sessions_Management.md](Brainstorm_nnn_Support_Sessions_Management.md).
+
+nnn's built-in session support (3.5.7) can only *save*, *load* and *restore* one
+named file at a time, and `save_session()` opens with `O_TRUNC` -- so every save
+(including each auto-save-on-cd) irreversibly overwrites the previous state.
+This feature adds the missing **management layer**: enumerate, preview, version,
+curate and coordinate sessions.
+
+**The load-bearing insight.** Because this fork builds with `O_SSN_ON_CD`
+(3.5.7), the on-disk session file is rewritten on every real chdir and is
+therefore a **live mirror** of the running instance. A plain file copy is an
+accurate point-in-time backup, and swapping the file plus reloading is an
+accurate restore -- no IPC or shared memory needed.
+
+##### 3.5.13.1 Architecture
+
+```mermaid
+%% Session management: plugin-first manager over a versioned file store
+flowchart TB
+    subgraph UI["User-facing (plugin, 0 C)"]
+        Mgr["Session Manager (nnn-sessions, #59;S)"]
+        Prev["Session Previewer (parse_session, all 8 ctx)"]
+    end
+    subgraph StorePlane["Backup Store (files under sessions/)"]
+        Live["live sessions/&lt;name&gt;"]
+        Bak[".backups/&lt;name&gt;/&lt;ts&gt; (+ .txt mirror)"]
+        Tar[".snapshots/&lt;label&gt;.tar (workspace)"]
+    end
+    subgraph CoreC["Running nnn (C)"]
+        AutoCd["auto-save on cd (O_SSN_ON_CD, existing)"]
+        LoadC["load_session() (existing)"]
+        PipeC["readpipe() + 's' op (NEW, gated O_SSN_PIPE)"]
+    end
+
+    AutoCd -- "mirrors live state" --> Live
+    Mgr -- "cp + decode + prune" --> Bak
+    Mgr -- "tar left+right+@" --> Tar
+    Prev -- "read" --> Live
+    Mgr -- "faithful: write '0s&lt;name&gt;'" --> PipeC
+    Mgr -- "quick: write '0c&lt;dir&gt;'" --> PipeC
+    PipeC --> LoadC
+```
+
+**Explanation.** The UI is entirely a plugin; the store is plain files; the only
+new C is one **gated** pipe op. `NNN_SSN_PIPE=1` and `NNN_SESSION=<name>` are
+exported (both under `-DSSN_PIPE`) so the plugin can feature-detect the op and
+know which session it is running as.
+
+##### 3.5.13.2 The `s` pipe op (the only C change)
+
+```
+ASCII Table 12: NNN_PIPE ops after this feature
++-----+--------------------+------------------------------------------------+
+| Op  | Wire format        | Effect                                         |
++-----+--------------------+------------------------------------------------+
+| c   | <ctx>c<abs/path>   | chdir a context (existing)                     |
+| l   | <ctx>l<listpath>   | load a file list (existing)                    |
+| p   | <ctx>p             | finish picker mode (existing)                  |
+| s   | <ctx>s<name>       | NEW, gated: load_session(name). <ctx> ignored. |
++-----+--------------------+------------------------------------------------+
+```
+
+`readpipe()` only *stashes* the name (`g_ssnpipe`); `run_plugin()` performs the
+load **after** `waitpid()` + `refresh()`, so the plugin has exited and curses is
+ours again before `load_session()` can print any error. `browse()` then does its
+normal `goto begin`, which repopulates and draws the restored session.
+
+Deliberately, **no `save_session()` runs before the load**: the restore flow
+swaps the session file on disk *before* sending `s`, so saving first would
+overwrite the very bytes about to be loaded.
+
+##### 3.5.13.3 One op per plugin run (a hard constraint)
+
+`run_plugin()` opens the pipe once and calls `readpipe()` **exactly once**, then
+closes the read end and blocks in `waitpid()`. A plugin therefore gets **one**
+message per invocation; a second write **deadlocks** (the plugin blocks in
+`open(FIFO, O_WRONLY)` for a reader that never returns, while nnn waits for the
+plugin to exit). Verified experimentally.
+
+```mermaid
+%% Why a plugin may send only one pipe message per run
+sequenceDiagram
+    participant P as plugin (child)
+    participant F as FIFO ($NNN_PIPE)
+    participant N as nnn (run_plugin)
+
+    N->>F: open(O_RDONLY)
+    P->>F: open(O_WRONLY) + write op #1
+    F->>N: readpipe() reads op #1 -- ONCE
+    N->>F: close(read end)
+    N->>N: waitpid(plugin)
+    P-->>F: open(O_WRONLY) for op #2 -- BLOCKS
+    Note over P,N: deadlock#59; every action must send at most ONE message
+```
+
+This is why "activate" is a single `s` op, and why the zero-C fallback cd-s only
+the **current** context rather than replaying all eight.
+
+##### 3.5.13.4 Activate: faithful vs quick
+
+```
+ASCII Table 13: Faithful restore vs quick cd
++--------------------------+--------------------------+------------------------+
+| Aspect                   | Faithful (s op)          | Quick cd (c op)        |
++--------------------------+--------------------------+------------------------+
+| Restores dirs            | all 8 contexts           | current context only   |
+| Restores sort/filter/    | yes                      | no                     |
+|   cursor/colors          |                          |                        |
+| Adopts the session name  | yes (curssn <- name)     | no (stays on yours)    |
+| Needs build flag         | yes (O_SSN_PIPE)         | no (any build)         |
++--------------------------+--------------------------+------------------------+
+```
+
+The quick path reads the session's saved current context from `settings.curctx`
+-- bits **13..15** of the 4-byte global cfg that follows the 264-byte header (13
+single-bit fields precede it) -- and cd-s there with one `c` op.
+
+##### 3.5.13.5 Store layout and retention
+
+```
+ASCII Table 14: On-disk layout under sessions/
++-------------------------------------------+-----------------------------------+
+| Path                                      | Contents                          |
++-------------------------------------------+-----------------------------------+
+| sessions/<name>                           | live session (mirrors the         |
+|                                           |   instance via O_SSN_ON_CD)       |
+| sessions/.backups/<name>/<ts>             | timestamped snapshot (blob copy)  |
+| sessions/.backups/<name>/<ts>.txt         | decoded, greppable mirror         |
+| sessions/.snapshots/<label>.tar           | workspace: left + right + @       |
++-------------------------------------------+-----------------------------------+
+```
+
+Writes are **atomic** (write `.tmp` in the same directory, then `rename()`), and
+retention keeps the newest `NNN_SSN_KEEP` snapshots per session (default 20,
+`0` = unlimited), pruning blob and mirror as a pair. `NNN_SSN_GIT=1` additionally
+commits `sessions/` after each snapshot -- the nnn config dir is already a git
+submodule -- giving unlimited, diffable history via the `.txt` mirrors.
+
+##### 3.5.13.6 Restore sequence
+
+```mermaid
+%% Restoring a snapshot into the live instance
+sequenceDiagram
+    actor U as User
+    participant P as nnn-sessions (#59;S)
+    participant S as .backups store
+    participant F as sessions/<name>
+    participant N as nnn (run_plugin)
+    participant C as load_session()
+
+    U->>P: pick a snapshot, confirm
+    P->>S: snapshot the CURRENT state first (undo point)
+    P->>S: read chosen blob
+    P->>F: cp blob -> live (tmp + rename)
+    P->>N: write "0s<name>" to $NNN_PIPE
+    N->>N: waitpid(plugin) + refresh()
+    N->>C: load_session(name)
+    C-->>N: cfg + all 8 contexts restored
+    N-->>U: goto begin -> restored session drawn
+```
+
+**Explanation.** The order matters: back up, swap, *then* reload. The plugin exits
+before the load runs, so the screen is never contended. Restoring is itself
+undoable because the pre-restore state was snapshotted in step 2.
+
+##### 3.5.13.7 Safety rails
+
+```
+ASCII Table 15: Session-management safety rails
++----------------------------------+------------------------------------------+
+| Risk                             | Rail                                     |
++----------------------------------+------------------------------------------+
+| Restore destroys current state   | snapshot the live file first (undo)      |
+| Delete loses a session outright  | snapshot before rm; backups are kept     |
+| Activating the other pane's ssn  | warn: with O_SSN_ON_CD both panes would  |
+|                                  |   then auto-save onto the same file      |
+| Torn/partial backup              | write .tmp then rename() (same FS)       |
+| Non-session file in sessions/    | is_session(): require ver == 1           |
+| Unsupported format version       | preview refuses; blob backup still works |
+| Automation (cron) blocking on a  | pause() probes /dev/tty in a subshell    |
+|   prompt                         |   and no-ops without a terminal          |
++----------------------------------+------------------------------------------+
+```
+
 ---
 
 ### 3.6 Keyboard and Input Event Handling (Deep Dive)
@@ -2361,6 +2548,16 @@ ASCII Table 5: How the fork features map onto this design
 |          |                            | instance via pipe, other pane via tmux,   |
 |          |                            | like ctx_switcher). Cross tab/session/    |
 |          |                            | instance.                                |
+| Session  | Sessions (3.5.7, 3.5.13) + | O_SSN_ON_CD makes the on-disk session a  |
+| mgmt     | Plugins/Pipe (3.5.9)       | live mirror, so a file copy is an        |
+|          |                            | accurate backup. nnn-sessions (;S) lists |
+|          |                            | sessions, previews all 8 contexts, and   |
+|          |                            | snapshots/restores/renames/deletes/dups  |
+|          |                            | them + captures left+right+@ as one tar. |
+|          |                            | One gated C op (-DSSN_PIPE) '<ctx>s<name>'|
+|          |                            | calls load_session for a faithful        |
+|          |                            | activate; without it the plugin degrades |
+|          |                            | to a one-op cd. Retention NNN_SSN_KEEP.  |
 | Native   | DnD Subsystem (3.7) +       | NNN_DND_OSC72=1 makes nnn a kitty OSC-72  |
 | drag &   | Process Service (3.5.5) +   | drag source / drop target in-process:     |
 | drop     | Input (3.6, nextsel hooks)  | drag-out (unpadded base64, empty machine- |
