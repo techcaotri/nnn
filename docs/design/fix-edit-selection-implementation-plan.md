@@ -318,10 +318,17 @@ Everything above documents the shipped fix (a message-only change, commit
 in Part 2 has been implemented.
 
 `Note on verification status`: the options below were produced by parallel
-investigation agents that read the real source and config. Only option `A4` was
-put through a full adversarial review before the review pass was cut short.
-Each option is labelled with how far its verification actually got. Do not treat
-an unreviewed option as vetted.
+investigation agents that read the real source and config, then put through
+adversarial review. `A4` had one reviewer; `A1`, `A2` and `A3` had two
+independent reviewers each, several of whom applied the patch to a throwaway
+copy, built it with `./build.sh`, and drove it under a pty. **No option came
+back `SOUND`.** Findings are in section 8.5.2, and section 8.6 states what to do
+about them. Where a reviewer corrected an earlier claim, the correction is
+recorded rather than the original quietly edited.
+
+`Fact`: no work in Part 2 has been implemented in this repository. All reviewer
+builds and experiments were done in `/tmp` copies; `git status` stayed clean and
+the live `~/.config/nnn/.selection` was never written.
 
 ## 8. Why external selections are read-only, and how to make them editable
 
@@ -414,12 +421,149 @@ Two guards in `editselection()` reject an edited list that grew:
 
 ### 8.5 Options
 
-| Option | Mechanism | Change type | Effort | Review status |
+All four options have now been adversarially reviewed. `A1`, `A2` and `A3` each
+got **two independent reviewers** who read the source, and in several cases
+applied the patch to a throwaway copy, built it with `./build.sh`, and drove it
+under a pty. No option came back `SOUND`.
+
+| Option | Mechanism | Change type | Effort (real) | Verdict |
 |---|---|---|---|---|
-| `A1` `readselfile()` | Load `selpath` into `pselbuf`, then edit normally | C change | small | Arithmetic self-verified; not adversarially reviewed |
-| `A2` Atomic write + edit token | `rename(2)` write, plus optimistic stat token | C change | medium | Not adversarially reviewed |
-| `A3` `seledit` plugin | Plugin edits the shared file directly | plugin only | small | Not adversarially reviewed |
-| `A4` Per-instance `NNN_SEL` | Separate files plus a `selpush` transfer plugin | config | small | **Reviewed and rejected** |
+| `A1` `readselfile()` | Load `selpath` into `pselbuf`, then edit normally | C change | medium | `FLAWED` x2, fixable |
+| `A2` Atomic write + edit token | `rename(2)` write, plus optimistic stat token | C change | medium-large | `FLAWED` x2, L1 salvageable |
+| `A3` `seledit` plugin | Plugin edits the shared file directly | plugin only | small to build | `FLAWED` x2, two reproduced defects |
+| `A4` Per-instance `NNN_SEL` | Separate files plus a `selpush` transfer plugin | config | small | **Rejected** |
+
+### 8.5.1 The finding that dominates everything: `selbufpos` is overloaded
+
+`Fact`, converged on independently by four reviewers across `A1` and `A2`:
+
+> `selbufpos` is not just a byte count. It is nnn's de facto **"this instance
+> owns a selection"** predicate, and it is read in at least seven places outside
+> `editselection()`.
+
+Any design that makes `selbufpos` non-zero in a pane that did not make the
+selection silently changes behavior everywhere else that flag is read. The known
+readers are:
+
+| Line | Consumer | What changes if a non-owning pane adopts |
+|---|---|---|
+| 1701, 1708 | `get_cur_or_sel()` | With `-u` (`cfg.prefersel`), the current-vs-selection prompt disappears for `x`/`X` |
+| 2178 | `endselection()` | Runs instead of returning early in list mode |
+| 2840 | `cpmv_rename()` | Switches from the file branch to the memory branch |
+| 3830 | `dnd_prepare_data()` | A mouse drag exports the whole adopted selection |
+| 8531 | `send_to_explorer()` | In fifomode, Enter ships the adopted selection and clears it |
+| 10967 | `SEL_QUITERR` (`Q`) | Turns the pane into a picker |
+| 11952 | picker exit write | Writes the adopted selection to stdout |
+
+`Risk`: the original `A1` proposal audited exactly one of these and got it
+wrong. It claimed "the DND path does not touch `pselbuf`", but
+`dnd_prepare_data()` at line 3830 reads it directly. This fork builds with
+`O_DND=1`, so that path is live.
+
+### 8.5.2 Review findings per option
+
+#### A1: `readselfile()` - core is correct, surroundings are not
+
+`Fact`: reviewer 1 tried to refute the core arithmetic and **could not**. They
+applied the patch to `/tmp/nnnrev`, built it with the fork's real flags, and ran
+a byte-level harness:
+
+- Buffer arithmetic exactly right (3 paths, `sum=45`: disk `st_size=47 =
+  sum+N-1`; after adopt `selbufpos=48`, `nselected=3`).
+- No heap overflow via `invertselbuf()`; `nmarked <= nselected` always holds.
+- Both grow-guards keep their exact meaning. Confirmed the editor temp file is
+  exactly `selbufpos` bytes, guard 2283 passes on a deletion and **bites** on an
+  added line.
+- List mode is **not** a corruption bug (the earlier concern was wrong):
+  adopted paths are `listroot`-form, so `is_prefix()` at 1850 fails and
+  `seltofile()` writes them verbatim.
+- It compiles clean with `./build.sh`.
+
+What the reviews found instead:
+
+- `Risk` **reproduced end to end**: with the patch applied, pressing `E` then
+  `Q` in the adopting pane turns it into a picker, prints the adopted paths to
+  stdout, returns `EXIT_SUCCESS` instead of `EXIT_FAILURE`, and stops unlinking
+  the shared selection.
+- `Risk` **missing short-read check**. `count = read(fd, pselbuf, sb.st_size)`
+  is never compared to `sb.st_size`. A short read appends a NUL mid-path, and a
+  truncated absolute path is often still a *valid* path to an ancestor directory
+  (`/home/u/Documents/report.pdf` becomes `/home/u/Documents`), which then gets
+  written back and later handed to `rm -rf`. Fix: `if (count != sb.st_size)
+  return FALSE;`.
+- `Risk`: the "optional hardening" in the original proposal is itself
+  destructive. Its guard makes `readselfile()` reachable with `selbufpos != 0`,
+  and `selbufpos = 0;` executes *before* the `if (count <= 0) return FALSE;`
+  bail, so a failed read destroys a live local buffer. Its change detector also
+  uses whole-second `st_mtime`, so it is blind to the exact fast
+  select-left/edit-right sequence it exists to catch.
+- `Correction`: one earlier worry was withdrawn. `startselection()` truncating
+  the shared file is **not** new data loss; today's `SEL_SEL` path does an
+  `O_TRUNC` rewrite anyway, so net on-disk bytes are unchanged. Both reviewers
+  agreed on this.
+
+`Decision`: A1's 25-line core is sound. The honest effort is **medium**, not
+small: the diff is small, but shipping it requires the short-read bail plus an
+explicit before/after decision for each of the seven `selbufpos` consumers.
+
+#### A2: L1 is worth doing, L2 is dangerous
+
+`Fact`: both reviewers rejected layer 2 for the same reason, arrived at
+independently.
+
+- Reviewer 1: `startselection()` (1905-1909) and the other `selbufpos` readers
+  are unaudited, same overloading problem as A1 but without A1's compensating
+  care.
+- Reviewer 2 found the sharper version: L2 makes `editselection()`'s
+  `emptyedit:` label reachable from a non-owning pane. That label calls
+  `clearselection()`, which calls `writesel(NULL, 0)`. **Five** `goto`s reach it,
+  and two are ordinary user actions (adding a line, or an editor that grows the
+  file). So "press `E` in the wrong pane and type one extra path" silently
+  truncates the other pane's entire selection, with no confirmation and no
+  message.
+
+`Correction` to a claim in Part 2 above and in the proposal: `writesel()` is
+**not** the only writer, and the no-trailing-NUL invariant is **not** universal
+in this repo. `main()` writes `selpath` directly in picker mode (11953-11954),
+bypassing `writesel()`. And `plugins/dragdrop:46` does
+`printf '%s\0' "$@" >> "$selection"`, appending a NUL after *every* path
+including the last. Any format assumption must tolerate both forms.
+
+`Decision`: keep **L1 only** (atomic write-temp-then-`rename`). It is
+independently useful and does not touch `selbufpos`. It needs a real fallback
+for `open(tmp)` failure, which the sketch promised in prose but omitted in code.
+
+#### A3: two defects reproduced by execution
+
+`Fact`: reviewers ran the actual script rather than only reading it.
+
+- `Risk` **reproduced**: `trap '... rm -f "$tmp" "$out"' EXIT INT HUP TERM`
+  makes `Ctrl-C` during the editor **destructive** rather than a cancel.
+  `/bin/sh` here is `dash`, which runs the INT handler and then *resumes*. The
+  reviewer reproduced the full chain with a stand-in editor and `kill -INT`: the
+  trap deletes `$tmp`, the "unchanged" guard is bypassed, `$out` is created
+  empty, and the user who just pressed `Ctrl-C` to cancel is prompted to clear
+  the shared selection. Given how slow the editor was, `Ctrl-C` at that moment
+  is exactly what a user would do.
+- `Risk` **reproduced**: adding a non-absolute line, the plugin's headline
+  feature over built-in `E`, silently corrupts the list. Lines `/etc/hosts`,
+  `notes.txt`, `/etc/passwd` produce one NUL and the bogus entry
+  `/etc/hosts\nnotes.txt`, silently dropping an entry. `sed -z` only splits
+  before a `/`.
+- `Risk`: list mode defeats the design. `endselection()` (2168) rewrites
+  `selpath` from the stale buffer at 2227 and runs immediately before paste, the
+  `%j` prompt, and plugin invocation, so the edit is reverted by the very
+  keypress meant to consume it.
+- `Fact`, to the proposal's credit and verified by both reviewers: the byte
+  round trip is exactly right (`cmp` identical, N-1 NULs, no trailing NUL), and
+  the non-obvious `NNN_PIPE` `-` handshake analysis is correct.
+
+`Correction`: reviewer 1 claimed the growth problem is "exactly what guard 2327
+exists to prevent". Reviewer 2 showed this misattributes a pre-existing hole:
+nnn has **no** cross-instance protection at all, and the same under-reported
+delete is already reachable in stock nnn with two panes. What the plugin
+genuinely adds is that never-selected, unvalidated paths can enter the set that
+`rm` consumes.
 
 #### A1: `readselfile()` (recommended)
 
@@ -501,25 +645,53 @@ The review also found two real bugs in the proposed transfer script (appending
 without a separating NUL glues two paths into one garbage entry; the entry
 counter reports `N-1` because of the stripped trailing NUL).
 
-### 8.6 Recommendation
+### 8.6 Recommendation (after review)
 
-`Decision`: if you want cross-pane `E`, implement **A1**, and treat **A2 layer
-one** (atomic `writesel()`) as a separate, independently worthwhile hardening.
+`Decision`: **A1 plus A2 layer one, in two separate steps, in this order.**
 
-Reasoning: A1 is about 25 lines, changes one guard line, needs no change to the
-rest of `editselection()`, and restores rather than weakens the existing safety
-invariants. A2 layer one fixes a real race that exists regardless. A3 works but
-hides a workflow landmine. A4 is refuted.
+**Step 1, do this regardless: A2 layer one (atomic `writesel()`).** Write to a
+temp file in the same directory as `selpath` and `rename(2)` over it, with a
+fallback to the old in-place write if `open(tmp)` fails. It touches no
+`selbufpos` semantics, closes a real torn-read race for every external consumer,
+and is useful whether or not cross-pane editing ever ships.
 
-What I would **not** do: remove the grow-guards (line 2283 is load-bearing for
-memory safety, line 2327 is load-bearing for not handing typos to `rm`), and
-would not stop sharing the selection file, since the cross-pane paste workflow
-depends on it.
+**Step 2, if you want cross-pane `E`: A1, with three mandatory additions** that
+the review made non-optional:
 
-`Open question`: A1 makes `E` editable from either pane, but the *other* pane's
-stale in-memory buffer can still clobber the result afterwards. A1 plus the A2
-token narrows that window; fully closing it needs a resync before `SEL_SEL` too.
-Worth deciding how far to go before implementing.
+1. `if (count != sb.st_size) return FALSE;` after the read. Without it a short
+   read produces a mangled-but-plausible path that reaches `rm`.
+2. An explicit decision for each of the seven `selbufpos` consumers in the table
+   in section 8.5.1. At minimum, `SEL_QUITERR` (`Q`) must not turn the adopting
+   pane into a picker; that was reproduced.
+3. Drop the proposal's "optional hardening" as written. It is destructive
+   (clears `selbufpos` before its failure bail) and its second-granularity
+   `st_mtime` detector is blind to the case it targets. If you want it, it needs
+   `st_ino` plus `st_dev` plus `st_mtim.tv_nsec`, and must not mutate state
+   before it can fail.
+
+What I would **not** do:
+
+- **A3 as written.** Two defects were reproduced by execution, one of which
+  turns `Ctrl-C` into "destroy the shared selection". Both are small fixes
+  (drop `INT HUP TERM` from the trap, reject added lines not matching `^/`), but
+  the design still leaves `E` and `;m` with two different safety models, and
+  list mode silently reverts it.
+- **A2 layer two.** Superseded by A1, which does the same job with more care.
+- **A4.** Refuted; it reproduces the bug rather than fixing it.
+- **Removing the grow-guards.** Line 2283 is load-bearing for memory safety;
+  line 2327 is load-bearing for not handing typos to `rm`.
+- **Un-sharing the selection file.** The cross-pane paste workflow depends on it.
+
+`Open question`: even with A1, the *other* pane's stale in-memory buffer can
+still clobber the result on its next selection keypress. Fully closing that
+needs a resync before `SEL_SEL` as well. Decide how far to go before starting.
+
+`Risk`, worth stating plainly: nnn has **no** cross-instance selection
+protection today, and the reviews surfaced several pre-existing destructive
+paths that none of these options fix (`xlink()` wiping the shared file from a
+non-owning pane; either pane's exit `unlink()`ing it; an under-reported `x`/`X`
+confirmation count). Shipping A1 makes `E` work cross-pane; it does not make the
+shared-selection model safe. Do not let it imply otherwise.
 
 ## 9. Making `$EDITOR` start fast for `nnn`'s scratch edits
 
@@ -653,17 +825,104 @@ heavy) works for 3 of the internal edit sites but misses `export_file_list()`
 rename (`r`), which prefers the `.nmv` plugin reading `$EDITOR` directly. The
 wrapper covers all of them.
 
-### 9.3 Recommendation
+### 9.3 Option `B3`: point `$EDITOR` at `lvim-new` (what the user actually did)
 
-`Decision`: apply **B1a and B1b first**. They are two small config edits, they
-fix the actual root causes, and they speed up *every* nvim launch, not just the
-ones `nnn` triggers. B1a in particular also repairs `nvim-java`, which is
-currently half-configured on every startup.
+`Fact`: the user switched `$EDITOR` to `/home/tripham/.local/bin/lvim-new` and
+reports it is fast. Investigated, and the result **confirms the root-cause
+analysis** rather than sidestepping it.
 
-Add **B2** only if a ~250 ms editor still feels heavy for a throwaway list
-buffer. With B1a and B1b applied, the overlay and the network stall are gone, so
-B2 becomes a nice-to-have rather than a fix.
+`lvim-new` is a 9-line wrapper:
 
-`Not verified`: none of Section 9 has been applied. The probes that produced
-these findings were read-only and modified no files. The measurements are real;
-the diffs are proposed, not tested in place.
+```sh
+export NVIM_APPNAME="lvim-lazyvim"
+export VIMRUNTIME="/home/tripham/Dev/Playground_Terminal/neovim/runtime"
+exec -a lvim-new "/home/tripham/Dev/Playground_Terminal/neovim/build/bin/nvim" "$@"
+```
+
+So it is already exactly the `NVIM_APPNAME` mechanism `B2` proposed, pointed at
+a separate LazyVim profile (`~/.config/lvim-lazyvim`) on a locally built
+Neovim.
+
+#### Why it is faster (Fact, measured)
+
+| Profile | Plugins | `nvim-java` present | `Cannot find package` in `mason.log` | Headless startup |
+|---|---|---|---|---|
+| `nvim` (main config) | 86 | **yes** | 205 | 203-216 ms |
+| `lvim-new` (`lvim-lazyvim`) | **131** | no | 0 | 132-159 ms |
+
+The decisive column is not plugin count. `lvim-lazyvim` loads **more** plugins
+(131 vs 86) and is still faster, which rules out general config weight. What it
+does not have is `nvim-java`, and therefore it never hits root cause 1: no
+`mason.setup()` ordering bug, no Mason overlay, and no unconditional blocking
+registry download. Its `mason.log` has zero `Cannot find package` entries
+against 205 in the main config.
+
+`Decision`: this is a legitimate fix, not a workaround. It removes the only
+*blocking* cost. The remaining 132-159 ms is ordinary startup.
+
+#### Does it meet the clipboard requirement? Yes (Fact, verified)
+
+Both layers are present:
+
+- `opt.clipboard = "unnamedplus"` is set by LazyVim's own defaults
+  (`lazy/LazyVim/lua/lazyvim/config/options.lua:57`, guarded on
+  `SSH_CONNECTION`).
+- `~/.config/lvim-lazyvim/lua/config/options.lua:64` additionally pins an
+  explicit `vim.g.clipboard` provider using `xclip`, on non-Wayland sessions.
+
+This session is X11 with `xclip`, `xsel` and `wl-copy` all installed, so yank to
+system clipboard works in the scratch buffer. This is strictly better than the
+`nvim --clean` idea in `B2`, which would have dropped it.
+
+#### One thing it does not fix (Risk)
+
+`Fact`: `~/.config/lvim-lazyvim/lua/config/lazy.lua:52` has
+`checker = { enabled = true, notify = false }`. The checker **is** running: all
+131 `FETCH_HEAD` files carry mtimes matching `checker.last_check` to the second.
+
+So root cause 2 is still present in this profile, just **silent** rather than
+absent. It is a background `git fetch` against 131 repositories, not a blocking
+stall, which is why it does not feel slow. `notify = false` means the user never
+sees it. If the background network churn is unwanted, set `enabled = false` here
+too and use `:Lazy check` manually.
+
+`Risk`: `lvim-new` runs a **locally built** Neovim from a source tree
+(`Dev/Playground_Terminal/neovim/build/bin/nvim`) with `VIMRUNTIME` pointed at
+that tree. If that tree is rebuilt, moved, or cleaned, `$EDITOR` breaks for nnn.
+A system `nvim` would not have that coupling. `Open question`: whether to
+guard the wrapper with a fallback if the built binary is missing.
+
+`Note`: `lvim-new` is a single word as far as `spawn()` is concerned, so it is
+safe with `parseargs()` (no multi-word `$EDITOR` hazard), and
+`/home/tripham/.local/bin` is on the `PATH` inherited by nnn's children.
+
+### 9.4 Recommendation
+
+`Decision`: **keep `lvim-new` as `$EDITOR` (`B3`), and still apply `B1a` to the
+main config.**
+
+Reasoning:
+
+1. `B3` already solves the reported symptom for nnn, and it satisfies the
+   clipboard requirement. No further work needed for the nnn path.
+2. `B1a` is still worth applying, because the main `nvim` config is **also what
+   the user edits real files with**, and it is currently broken in a way that
+   goes beyond slowness: `nvim-java` returns early on every startup, so it is
+   left permanently half-configured (`JavaPostSetup` never fires). Fixing the
+   ordering repairs that, not just the delay.
+3. `B1b` / `B1c` are optional. Consider `checker = { enabled = false }` in
+   **both** profiles if you would rather not have 86 + 131 background fetches.
+
+| Option | Fixes nnn scratch edits | Fixes real-file editing | Keeps clipboard | Status |
+|---|---|---|---|---|
+| `B3` `lvim-new` | Yes | No (separate profile) | Yes | **In use** |
+| `B1a` mason ordering | n/a | Yes, and repairs `nvim-java` | Yes | Recommended |
+| `B1b` checker off | Minor | Minor | Yes | Optional |
+| `B2` wrapper + minimal profile | Yes | n/a | Only with a custom profile | Superseded by `B3` |
+
+`Not verified`: `B1a`, `B1b` and `B1c` have not been applied. The probes that
+produced these findings were read-only. The measurements in this section are
+real and were run on this machine; the diffs are proposed, not tested in place.
+`B3` is in use by the user, and its properties above were measured, but its
+end-to-end behavior inside nnn (`E` opening the scratch list in `lvim-new`) is
+`Not verified` by me and needs the user's confirmation.
