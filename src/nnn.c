@@ -1787,10 +1787,37 @@ static char confirm_force(bool selection, bool use_trash)
 /* Writes buflen char(s) from buf to a file */
 static void writesel(const char *buf, const size_t buflen)
 {
+	char tmp[PATH_MAX];
+	int fd;
+
 	if (!selpath)
 		return;
 
-	int fd = open(selpath, O_CREAT | O_WRONLY | O_TRUNC, S_IWUSR | S_IRUSR);
+	/*
+	 * Write to a sibling temp file and rename(2) over selpath instead of
+	 * truncating it in place. selpath is shared by every nnn instance on the
+	 * machine (unless NNN_SEL differs per instance), and an external reader
+	 * (xargs, a plugin) could otherwise observe a partially-written file mid-
+	 * write. rename() within the same directory is atomic and needs no lock.
+	 * Falls back to the old in-place write if the temp file can't even be
+	 * created (e.g. an unwritable selpath directory), matching prior behavior.
+	 */
+	if (snprintf(tmp, PATH_MAX, "%s.XXXXXX", selpath) < (int)PATH_MAX) {
+		fd = mkstemp(tmp);
+		if (fd != -1) {
+			bool ok = (write(fd, buf, buflen) == (ssize_t)buflen);
+
+			close(fd);
+			if (ok && !rename(tmp, selpath))
+				return;
+
+			unlink(tmp);
+			printwarn(NULL);
+			return;
+		}
+	}
+
+	fd = open(selpath, O_CREAT | O_WRONLY | O_TRUNC, S_IWUSR | S_IRUSR);
 
 	if (fd != -1) {
 		if (write(fd, buf, buflen) != (ssize_t)buflen)
@@ -1886,6 +1913,47 @@ static bool listselfile(void)
 	spawn(utils[UTIL_SH_EXEC], g_buf, NULL, NULL, F_CLI | F_CONFIRM);
 
 	return TRUE;
+}
+
+/*
+ * Adopt the on-disk selection (e.g. made by another nnn instance sharing
+ * selpath) into the local buffer, so it becomes locally editable. Inverse of
+ * writesel(): the file is NUL-separated (no trailing NUL), pselbuf is
+ * NUL-terminated per entry, so a NUL is appended after reading.
+ * Returns FALSE (and leaves the local buffer empty) on any read problem,
+ * including a short read, rather than risk adopting a truncated path.
+ */
+static bool readselfile(void)
+{
+	struct stat sb;
+	int fd;
+	ssize_t count;
+
+	if (!selpath || (stat(selpath, &sb) == -1) || !sb.st_size)
+		return FALSE;
+
+	fd = open(selpath, O_RDONLY);
+	if (fd == -1)
+		return FALSE;
+
+	selbufpos = 0;
+	selbufrealloc((size_t)sb.st_size + 1);
+
+	count = read(fd, pselbuf, (size_t)sb.st_size);
+	close(fd);
+	if (count != sb.st_size) /* short/failed read: refuse rather than adopt a truncated path */
+		return FALSE;
+
+	if (pselbuf[count - 1] != '\0') /* tolerate a writer that does NUL-terminate (e.g. dragdrop) */
+		pselbuf[count++] = '\0';
+	selbufpos = (uint_t)count;
+
+	nselected = 0;
+	for (ssize_t i = 0; i < count; ++i)
+		if (pselbuf[i] == '\0')
+			++nselected;
+
+	return (nselected > 0);
 }
 
 /* Reset selection indicators */
@@ -2235,9 +2303,13 @@ static int editselection(bool allowemptysel)
 	ssize_t count;
 	struct stat sb;
 	time_t mtime;
+	bool adopted = FALSE; /* buffer was loaded from an external instance's selection */
 
-	if (!allowemptysel && !selbufpos) /* External selection is only editable at source */
-		return listselfile();
+	if (!allowemptysel && !selbufpos) {
+		if (!readselfile()) /* nothing local and nothing on disk either */
+			return listselfile();
+		adopted = TRUE;
+	}
 
 	fd = create_tmp_file();
 	if (fd == -1) {
@@ -2277,6 +2349,22 @@ static int editselection(bool allowemptysel)
 			DPRINTF_S(strerror(errno));
 			printwarn(NULL);
 			goto emptyedit;
+		}
+		/*
+		 * Adopted but never actually edited: this instance only "peeked" at
+		 * another instance's selection. Revert the LOCAL adoption only, so
+		 * pressing 'E' to look does not have side effects elsewhere (Q
+		 * dumping to stdout as a picker, a DND drag exporting it, the -u
+		 * current-vs-selection prompt going away, etc.) - those all become
+		 * correct once a real edit is saved. Do NOT call clearselection()
+		 * here: it also truncates the shared selpath file via
+		 * writesel(NULL, 0), which would destroy the very selection this
+		 * instance never actually claimed.
+		 */
+		if (adopted) {
+			resetselind();
+			selbufpos = 0;
+			nselected = 0;
 		}
 		return 1;
 	}
