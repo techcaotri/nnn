@@ -4572,6 +4572,185 @@ static bool dnd_handle_drop(void)
 }
 
 /*
+ * ===== Cross-pane selection live-sync =====
+ *
+ * selpath is shared by every nnn instance that does not override $NNN_SEL, but
+ * each instance also keeps a private copy in pselbuf/selbufpos/nselected. Once
+ * an instance owns a non-empty private copy it never re-reads the file, so a
+ * change made by another instance stays invisible to it.
+ *
+ * syncselfile() closes that gap. The file is authoritative; the local copy is
+ * replaced when they differ. This code NEVER writes selpath: clearselection()
+ * would truncate a selection this instance does not own.
+ */
+static struct {
+	dev_t dev;
+	ino_t ino;
+	off_t size;
+	time_t mtsec;
+	long mtnsec;
+	bool valid;  /* holds a previous observation */
+	bool exists; /* selpath existed at that observation */
+} g_selstamp;
+
+static bool g_selsync; /* set in setup_config() */
+
+/*
+ * Read selpath into a fresh heap buffer in pselbuf format: every path NUL
+ * terminated, including the last one. Returns NULL on any problem, leaving the
+ * caller's state untouched.
+ */
+static char *loadselfile(off_t size, uint_t *plen, int *pcount)
+{
+	char *buf;
+	ssize_t count, start = 0;
+	int n = 0;
+	int fd = open(selpath, O_RDONLY);
+
+	if (fd == -1)
+		return NULL;
+
+	buf = malloc((size_t)size + 1);
+	if (!buf) {
+		close(fd);
+		return NULL;
+	}
+
+	count = read(fd, buf, (size_t)size);
+	close(fd);
+
+	if (count != size) { /* short read: refuse rather than adopt a truncated path */
+		free(buf);
+		return NULL;
+	}
+
+	/* plugins/dragdrop already NUL terminates every path; writesel() does not */
+	if (buf[count - 1] != '\0')
+		buf[count++] = '\0';
+
+	/* Validate before adopting: every entry must be a non-empty absolute path */
+	for (ssize_t i = 0; i < count; ++i) {
+		if (buf[i] != '\0')
+			continue;
+		if ((i == start) || (buf[start] != '/')) {
+			free(buf);
+			return NULL;
+		}
+		start = i + 1;
+		++n;
+	}
+
+	*plen = (uint_t)count;
+	*pcount = n;
+	return buf;
+}
+
+/*
+ * Returns TRUE if the local selection state was replaced. The caller MUST then
+ * force a full reload and redraw (presel = CONTROL('L')): pdents[] carries the
+ * materialized FILE_SELECTED/FILE_SCANNED view of the old buffer and only
+ * dentfill() resets it.
+ */
+static bool syncselfile(void)
+{
+	struct stat sb;
+	char *buf;
+	uint_t len;
+	int count;
+	bool exists;
+
+	if (!g_selsync || !selpath)
+		return FALSE;
+
+	exists = !stat(selpath, &sb) && S_ISREG(sb.st_mode);
+
+	/* Fast path: one stat(2), nothing observably changed since the last poll */
+	if (g_selstamp.valid && (exists == g_selstamp.exists)
+	    && (!exists || ((sb.st_dev == g_selstamp.dev)
+			    && (sb.st_ino == g_selstamp.ino)
+			    && (sb.st_size == g_selstamp.size)
+			    && (sb.st_mtim.tv_sec == g_selstamp.mtsec)
+			    && (sb.st_mtim.tv_nsec == g_selstamp.mtnsec))))
+		return FALSE;
+
+	/*
+	 * Something changed, but swapping the buffer now would corrupt a
+	 * half-finished operation. Return WITHOUT recording the new stamp so the
+	 * change is picked up by a later poll instead of being dropped.
+	 *
+	 * Note g_state.selmode is deliberately NOT a suppression condition:
+	 * startselection() sets it on the first Space and it stays set for the
+	 * whole selection round, so suppressing on it would permanently disable
+	 * the sync in the very pane that owns a selection. Only g_state.rangesel
+	 * is genuinely transient (it spans the two SEL_SELMUL presses, during
+	 * which selstartid indexes pdents[]).
+	 */
+	if (g_state.rangesel || listpath || g_dnd_b64 || cfg.blkorder)
+		return FALSE;
+
+	/* From here the change is consumed: record the new identity */
+	g_selstamp.valid = TRUE;
+	g_selstamp.exists = exists;
+	if (exists) {
+		g_selstamp.dev = sb.st_dev;
+		g_selstamp.ino = sb.st_ino;
+		g_selstamp.size = sb.st_size;
+		g_selstamp.mtsec = sb.st_mtim.tv_sec;
+		g_selstamp.mtnsec = sb.st_mtim.tv_nsec;
+	}
+
+	/*
+	 * Peer exited and unlinked selpath (main() does this at every non-picker
+	 * exit). That is not "cleared": keep what we have.
+	 */
+	if (!exists)
+		return FALSE;
+
+	if (!sb.st_size) { /* peer cleared the selection */
+		if (!selbufpos && !nselected && !g_state.selmode)
+			return FALSE;
+		/* Mirror clearselection()'s LOCAL effects only, never its writesel() */
+		resetselind();
+		findselpos = NULL;
+		selbufpos = 0;
+		nselected = 0;
+		g_state.selmode = 0;
+		return TRUE;
+	}
+
+	buf = loadselfile(sb.st_size, &len, &count);
+	if (!buf) {
+		g_selstamp.valid = FALSE; /* transient: retry on the next poll */
+		return FALSE;
+	}
+
+	/* Identical contents, typically our own write coming back */
+	if ((len == selbufpos) && pselbuf && !memcmp(buf, pselbuf, len)) {
+		free(buf);
+		return FALSE;
+	}
+
+	/* Atomic swap of the whole selection state */
+	selbufpos = 0;
+	selbufrealloc(len); /* errexit()s on OOM, like every other caller */
+	memcpy(pselbuf, buf, len);
+	selbufpos = len;
+	nselected = count;
+	free(buf);
+
+	/*
+	 * Treat the adopted selection as an in-progress round. Without this, a
+	 * pane with selmode == 0 would run startselection() on its next Space,
+	 * which truncates the shared file and drops what the peer selected.
+	 */
+	g_state.selmode = 1;
+
+	findselpos = NULL; /* pselbuf may have moved: kill the stale cursor */
+	resetselind();
+	return TRUE;
+}
+
+/*
  * Returns SEL_* if key is bound and 0 otherwise.
  * Also modifies the run and env pointers (used on SEL_{RUN,RUNARG}).
  * The next keyboard input can be simulated by presel.
@@ -9789,6 +9968,15 @@ nochange:
 			dnd_osc72_resync();
 		}
 
+		/*
+		 * Pick up a selection change made by another instance sharing selpath.
+		 * CONTROL('L') (SEL_REDRAW) consumes no keystroke and forces a reload,
+		 * which is what re-derives the per-entry FILE_SELECTED markers and
+		 * reseeds findselpos from the new buffer.
+		 */
+		if (!presel && syncselfile())
+			presel = CONTROL('L');
+
 		sel = nextsel(presel);
 		if (presel)
 			presel = 0;
@@ -11460,6 +11648,9 @@ static bool setup_config(void)
 			DPRINTF_S(selpath);
 		}
 	}
+
+	/* Track selpath changes made by other instances (see syncselfile()) */
+	g_selsync = !g_state.picker && selpath && !getenv("NNN_NO_SELSYNC");
 
 	return TRUE;
 }

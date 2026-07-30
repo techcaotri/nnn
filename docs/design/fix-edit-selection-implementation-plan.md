@@ -926,3 +926,390 @@ real and were run on this machine; the diffs are proposed, not tested in place.
 `B3` is in use by the user, and its properties above were measured, but its
 end-to-end behavior inside nnn (`E` opening the scratch list in `lvim-new`) is
 `Not verified` by me and needs the user's confirmation.
+
+## 10. Cross-pane selection live-sync
+
+### 10.1 Purpose
+
+Two `nnn` instances in tmux share one selection file (`~/.config/nnn/.selection`, because `NNN_SEL` is unset). Each instance also keeps a private copy in `pselbuf` / `selbufpos` / `nselected` (declared at `src/nnn.c:477`, `src/nnn.c:455`, `src/nnn.c:449`). Once an instance owns a non-empty private copy it never re-reads the file again, so changes made by the other instance are invisible to it.
+
+This section specifies a poll that closes that gap: an instance notices when the on-disk selection has stopped matching its private copy, and replaces the private copy with the file contents.
+
+### 10.2 Problem statement and the semantic decision
+
+`Fact` (from the reproduced bug report, and confirmed by reading the code):
+
+1. Select 2 files in LEFT. `SEL_SEL` at `src/nnn.c:10435-10437` appends to `pselbuf` and calls `writesel()`.
+2. In RIGHT press `E`. `editselection()` at `src/nnn.c:2308-2312` sees `!selbufpos`, calls `readselfile()` (`src/nnn.c:1926`) and adopts. The user deletes every line and saves, so `writesel()` at `src/nnn.c:2421` writes a 0-byte file and RIGHT's local state is emptied.
+3. Back in LEFT press `E`. LEFT still lists the original 2 files. LEFT's `selbufpos` was never 0, so `editselection()` skips the adopt branch entirely and edits its own stale copy.
+4. In RIGHT press `E` again: `readselfile()` fails on the empty file, `listselfile()` (`src/nnn.c:1904`) returns `FALSE`, `editselection()` returns 0 and `SEL_SELEDIT` prints `MSG_0_SELECTED` (`src/nnn.c:10521-10523`).
+
+Step 3 is the defect. Nothing propagates *into* an instance that already owns a selection.
+
+`Decision 1 - the file is authoritative.` When the on-disk selection differs from the local copy, the local copy loses. Justification: the file is the only shared state, every mutation path already writes it immediately (`src/nnn.c:10437`, `src/nnn.c:2189`, `src/nnn.c:2202`, `src/nnn.c:2143`, `src/nnn.c:2421`), and the alternative (last-writer-in-memory wins) has no way to merge two divergent buffers without inventing a conflict UI.
+
+`Decision 2 - the sync never writes selpath.` It only reads. Every write path is a data-loss vector for the peer, and `clearselection()` (`src/nnn.c:1981-1987`) calls `writesel(NULL, 0)` which truncates the shared file. Dropping local state must therefore be done by hand, exactly as the existing revert path in `editselection()` already does at `src/nnn.c:2364-2368`.
+
+`Decision 3 - default on, with a kill switch.` Enabled by default because the current behavior is a correctness bug, the cost is one `stat(2)` per main-loop iteration, and there is already a partial precedent in-tree (`handle_event()` at `src/nnn.c:3668-3672` clears the local selection when the shared file goes empty). Opt out with `NNN_NO_SELSYNC=1`. Precedent for a plain `getenv()` outside `env_cfg[]`: `NNN_DND_OSC72` at `src/nnn.c:3768`. Hard-disabled in picker mode (`-p`) and while `listpath` is set (`-l`); see 10.6.
+
+`Decision 4 - accept the ownership side effects.` After a sync, the pane genuinely owns the peer's selection, so `Q` (`SEL_QUITERR`, `src/nnn.c:11055`) will dump it to stdout and `-u` / `cfg.prefersel` (`src/nnn.c:1708`) will skip the current-vs-selection prompt. That is the intended meaning of "both panes show the same selection". The "peek without side effects" revert in `editselection()` (`src/nnn.c:2352-2368`) stays in the tree: it still fires when the sync is disabled or suppressed.
+
+### 10.3 Chosen trigger: `stat(2)` poll at the `browse()` drain point
+
+The user asked to "re-sync the selections whenever the current active/focus cursor leaves it". The direction that actually fixes step 3 is resync on focus *return*, and an unfocused pane receives no keystrokes, so "the state is correct by the time the next key is processed" is functionally equivalent to focus-in and needs no terminal support at all.
+
+`Decision` - poll `selpath` with one `stat(2)` at the top of the `browse()` main loop, at the existing drain point (`src/nnn.c:9787-9790`, immediately before `sel = nextsel(presel);` at `src/nnn.c:9792`).
+
+`Fact` - that point is reached both after every keypress and about once per second while idle: `settimeout()` is `timeout(1000)` (`src/nnn.c:899`); on a timeout `nextsel()` returns 0, `browse()` falls into `default:` at `src/nnn.c:11064` and does `goto nochange` at `src/nnn.c:11074`, returning to `nochange:` at `src/nnn.c:9774`.
+
+`Decision` - a focus-out hook is not needed and is not specified. Every selection mutation already calls `writesel()` immediately (see 10.2), so there is nothing buffered to flush on focus loss.
+
+#### Trigger comparison
+
+| Option | Works without terminal/tmux support | Survives `writesel()`'s `rename(2)` | Cost | Verdict |
+| --- | --- | --- | --- | --- |
+| Terminal focus events (`ESC[?1004h`, `ESC[I` / `ESC[O`) | No | n/a | High | Rejected |
+| `inotify` watch on `selpath` itself | Yes | No | Low | Rejected |
+| `inotify` watch on `dirname(selpath)` | Yes | Yes (`IN_MOVED_TO`) | Medium | Rejected |
+| `stat(2)` poll at the drain point | Yes | Yes | 1 syscall per iteration | **Chosen** |
+
+Why focus events were rejected, plainly:
+
+- `Fact` - `nnn` has no focus-event support. Nothing in `src/nnn.c` enables mode 1004 or parses `ESC[I` / `ESC[O`.
+- `Fact` - tmux only requests and forwards focus events when `focus-events` is on, and only "if supported" by the outer terminal (`man tmux`, `focus-events [on | off]`). It is not set in `~/.config/tmux/`. The fix would require the user to change tmux config, and would silently do nothing on terminals that do not implement 1004 (common over `ssh`, in `screen`, in some multiplexed setups).
+- `Risk` - `ESC[I` / `ESC[O` collide with `nnn`'s Alt-key handling in `nextsel()` (`src/nnn.c:4629-4665`): an `ESC` followed by any other character is rewritten to `';'`, which is bound to `SEL_PLUGIN` (`src/nnn.h:263`). Getting the parse wrong makes stray focus events open the plugin prompt. The OSC-72 code at `src/nnn.c:4636-4647` already needs a 100 ms timed peek because tmux splits escape sequences across reads; a focus parser inherits that same fragmentation problem.
+- The payoff over a `stat(2)` is zero: the poll already produces a correct screen before the first post-focus keystroke is acted on.
+
+Why `inotify` on `selpath` was rejected:
+
+- `Fact` - `writesel()` now writes a sibling temp file and `rename(2)`s over `selpath` (`src/nnn.c:1798-1817`). The watch descriptor follows the *old* inode, so `IN_MODIFY` stops firing after the first peer write. Watching the parent directory for `IN_MOVED_TO` would work, but `inotify_wd` is a single descriptor reused for the browsed directory (`src/nnn.c:876`, added at `src/nnn.c:9745-9746`, removed at `src/nnn.c:9687-9689` and `src/nnn.c:10263-10265`), so a second watch means new state, new lifetime rules, and a `#ifdef` fork for `BSD_KQUEUE` (`src/nnn.c:4706`) and `HAIKU_NM` (`src/nnn.c:4714`). A `stat(2)` is portable and needs none of it.
+- `selpath` may not exist yet, so the watch would need lazy (re)arming anyway.
+
+### 10.4 The sync function
+
+Two new functions plus one static struct. `Decision` - place them immediately above `static int nextsel(int presel)` (currently `src/nnn.c:4579`). They must sit after `g_dnd_b64` (`src/nnn.c:3688`) and after `resetselind()` (`src/nnn.c:1960`) and `selbufrealloc()` (`src/nnn.c:1842`), which the sketch below uses.
+
+```c
+/*
+ * ===== Cross-pane selection live-sync =====
+ *
+ * selpath is shared by every nnn instance that does not override $NNN_SEL, but
+ * each instance also keeps a private copy in pselbuf/selbufpos/nselected. Once
+ * an instance owns a non-empty private copy it never re-reads the file, so a
+ * change made by another instance stays invisible to it.
+ *
+ * syncselfile() closes that gap. The file is authoritative; the local copy is
+ * replaced when they differ. This code NEVER writes selpath: clearselection()
+ * would truncate a selection this instance does not own.
+ */
+static struct {
+	dev_t dev;
+	ino_t ino;
+	off_t size;
+	time_t mtsec;
+	long mtnsec;
+	bool valid;  /* holds a previous observation */
+	bool exists; /* selpath existed at that observation */
+} g_selstamp;
+
+static bool g_selsync; /* set in setup_config() */
+
+/*
+ * Read selpath into a fresh heap buffer in pselbuf format: every path NUL
+ * terminated, including the last one. Returns NULL on any problem, leaving the
+ * caller's state untouched.
+ */
+static char *loadselfile(off_t size, uint_t *plen, int *pcount)
+{
+	char *buf;
+	ssize_t count, start = 0;
+	int n = 0;
+	int fd = open(selpath, O_RDONLY);
+
+	if (fd == -1)
+		return NULL;
+
+	buf = malloc((size_t)size + 1);
+	if (!buf) {
+		close(fd);
+		return NULL;
+	}
+
+	count = read(fd, buf, (size_t)size);
+	close(fd);
+
+	if (count != size) { /* short read: refuse rather than adopt a truncated path */
+		free(buf);
+		return NULL;
+	}
+
+	/* plugins/dragdrop already NUL terminates every path; writesel() does not */
+	if (buf[count - 1] != '\0')
+		buf[count++] = '\0';
+
+	/* Validate before adopting: every entry must be a non-empty absolute path */
+	for (ssize_t i = 0; i < count; ++i) {
+		if (buf[i] != '\0')
+			continue;
+		if ((i == start) || (buf[start] != '/')) {
+			free(buf);
+			return NULL;
+		}
+		start = i + 1;
+		++n;
+	}
+
+	*plen = (uint_t)count;
+	*pcount = n;
+	return buf;
+}
+
+/*
+ * Returns TRUE if the local selection state was replaced. The caller MUST then
+ * force a full reload and redraw (presel = CONTROL('L')): pdents[] carries the
+ * materialized FILE_SELECTED/FILE_SCANNED view of the old buffer and only
+ * dentfill() resets it.
+ */
+static bool syncselfile(void)
+{
+	struct stat sb;
+	char *buf;
+	uint_t len;
+	int count;
+	bool exists;
+
+	if (!g_selsync || !selpath)
+		return FALSE;
+
+	exists = !stat(selpath, &sb) && S_ISREG(sb.st_mode);
+
+	/* Fast path: one stat(2), nothing observably changed since the last poll */
+	if (g_selstamp.valid && (exists == g_selstamp.exists)
+	    && (!exists || ((sb.st_dev == g_selstamp.dev)
+			    && (sb.st_ino == g_selstamp.ino)
+			    && (sb.st_size == g_selstamp.size)
+			    && (sb.st_mtim.tv_sec == g_selstamp.mtsec)
+			    && (sb.st_mtim.tv_nsec == g_selstamp.mtnsec))))
+		return FALSE;
+
+	/*
+	 * Something changed, but swapping the buffer now would corrupt a
+	 * half-finished operation. Return WITHOUT recording the new stamp so the
+	 * change is picked up by a later poll instead of being dropped.
+	 */
+	if (g_state.selmode || g_state.rangesel || listpath || g_dnd_b64 || cfg.blkorder)
+		return FALSE;
+
+	/* From here the change is consumed: record the new identity */
+	g_selstamp.valid = TRUE;
+	g_selstamp.exists = exists;
+	if (exists) {
+		g_selstamp.dev = sb.st_dev;
+		g_selstamp.ino = sb.st_ino;
+		g_selstamp.size = sb.st_size;
+		g_selstamp.mtsec = sb.st_mtim.tv_sec;
+		g_selstamp.mtnsec = sb.st_mtim.tv_nsec;
+	}
+
+	/* Peer exited and unlinked selpath (main() does this at every non-picker
+	 * exit). That is not "cleared": keep what we have.
+	 */
+	if (!exists)
+		return FALSE;
+
+	if (!sb.st_size) { /* peer cleared the selection */
+		if (!selbufpos && !nselected)
+			return FALSE;
+		resetselind();
+		findselpos = NULL;
+		selbufpos = 0;
+		nselected = 0;
+		return TRUE;
+	}
+
+	buf = loadselfile(sb.st_size, &len, &count);
+	if (!buf) {
+		g_selstamp.valid = FALSE; /* transient: retry on the next poll */
+		return FALSE;
+	}
+
+	/* Identical contents, typically our own write coming back */
+	if ((len == selbufpos) && pselbuf && !memcmp(buf, pselbuf, len)) {
+		free(buf);
+		return FALSE;
+	}
+
+	/* Atomic swap of the whole selection state */
+	selbufpos = 0;
+	selbufrealloc(len); /* errexit()s on OOM, like every other caller */
+	memcpy(pselbuf, buf, len);
+	selbufpos = len;
+	nselected = count;
+	free(buf);
+
+	findselpos = NULL; /* pselbuf may have moved: kill the stale cursor */
+	resetselind();
+	return TRUE;
+}
+```
+
+`setup_config()` (`src/nnn.c:11377`) gets one line after the selection-file block that ends at `src/nnn.c:11462`:
+
+```c
+	g_selsync = !g_state.picker && selpath && !getenv("NNN_NO_SELSYNC");
+```
+
+Call site, inserted in `browse()` directly after the existing `g_dnd_resync` drain at `src/nnn.c:9787-9790` and before `sel = nextsel(presel);` at `src/nnn.c:9792`:
+
+```c
+		if (!presel && syncselfile())
+			presel = CONTROL('L'); /* SEL_REDRAW: reload + repaint, consumes no key */
+```
+
+#### Why `presel = CONTROL('L')` and not a hand-rolled repaint
+
+This is the load-bearing detail. Swapping the buffer in place is not enough, because `nnn` keeps a materialized view of `pselbuf` in two places outside the buffer:
+
+- the per-entry `FILE_SELECTED` / `FILE_SCANNED` bits on `pdents[]` (`src/nnn.c:259-260`), which drive the on-screen `+` marker. `resetselind()` (`src/nnn.c:1960-1965`) clears only `FILE_SELECTED`; `findmarkentry()` (`src/nnn.c:2022-2028`) refuses to re-derive anything that still has `FILE_SCANNED`. The only code that clears both is `dentfill()`, which assigns `dentp->flags` fresh at `src/nnn.c:8478`.
+- `findselpos` (`src/nnn.c:477`), a raw `char *` into `pselbuf`, seeded only by `scanselforpath()` (`src/nnn.c:2205-2226`), which is called from `redraw()` (`src/nnn.c:9525`) and `showselsize()` (`src/nnn.c:9580`), never from `draw_line()`.
+
+`Fact` - the drain point does not repaint by itself: on the idle tick `nextsel()` returns 0, `browse()` hits `default:` (`src/nnn.c:11064`) and `goto nochange` (`src/nnn.c:11074`), which skips `redraw(path); statusbar(path);` at `src/nnn.c:9764-9767`. Setting `presel = CONTROL('L')` fixes this and does the flag reset for free:
+
+1. `nextsel()` begins `wint_t c = presel;` and only calls `get_wch()` when `c == 0 || c == MSGWAIT` (`src/nnn.c:4581-4586`). `CONTROL('L')` is 12 and `MSGWAIT` is `'$'` (`src/nnn.c:196`), so no keystroke is swallowed and the idle `inotify` branch at `src/nnn.c:4681-4705` is skipped for this iteration.
+2. `CONTROL('L')` maps to `SEL_REDRAW` (`src/nnn.h:220`), which sets `refresh = TRUE` (`src/nnn.c:10370-10372`).
+3. `refresh == TRUE` bypasses the type-to-nav early exit at `src/nnn.c:10412-10415`, so control reaches `copycurname(); cd = FALSE; goto begin;` (`src/nnn.c:10418-10421`). The cursor position is preserved via `lastname`, and `cd = FALSE` suppresses the history/`record_visit()` push at `src/nnn.c:9731-9735`.
+4. `begin:` runs `populate(path, lastname)` (`src/nnn.c:9736`) -> `dentfill()` -> every `dentp->flags` reassigned at `src/nnn.c:8478`.
+5. The loop top then runs `redraw()` + `statusbar()` (`src/nnn.c:9764-9767`), which reseeds `findselpos` via `scanselforpath()` at `src/nnn.c:9525` and re-derives every `+` marker via `findmarkentry()` at `src/nnn.c:9534`. `statusbar()` prints the new `nselected` at `src/nnn.c:9013-9014`.
+
+The invariant "`FILE_SELECTED` implies present in `pselbuf`" is therefore re-established by reload, not by hand. This is the same mechanism the existing `handle_event()` relies on: it mutates the selection asynchronously and returns `CONTROL('L')` (`src/nnn.c:3668-3672`).
+
+`Fact` - `presel = CONTROL('L')` does **not** clear an active filter here. `clearfilter()` on `CONTROL('L')` lives inside the `if (c == 0 || c == MSGWAIT)` block (`src/nnn.c:4669-4673`), which a non-zero `presel` skips.
+
+`Decision` - guard with `!presel` so the sync never overwrites a pending simulated key (`FILTER`, `MSGWAIT`). Losing one poll iteration is harmless: `presel` is reset to 0 at `src/nnn.c:9793` after a single use.
+
+### 10.5 Decision table
+
+Rows are the local state, columns the observed state of `selpath`. "Local owns" means `selbufpos != 0`.
+
+| Local state | Disk: unchanged (stamp match) | Disk: changed, contents differ | Disk: changed, contents identical | Disk: 0 bytes | Disk: missing (`stat` fails) |
+| --- | --- | --- | --- | --- | --- |
+| Empty (`!selbufpos && !nselected`) | no-op | adopt, force reload | no-op, stamp updated | no-op, stamp updated | no-op, stamp updated |
+| Locally owned | no-op | replace, force reload | no-op, stamp updated (this is our own write) | drop local state (no write), force reload | keep local state, stamp updated |
+| Suppressed state (see 10.6) | no-op | defer, stamp NOT updated | defer, stamp NOT updated | defer, stamp NOT updated | defer, stamp NOT updated |
+| `loadselfile()` failed (short read, unreadable, invalid entry) | n/a | keep local state, invalidate stamp so the next poll retries | n/a | n/a | n/a |
+
+Notes on two cells:
+
+- **Disk missing.** `Fact` - `main()` unlinks `selpath` on every non-picker exit, regardless of whether `NNN_SEL` was set: `} else if (selpath) unlink(selpath);` at `src/nnn.c:12048-12049`, with `selpath` taken from the environment at `src/nnn.c:11447-11449`. So closing either pane deletes the shared file while the survivor may still hold a valid selection. Treating "gone" as "cleared" would silently wipe the survivor. `Decision` - missing means *no information*: keep local state, do not write. `isselfileempty()` (`src/nnn.c:1692-1697`) folds `stat` failure and zero size into one boolean and must not be used for this decision. `Open question` - whether the survivor should re-create the file from its own buffer. Not specified here (it would be a write); the next local selection change re-creates it anyway.
+- **Disk 0 bytes.** This is `clearselection()`'s `writesel(NULL, 0)` from the peer. Drop local state by hand (`resetselind(); findselpos = NULL; selbufpos = 0; nselected = 0;`), never by calling `clearselection()`, which would write. This subsumes the narrower check in `handle_event()` at `src/nnn.c:3670`; `Decision` - leave `handle_event()` unchanged, it becomes a harmless no-op once the sync has already cleared `nselected`.
+
+### 10.6 Suppression states
+
+The sync defers (returns `FALSE` **before** recording the new stamp, so the change is retried later) whenever any of these hold:
+
+| State | Test | Reason |
+| --- | --- | --- |
+| Picker mode | `g_selsync` is FALSE when `g_state.picker` | The buffer is the program's return value, written at `src/nnn.c:12039-12047`. Silently changing it changes what the calling editor receives. |
+| Opt-out | `g_selsync` is FALSE when `NNN_NO_SELSYNC` is set | Kill switch. |
+| Selection mode | `g_state.selmode` | Set at `src/nnn.c:1969-1970`; a multi-select is in progress. |
+| Range selection | `g_state.rangesel` | Set at `src/nnn.c:10460`; `selstartid` is a `browse()`-local index into `pdents[]` (`src/nnn.c:9599`) captured at `src/nnn.c:10469`. A swap between the two `SEL_SELMUL` presses appends the range on top of the peer's paths. |
+| List mode | `listpath` | `endselection()` (`src/nnn.c:2236-2295`) round-trips the buffer through a spawn and rewrites `selpath` with `listroot`-rewritten paths at `src/nnn.c:2295`. |
+| DnD in flight | `g_dnd_b64` | `g_dnd_b64` (`src/nnn.c:3688`) is built once and held while the terminal completes the drag asynchronously. |
+| du mode | `cfg.blkorder` | A forced reload recomputes disk usage, which can take seconds. Matches the existing gate at `src/nnn.c:4685`. Known limit: cross-pane sync is deferred until du mode is turned off, at which point the next poll picks it up. |
+| Pending simulated key | `presel != 0` at the call site | Do not clobber `FILTER` / `MSGWAIT`. |
+
+### 10.7 Hazards that must be handled
+
+Derived from the adversarial review of the earlier hazard audit. Where the audit's evidence was wrong, the corrected version is recorded.
+
+| # | Hazard | Class | Mitigation in this design |
+| --- | --- | --- | --- |
+| H1 | `findselpos` dangles after `selbufrealloc()` moves `pselbuf` (`xrealloc()` is plain `realloc()`, `src/nnn.c:1060-1068`). `findinsel()` then computes `size_t buflen = selbufpos - (startpos - pselbuf)` at `src/nnn.c:1998` from a garbage difference: `size_t` underflow and a `memmem()` over a huge region, plus the `*(found - 1)` read at `src/nnn.c:2005`. | Memory-unsafe | `findselpos = NULL` inside the swap (`findinsel()` handles a NULL `startpos` at `src/nnn.c:1993-1995`), plus the forced reload, whose `redraw()` reseeds it at `src/nnn.c:9525`. |
+| H2 | Heap overflow in `invertselbuf()`: `selmark *marked = malloc(nselected * sizeof(selmark));` at `src/nnn.c:2042`, sized from `nselected`, while pass 1 (`src/nnn.c:2050-2083`) writes one entry per `pdents[]` row that is both `FILE_SELECTED` and present in `pselbuf`. Safe only while "`FILE_SELECTED` implies present in `pselbuf`" holds. | Memory-unsafe | The forced reload re-derives every flag from the new buffer in `dentfill()` (`src/nnn.c:8478`), so the invariant is never broken across a keypress boundary. |
+| H3 | Shared-file truncation: `rmfromselbuf()` ends `nselected ? writesel(pselbuf, selbufpos - 1) : clearselection();` at `src/nnn.c:2202` (same tail in `invertselbuf()` at `src/nnn.c:2143`). With stale flags, deselects can drive `nselected` to 0 while `pselbuf` still holds the peer's paths, and `clearselection()` truncates the shared file. | Data loss | Same mitigation as H2. `Correction`: the audit's original trace was wrong. `rmfromselbuf()` returns early at `src/nnn.c:2195-2197` (`if (!found) return;`) when the deselected path is absent from the adopted buffer, so it never reaches the tail. The real trace needs an *overlapping* selection: local `{A, B}`, peer rewrites to `{A, C}`; deselecting `B` decrements `nselected` with no buffer change (early return), then deselecting `A` removes `A` and the tail fires `clearselection()` with `C` still in `pselbuf`. |
+| H4 | Stale `+` markers and a status bar that disagrees with the screen: `FILE_SCANNED` (`src/nnn.c:260`) memoizes and is cleared only by `dentfill()`; `resetselind()` (`src/nnn.c:1960-1965`) does not clear it. | Wrong behavior | The forced reload. `Correction`: a hand-rolled flag clear at the drain point does not repaint, because the drain point is skipped by `goto nochange` (`src/nnn.c:11074`) before `redraw()` at `src/nnn.c:9764`. `presel = CONTROL('L')` is mandatory, not optional. |
+| H5 | Swap between two `SEL_SELMUL` presses corrupts a range selection. | Wrong behavior | Suppression on `g_state.rangesel` and `g_state.selmode` (10.6). Deferral, not drop, so the change is not lost. |
+| H6 | Peer exit unlinks `selpath` (`src/nnn.c:12048-12049`), which a naive check reads as "cleared". | Data loss | Explicit `exists` vs `st_size == 0` split in `syncselfile()`. `isselfileempty()` is not used. |
+| H7 | `readselfile()` (`src/nnn.c:1926-1957`) sets `selbufpos = 0` at `src/nnn.c:1939` *before* the read, and on a short read returns `FALSE` leaving `selbufpos == 0` with partially clobbered `pselbuf`. Calling it from the poll would silently destroy a locally owned selection on a transient read error. | Data loss | `syncselfile()` does not call `readselfile()`. `loadselfile()` reads into its own heap buffer and only commits on success. `readselfile()` stays as-is for `editselection()`, where it is only reached with `selbufpos == 0`. |
+| H8 | Adopting garbage: a 1-byte file containing a single NUL yields one zero-length "path"; a plugin writing newline-separated text yields one bogus entry. | Wrong behavior | `loadselfile()` validates that every entry is non-empty and begins with `/`; otherwise it refuses and the local state is untouched. |
+| H9 | Spurious reload loop from the instance's own writes. | Performance / flicker | Content compare (`memcmp` against `pselbuf`) before swapping, and the stamp is updated on every consumed observation. `plugins/dragdrop:46` appends a NUL after every path while `writesel()` omits the last one; `loadselfile()` normalizes both to the same in-memory form, so the two representations compare equal. |
+| H10 | Async mutation during a blocking prompt: `xlink()` caches `char *psel = pselbuf;` at `src/nnn.c:5486` before calling `get_cur_or_sel()` (which blocks in `get_input()`, `src/nnn.c:1699-1715`), then walks `psel` at `src/nnn.c:5518-5529`. | Memory-unsafe if containment is lost | Containment is preserved: the sync runs only at `src/nnn.c:9787`, never inside `get_input()` (`src/nnn.c:1665`, uses `get_wch()` directly), `xreadline()` (`src/nnn.c:5190`) or `spawn()`. `nextsel()` has exactly one caller, `src/nnn.c:9792`. Do not move the call site. |
+| H11 | `nselected != 0` with `selbufpos == 0` is reachable today (`batch_rename()` at `src/nnn.c:3038` and `src/nnn.c:3064`; `SEL_QUITCD` in picker mode at `src/nnn.c:11048-11049`), and `confirm_force()` produces the mirror image at `src/nnn.c:1749-1753`. | Wrong behavior | The "already empty" fast exit tests both: `if (!selbufpos && !nselected) return FALSE;`. The swap always sets both together. |
+| H12 | Ownership side effects after an automatic adopt: `Q` dumps to stdout (`src/nnn.c:11055`), `-u` skips the prompt (`src/nnn.c:1708`), a DnD drag exports the selection (`dnd_prepare_data()`, `src/nnn.c:3904-3936`). | Behavior change | Accepted by `Decision 4` in 10.2. Documented, not mitigated. |
+| H13 | `entries_in_file()` returns `++count` for `NUL_CHAR` (`src/nnn.c:1741`), so it over-counts by one. | Cosmetic | The sync does not use it. `Correction`: the only `NUL_CHAR` caller is `confirm_force()` at `src/nnn.c:1753`; `cpmv_rename()` at `src/nnn.c:2932` passes `NEWLINE_CHAR` and is unaffected. Out of scope. |
+
+`Risk` - pre-existing, found during this review, not caused by the sync and not fixed by it: `endselection()` does `selbufpos = count; pselbuf[--count] = '\0';` at `src/nnn.c:2289-2290` with no zero check, so a zero-length replace-script output writes `pselbuf[-1]`. `editselection()` guards the identical pattern at `src/nnn.c:2394-2397`. Worth a separate commit.
+
+`Risk` - pre-existing cross-instance TOCTOU: `cpmvrm_selection()` (`src/nnn.c:2967-3018`) reads the selection at `src/nnn.c:2971`, `2972`, `2974`, and the spawned shell re-reads `selpath` itself at `src/nnn.c:3009`. "Delete 3 files?" can already delete more if the peer writes in between. The sync does not worsen it (it never writes), and does not fix it.
+
+`Risk` - no size cap on `loadselfile()`'s `malloc`. Matches existing `readselfile()` behavior, but a hostile or corrupt `selpath` allocates its full size. `Open question` - whether to add a ceiling (for example 16 MB) and refuse above it.
+
+### 10.8 Out of scope
+
+- Merging divergent selections. Last writer to the file wins.
+- Any write to `selpath` from the sync path, including re-creating the file after a peer exit unlinks it.
+- Terminal focus reporting (mode 1004) and tmux `focus-events`. Rejected in 10.3.
+- Watching `selpath` with `inotify` / `kqueue`. Rejected in 10.3.
+- Cross-instance locking of `selpath`. `writesel()`'s `rename(2)` already makes each write atomic for readers.
+- Fixing the H3 root cause inside `rmfromselbuf()` / `invertselbuf()` (not decrementing `nselected` when `findinsel()` fails, sizing `marked[]` from a real buffer scan). Worth doing independently; this design avoids the trigger rather than the latent defect.
+- du mode (`cfg.blkorder`) and list mode (`-l`) live-sync.
+- Picker mode (`-p`) live-sync.
+- Any change to `handle_event()` (`src/nnn.c:3668-3672`).
+
+### 10.9 Test plan
+
+`Not verified` - nothing in this section has been run. Everything below is a procedure for the implementer.
+
+Build with the canonical script, not bare `make`:
+
+```bash
+cp -a /home/tripham/Dev/Playground_Terminal/nnn /tmp/nnn-selsync
+cd /tmp/nnn-selsync && ./build.sh
+```
+
+Use a throwaway selection file for every test. Do not touch `~/.config/nnn/.selection`:
+
+```bash
+mkdir -p /tmp/selsync-test/{a,b}
+touch /tmp/selsync-test/a/{f1,f2,f3,f4}
+export NNN_SEL=/tmp/selsync-test/.selection
+```
+
+Run two instances in one tmux window, both with the same `NNN_SEL`.
+
+| # | Test | Steps | Pass criteria |
+| --- | --- | --- | --- |
+| T1 | The user's exact repro | (1) Select `f1` and `f2` in LEFT with `space`. (2) In RIGHT press `E`, delete every line, save, quit the editor. (3) Switch to LEFT and press `E`. (4) Switch to RIGHT and press `E`. | Step 2: RIGHT shows no selection. Step 3: LEFT's `+` markers and the status-bar count are already gone before `E` is pressed, and `E` prints `0 selected`. Step 4: `0 selected`. |
+| T2 | Peer adds to the selection | Select `f1` in LEFT. In RIGHT select `f3`. Look at LEFT without pressing any key. | Within about one second LEFT shows the count `2`; `f1` keeps its `+`; navigating to `/tmp/selsync-test/a` in RIGHT shows `+` on both. |
+| T3 | Peer edit via `E` | Select `f1`, `f2`, `f3` in LEFT. In RIGHT press `E`, delete the `f2` line, save. | LEFT's count drops to 2 and `f2` loses its `+` without any keypress in LEFT. |
+| T4 | No self-triggered churn | Select and deselect files in LEFT only, with RIGHT idle. | LEFT does not flicker or reload on its own writes; the cursor position and any active filter survive. Confirm with `strace -f -e trace=openat -p <pid>` that LEFT reopens `selpath` only when it changed. |
+| T5 | Peer exit does not wipe the survivor | Select `f1` and `f2` in LEFT. Quit RIGHT with `q`. Wait 3 seconds. | `selpath` is gone (`ls -l "$NNN_SEL"` fails). LEFT still shows 2 selected and both `+` markers. `E` in LEFT still lists both files. |
+| T6 | Recovery after peer exit | Continue from T5: in LEFT press `space` on `f3`. | `selpath` is re-created and contains all three paths (`tr '\0' '\n' < "$NNN_SEL"`). |
+| T7 | Range selection is not corrupted | In LEFT press `SEL_SELMUL` to start a range. While the range is open, in RIGHT select a different file. Complete the range in LEFT. | LEFT's range covers exactly the intended rows and does not include RIGHT's file. The sync applies after the range completes. |
+| T8 | Filter survives a sync | In LEFT apply a filter that hides some files. In RIGHT change the selection. | LEFT's filter is still active after the forced reload, and the cursor stays on the same entry. |
+| T9 | Garbage file is refused | With LEFT holding a selection, run `printf 'not-a-path\n' > "$NNN_SEL"`. | LEFT keeps its selection and does not crash. Repeat with `printf '\0' > "$NNN_SEL"`. |
+| T10 | Trailing-NUL writer | With LEFT holding a selection, run `printf '%s\0' /tmp/selsync-test/a/f4 > "$NNN_SEL"` (mimics `plugins/dragdrop:46`). | LEFT adopts exactly one entry, count `1`, `+` on `f4` only, and does not reload repeatedly afterwards. |
+| T11 | Kill switch | Restart LEFT with `NNN_NO_SELSYNC=1`. Repeat T2. | LEFT does not change until the user presses `E`, which falls back to the existing `editselection()` adopt path. |
+| T12 | Picker mode unaffected | `nnn -p - /tmp/selsync-test/a`, select files, and change `$NNN_SEL` from another shell. | The picker's output is unchanged by the external write. |
+| T13 | ASan run | Rebuild with `./build.sh` plus `-fsanitize=address -fno-omit-frame-pointer`, then repeat T1, T2, T3 and T7 and additionally: local `{f1, f2, f3, f4}`, peer rewrites to `{f1, f2}`, then deselect `f3` and `f4` in the first pane, then press `SEL_SELINV`. | No ASan report. This exercises the H1/H2 window directly. |
+
+For each test, record the exact command, the observed result and a pass/fail verdict. Do not mark the feature `DONE` until T1, T2, T5 and T13 have all been run and recorded.
+
+### 10.10 Implementer checklist
+
+1. Add the `g_selstamp` struct and `g_selsync` flag, plus `loadselfile()` and `syncselfile()`, immediately above `static int nextsel(int presel)` (currently `src/nnn.c:4579`). They must be placed after `g_dnd_b64` (`src/nnn.c:3688`).
+2. Initialize `g_selsync` in `setup_config()` (`src/nnn.c:11377`), just after the selection-file block that ends at `src/nnn.c:11462`:
+   `g_selsync = !g_state.picker && selpath && !getenv("NNN_NO_SELSYNC");`
+3. Add the call site in `browse()` directly after the `g_dnd_resync` drain (`src/nnn.c:9787-9790`), before `sel = nextsel(presel);` (`src/nnn.c:9792`):
+   `if (!presel && syncselfile()) presel = CONTROL('L');`
+4. Confirm the sync is called from nowhere else. In particular not from `get_input()` (`src/nnn.c:1665`), `xreadline()` (`src/nnn.c:5190`), `spawn()`, `handle_event()` (`src/nnn.c:3668`), or any plugin callback.
+5. Verify the swap sets all five pieces of state together: `pselbuf` contents, `selbufpos`, `nselected` (counted from the buffer, never carried), `findselpos = NULL`, and `resetselind()`.
+6. Verify `syncselfile()` contains no call to `writesel()`, `clearselection()`, `startselection()` or `endselection()`. Grep the new code for `writesel` and expect zero hits.
+7. Verify the deferral gates return **before** the stamp is recorded, and the consume paths return **after**.
+8. Verify `readselfile()` (`src/nnn.c:1926`) and the `adopted` revert in `editselection()` (`src/nnn.c:2352-2368`) are left untouched: they still serve the suppressed and opted-out cases.
+9. Verify `handle_event()` (`src/nnn.c:3668-3672`) is left untouched.
+10. Build with `./build.sh` (not bare `make`) and confirm no new warnings.
+11. Run the test plan in 10.9 against a copy in `/tmp` with `NNN_SEL` pointing at a throwaway file. Do not run any test against `~/.config/nnn/.selection`.
+12. Run T13 under ASan before declaring the work `DONE`.
+13. Document `NNN_NO_SELSYNC` in the README next to the existing selection notes, and note the du-mode and list-mode limits.
+14. Commit with a message describing the behavior change: the shared selection file becomes authoritative and every instance tracks it live.
