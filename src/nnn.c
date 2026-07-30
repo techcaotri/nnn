@@ -447,6 +447,7 @@ alignas(max_align_t) static context g_ctx[CTX_MAX];
 
 static int ndents, cur, last, curscroll, last_curscroll, total_dents = ENTRY_INCR, scroll_lines = 1;
 static int nselected;
+static uint16_t g_selctxcount[CTX_MAX]; /* selected-entry count attributed to each context */
 #ifndef NOFIFO
 static int fifofd = -1;
 #endif
@@ -1949,9 +1950,11 @@ static bool readselfile(void)
 	selbufpos = (uint_t)count;
 
 	nselected = 0;
+	memset(g_selctxcount, 0, sizeof(g_selctxcount));
 	for (ssize_t i = 0; i < count; ++i)
 		if (pselbuf[i] == '\0')
 			++nselected;
+	g_selctxcount[cfg.curctx] = nselected; /* whole adopted selection attributed to "now" */
 
 	return (nselected > 0);
 }
@@ -1969,6 +1972,7 @@ static void startselection(void)
 	if (!g_state.selmode) {
 		g_state.selmode = 1;
 		nselected = 0;
+		memset(g_selctxcount, 0, sizeof(g_selctxcount));
 
 		if (selbufpos) {
 			resetselind();
@@ -1981,6 +1985,7 @@ static void startselection(void)
 static void clearselection(void)
 {
 	nselected = 0;
+	memset(g_selctxcount, 0, sizeof(g_selctxcount));
 	selbufpos = 0;
 	g_state.selmode = 0;
 	writesel(NULL, 0);
@@ -2071,6 +2076,7 @@ static void invertselbuf(const int pathlen)
 				}
 
 				--nselected;
+				if (g_selctxcount[cfg.curctx]) --g_selctxcount[cfg.curctx];
 				shrinklen += len; /* buffer size adjustment */
 			} else {
 				dentp->flags |= FILE_SELECTED;
@@ -2137,6 +2143,7 @@ static void invertselbuf(const int pathlen)
 			len = pathlen + xstrsncpy(pbuf, pdents[i].name, NAME_MAX);
 			appendfpath(g_sel, len);
 			++nselected;
+			++g_selctxcount[cfg.curctx];
 		}
 	}
 
@@ -2182,6 +2189,7 @@ static void addtoselbuf(const int pathlen, int startid, int endid)
 			len = pathlen + xstrsncpy(pbuf, pdents[i].name, NAME_MAX);
 			appendfpath(g_sel, len);
 			++nselected;
+			++g_selctxcount[cfg.curctx];
 			pdents[i].flags |= (FILE_SCANNED | FILE_SELECTED);
 		}
 	}
@@ -2365,6 +2373,7 @@ static int editselection(bool allowemptysel)
 			resetselind();
 			selbufpos = 0;
 			nselected = 0;
+			memset(g_selctxcount, 0, sizeof(g_selctxcount));
 		}
 		return 1;
 	}
@@ -2418,6 +2427,8 @@ static int editselection(bool allowemptysel)
 	}
 
 	nselected = lines;
+	memset(g_selctxcount, 0, sizeof(g_selctxcount));
+	g_selctxcount[cfg.curctx] = lines;
 	writesel(pselbuf, selbufpos - 1);
 
 	return 1;
@@ -2901,6 +2912,7 @@ static void xrmfromsel(char *path, char *fpath)
 		clearselection();
 	else if (pdents[cur].flags & FILE_SELECTED) {
 		--nselected;
+		if (g_selctxcount[cfg.curctx]) --g_selctxcount[cfg.curctx];
 		rmfromselbuf(mkpath(path, pdents[cur].name, g_sel));
 	}
 #ifndef NOX11
@@ -4714,6 +4726,7 @@ static bool syncselfile(void)
 		findselpos = NULL;
 		selbufpos = 0;
 		nselected = 0;
+		memset(g_selctxcount, 0, sizeof(g_selctxcount));
 		g_state.selmode = 0;
 		return TRUE;
 	}
@@ -4736,6 +4749,8 @@ static bool syncselfile(void)
 	memcpy(pselbuf, buf, len);
 	selbufpos = len;
 	nselected = count;
+	memset(g_selctxcount, 0, sizeof(g_selctxcount));
+	g_selctxcount[cfg.curctx] = count;
 	free(buf);
 
 	/*
@@ -9633,6 +9648,13 @@ static void redraw(char *path)
 	for (i = 0; i < CTX_MAX; ++i) { /* 8 chars printed for contexts - "1 2 3 4 " */
 		if (!g_ctx[i].c_cfg.ctxactive)
 			addch(i + '1');
+		else if (g_selctxcount[i] && (i != cfg.curctx))
+			/* Active tab holding a selection you are not currently on: tint it
+			 * instead of its usual per-context color. Keep bold+underline so it
+			 * still reads as "active", just attention-colored. No extra
+			 * character, so the fixed 2-columns-per-context layout
+			 * (MIN_DISPLAY_COL, used right after this loop) is unaffected. */
+			addch((i + '1') | (COLOR_PAIR(C_UND) | A_BOLD | A_UNDERLINE));
 		else
 			addch((i + '1') | (COLOR_PAIR(i + 1) | A_BOLD
 				/* active: underline, current: reverse */
@@ -10621,10 +10643,12 @@ nochange:
 
 			if (pdents[cur].flags & FILE_SELECTED) {
 				++nselected;
+				++g_selctxcount[cfg.curctx];
 				appendfpath(newpath, mkpath(path, pdents[cur].name, newpath));
 				writesel(pselbuf, selbufpos - 1); /* Truncate NULL from end */
 			} else {
 				--nselected;
+				if (g_selctxcount[cfg.curctx]) --g_selctxcount[cfg.curctx];
 				rmfromselbuf(mkpath(path, pdents[cur].name, g_sel));
 			}
 
