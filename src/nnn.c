@@ -1879,7 +1879,10 @@ static bool listselfile(void)
 	if (isselfileempty())
 		return FALSE;
 
-	snprintf(g_buf, CMD_LEN_MAX, "tr \'\\0\' \'\\n\' < '%s'", selpath);
+	snprintf(g_buf, CMD_LEN_MAX,
+		 "echo 'Selection was made in another nnn instance - showing it read-only.'; "
+		 "echo 'Switch to that instance to edit it.'; echo; "
+		 "tr \'\\0\' \'\\n\' < '%s'", selpath);
 	spawn(utils[UTIL_SH_EXEC], g_buf, NULL, NULL, F_CLI | F_CONFIRM);
 
 	return TRUE;
