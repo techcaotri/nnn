@@ -447,7 +447,10 @@ alignas(max_align_t) static context g_ctx[CTX_MAX];
 
 static int ndents, cur, last, curscroll, last_curscroll, total_dents = ENTRY_INCR, scroll_lines = 1;
 static int nselected;
-static uint16_t g_selctxcount[CTX_MAX]; /* selected-entry count attributed to each context */
+static uint16_t g_selctxcount[CTX_MAX]; /* per-context tally, DERIVED (see selown_recompute()) */
+static char *g_selown;      /* records "<ctx byte><path>\0": what THIS instance selected, and where */
+static uint_t g_selownpos, g_selownlen;
+static bool g_selctxdirty;  /* g_selctxcount needs recomputing before it is read */
 #ifndef NOFIFO
 static int fifofd = -1;
 #endif
@@ -1791,6 +1794,13 @@ static void writesel(const char *buf, const size_t buflen)
 	char tmp[PATH_MAX];
 	int fd;
 
+	/*
+	 * Every local selection change funnels through here, so this is the one
+	 * place that has to invalidate the derived per-context tally. The adopt
+	 * paths (which do not write) set the flag themselves.
+	 */
+	g_selctxdirty = TRUE;
+
 	if (!selpath)
 		return;
 
@@ -1848,6 +1858,129 @@ static void selbufrealloc(const size_t alloclen)
 		if (!pselbuf)
 			errexit();
 	}
+}
+
+/*
+ * ===== Per-context selection ownership (drives the tab-bar tint) =====
+ *
+ * g_selctxcount[i] must answer "how many currently-selected paths did I select
+ * while on context i". Running counters cannot answer that: the cross-instance
+ * sync replaces the whole of pselbuf at once, and a bare count carries no path
+ * information, so it is impossible to tell which of the incoming paths this
+ * instance had already attributed to a context.
+ *
+ * So the tally is DERIVED instead. g_selown remembers, per path, the context
+ * that selected it here; selown_recompute() intersects that against the live
+ * pselbuf. A buffer replace then costs nothing but a recompute: paths this
+ * instance selected keep their context as long as they survive in the
+ * selection, and paths that arrived from another instance match no record and
+ * are attributed to no context. The tally cannot drift, because it is never
+ * incrementally maintained.
+ *
+ * g_selown is advisory. It is never consumed by any file operation.
+ */
+static bool selown_inbuf(const char *path)
+{
+	const char *p = pselbuf, * const end = pselbuf + selbufpos;
+
+	if (!pselbuf || !selbufpos)
+		return FALSE;
+
+	while (p < end) {
+		if (!xstrcmp(p, path))
+			return TRUE;
+		p += xstrlen(p) + 1;
+	}
+
+	return FALSE;
+}
+
+/* Forget any record for path (a re-select moves attribution to the new context) */
+static void selown_del(const char *path)
+{
+	char *r, *w, *end;
+
+	if (!g_selown || !g_selownpos)
+		return;
+
+	r = w = g_selown;
+	end = g_selown + g_selownpos;
+
+	while (r < end) {
+		size_t rlen = 1 + xstrlen(r + 1) + 1;
+
+		if (xstrcmp(r + 1, path)) { /* keep */
+			if (w != r)
+				memmove(w, r, rlen);
+			w += rlen;
+		}
+		r += rlen;
+	}
+
+	g_selownpos = (uint_t)(w - g_selown);
+}
+
+/* Record that the current context selected path */
+static void selown_add(const char *path)
+{
+	size_t plen = xstrlen(path) + 1, need;
+
+	selown_del(path);
+	need = 1 + plen;
+
+	if ((g_selownpos + need) > g_selownlen) {
+		g_selownlen = (uint_t)ALIGN_UP(g_selownpos + need, PATH_MAX);
+		g_selown = xrealloc(g_selown, g_selownlen);
+		if (!g_selown) { /* advisory state only: degrade to no tint, never abort */
+			g_selownpos = g_selownlen = 0;
+			return;
+		}
+	}
+
+	g_selown[g_selownpos] = (char)cfg.curctx;
+	memcpy(g_selown + g_selownpos + 1, path, plen);
+	g_selownpos += (uint_t)need;
+	g_selctxdirty = TRUE;
+}
+
+static void selown_reset(void)
+{
+	g_selownpos = 0;
+	memset(g_selctxcount, 0, sizeof(g_selctxcount));
+	g_selctxdirty = FALSE;
+}
+
+/* Rebuild g_selctxcount from g_selown x pselbuf, dropping records that are no
+ * longer selected (which also keeps g_selown from growing without bound). */
+static void selown_recompute(void)
+{
+	char *r, *w, *end;
+
+	g_selctxdirty = FALSE;
+	memset(g_selctxcount, 0, sizeof(g_selctxcount));
+
+	if (!g_selown || !g_selownpos)
+		return;
+
+	r = w = g_selown;
+	end = g_selown + g_selownpos;
+
+	while (r < end) {
+		size_t rlen = 1 + xstrlen(r + 1) + 1;
+
+		if (selown_inbuf(r + 1)) {
+			uchar_t c = (uchar_t)r[0];
+
+			if (c < CTX_MAX)
+				++g_selctxcount[c];
+			if (w != r)
+				memmove(w, r, rlen);
+			w += rlen;
+		}
+		r += rlen;
+	}
+
+	g_selownpos = (uint_t)(w - g_selown);
 }
 
 /* Write selected file paths to fd, linefeed separated */
@@ -1951,13 +2084,12 @@ static bool readselfile(void)
 
 	nselected = 0;
 	/*
-	 * Leave g_selctxcount all-zero: these paths were selected in ANOTHER
-	 * instance, so no context of THIS instance owns them. Crediting the
-	 * current context would tint that tab as soon as the user moves off it,
-	 * claiming a selection the tab never made. nselected still drives the
-	 * status-bar count, so the selection remains visible.
+	 * Do NOT touch g_selown: it is this instance's memory of what it selected
+	 * and where, and those paths may well still be present in the incoming
+	 * list. The recompute intersects the two, so locally-selected paths keep
+	 * their context and paths that only exist in the peer's list get none.
 	 */
-	memset(g_selctxcount, 0, sizeof(g_selctxcount));
+	g_selctxdirty = TRUE;
 	for (ssize_t i = 0; i < count; ++i)
 		if (pselbuf[i] == '\0')
 			++nselected;
@@ -1978,7 +2110,7 @@ static void startselection(void)
 	if (!g_state.selmode) {
 		g_state.selmode = 1;
 		nselected = 0;
-		memset(g_selctxcount, 0, sizeof(g_selctxcount));
+		selown_reset(); /* a new round discards the old ownership records */
 
 		if (selbufpos) {
 			resetselind();
@@ -1991,7 +2123,7 @@ static void startselection(void)
 static void clearselection(void)
 {
 	nselected = 0;
-	memset(g_selctxcount, 0, sizeof(g_selctxcount));
+	selown_reset();
 	selbufpos = 0;
 	g_state.selmode = 0;
 	writesel(NULL, 0);
@@ -2082,7 +2214,6 @@ static void invertselbuf(const int pathlen)
 				}
 
 				--nselected;
-				if (g_selctxcount[cfg.curctx]) --g_selctxcount[cfg.curctx];
 				shrinklen += len; /* buffer size adjustment */
 			} else {
 				dentp->flags |= FILE_SELECTED;
@@ -2149,7 +2280,7 @@ static void invertselbuf(const int pathlen)
 			len = pathlen + xstrsncpy(pbuf, pdents[i].name, NAME_MAX);
 			appendfpath(g_sel, len);
 			++nselected;
-			++g_selctxcount[cfg.curctx];
+			selown_add(g_sel);
 		}
 	}
 
@@ -2195,7 +2326,7 @@ static void addtoselbuf(const int pathlen, int startid, int endid)
 			len = pathlen + xstrsncpy(pbuf, pdents[i].name, NAME_MAX);
 			appendfpath(g_sel, len);
 			++nselected;
-			++g_selctxcount[cfg.curctx];
+			selown_add(g_sel);
 			pdents[i].flags |= (FILE_SCANNED | FILE_SELECTED);
 		}
 	}
@@ -2379,7 +2510,7 @@ static int editselection(bool allowemptysel)
 			resetselind();
 			selbufpos = 0;
 			nselected = 0;
-			memset(g_selctxcount, 0, sizeof(g_selctxcount));
+			g_selctxdirty = TRUE;
 		}
 		return 1;
 	}
@@ -2434,14 +2565,11 @@ static int editselection(bool allowemptysel)
 
 	nselected = lines;
 	/*
-	 * Attribute the edited list to this context only when it was already
-	 * this instance's own selection. An adopted list belongs to whichever
-	 * instance selected it; curating it here does not move ownership, and
-	 * crediting the current context would falsely tint this tab later.
+	 * An edit can only prune (the guard above rejects growth), so ownership
+	 * records simply survive or fall away with their paths. writesel() marks
+	 * the tally dirty and the recompute does the rest; nothing to attribute
+	 * by hand, and an adopted list still gains no local owner.
 	 */
-	memset(g_selctxcount, 0, sizeof(g_selctxcount));
-	if (!adopted)
-		g_selctxcount[cfg.curctx] = lines;
 	writesel(pselbuf, selbufpos - 1);
 
 	return 1;
@@ -2925,7 +3053,6 @@ static void xrmfromsel(char *path, char *fpath)
 		clearselection();
 	else if (pdents[cur].flags & FILE_SELECTED) {
 		--nselected;
-		if (g_selctxcount[cfg.curctx]) --g_selctxcount[cfg.curctx];
 		rmfromselbuf(mkpath(path, pdents[cur].name, g_sel));
 	}
 #ifndef NOX11
@@ -4739,7 +4866,7 @@ static bool syncselfile(void)
 		findselpos = NULL;
 		selbufpos = 0;
 		nselected = 0;
-		memset(g_selctxcount, 0, sizeof(g_selctxcount));
+		selown_reset(); /* nothing is selected anywhere now */
 		g_state.selmode = 0;
 		return TRUE;
 	}
@@ -4763,13 +4890,13 @@ static bool syncselfile(void)
 	selbufpos = len;
 	nselected = count;
 	/*
-	 * All-zero, deliberately: this selection came from another instance, so
-	 * none of THIS instance's contexts selected it. Crediting the current
-	 * context would light that tab up the moment the user switches away,
-	 * pointing at a tab that never made the selection. The status-bar count
-	 * (nselected) still reports it.
+	 * Keep g_selown. The incoming list is the union of what every instance
+	 * selected, so paths this instance selected are typically still in it and
+	 * must keep their context (otherwise a peer selecting anything would wipe
+	 * this pane's tab markers). The recompute intersects the two: local paths
+	 * keep their tab, purely foreign paths get no tab.
 	 */
-	memset(g_selctxcount, 0, sizeof(g_selctxcount));
+	g_selctxdirty = TRUE;
 	free(buf);
 
 	/*
@@ -9664,6 +9791,9 @@ static void redraw(char *path)
 	//DPRINTF_D(cur);
 	DPRINTF_S(path);
 
+	if (g_selctxdirty) /* the tally is derived: refresh it before it is read */
+		selown_recompute();
+
 	for (i = 0; i < CTX_MAX; ++i) { /* 8 chars printed for contexts - "1 2 3 4 " */
 		if (!g_ctx[i].c_cfg.ctxactive)
 			addch(i + '1');
@@ -10662,12 +10792,11 @@ nochange:
 
 			if (pdents[cur].flags & FILE_SELECTED) {
 				++nselected;
-				++g_selctxcount[cfg.curctx];
 				appendfpath(newpath, mkpath(path, pdents[cur].name, newpath));
+				selown_add(newpath);
 				writesel(pselbuf, selbufpos - 1); /* Truncate NULL from end */
 			} else {
 				--nselected;
-				if (g_selctxcount[cfg.curctx]) --g_selctxcount[cfg.curctx];
 				rmfromselbuf(mkpath(path, pdents[cur].name, g_sel));
 			}
 
