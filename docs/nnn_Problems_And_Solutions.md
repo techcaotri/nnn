@@ -783,3 +783,434 @@ echo 'fs.inotify.max_user_instances=512' | sudo tee /etc/sysctl.d/40-inotify.con
 This is a common developer-machine condition (VS Code's docs recommend raising
 the same limit). It is unrelated to the DnD feature but blocked testing it, so
 it is recorded here.
+
+---
+
+## Problem 9 -- The tab-bar tint marked a tab that never made the selection, then stopped marking the one that did
+
+The per-tab selection tint (commit `e8ce68a7`) got the wrong answer twice in a
+row, and both times for the same underlying reason. The first fix (`cb5b9db4`)
+removed one wrong answer and immediately produced its mirror image; the real fix
+(`1bc07033`) replaced the mechanism. This entry records the whole arc, because
+the second failure is only understandable as a consequence of the first fix.
+
+### 9.1 Symptom (as reported)
+
+**Bug A -- a foreign selection lit up a local tab.**
+
+1. Only **tab 1 of the LEFT pane** had 2 selected files (confirmed by pressing
+   `E`, which lists the selection).
+2. Yet **tab 4 of the RIGHT pane** was highlighted red, as if it held a
+   selection.
+3. Tab 4 of the right pane had never had anything selected on it.
+
+**Bug B -- after Bug A was fixed, the tint stopped appearing at all.** This one
+appeared **only after** `cb5b9db4` landed; it did not exist before:
+
+1. Select 2 files on **left tab 1**, switch the left pane to tab 2. Tab 1 turns
+   red -- correct.
+2. Now select 2 files on **right tab 2** and switch the right pane to tab 3.
+3. The **left pane's tab 1 is no longer red**, even though pressing `E` in the
+   left pane still lists all 4 files, the left pane's 2 among them.
+
+### 9.2 TL;DR root cause
+
+`g_selctxcount[]` was a **running counter**: incremented next to every
+`++nselected` and decremented next to every `--nselected`. A counter holds only
+numbers. It carries **no record of which paths those numbers refer to**.
+
+The cross-instance sync (described in 9.3) **replaces the entire
+selection buffer at once** with the file's contents. At that moment a running
+counter cannot be repaired, because there is no way to tell which of the
+incoming paths this instance had already attributed to one of its own tabs:
+
+- Crediting the whole incoming list to the current tab is wrong -- that is
+  **Bug A** (a tab gets credit for files another pane selected).
+- Zeroing the whole tally is also wrong -- that is **Bug B** (the pane throws
+  away its own still-valid attribution for paths it really did select).
+
+Both answers are wrong because the question needs **per-path** information that
+a counter does not have. The fix is to stop counting and start **deriving**:
+record `<ctx><path>` for every path this instance selects, and rebuild the tally
+by intersecting those records against the live buffer.
+
+### 9.3 Background -- one selection file, two panes, eight tabs each
+
+The setup is two nnn instances side by side in tmux (`~/bin/start_dual_nnn.sh`,
+aliases `nnn_left` / `nnn_right`). `NNN_SEL` is **not** set, so both instances
+use the same default selection file, `~/.config/nnn/.selection`. That sharing is
+**deliberate**: it is what makes select-in-left / paste-in-right work. Each
+instance additionally has 8 contexts ("tabs", keys `1`-`8`, `Tab` to cycle).
+
+A selection therefore lives in two places at once:
+
+```
+ASCII Table 9.3a: The two selection stores
++---------------------------+---------------------------------------------------+
+| Store                     | Properties                                        |
++---------------------------+---------------------------------------------------+
+| In memory, PER PROCESS    | pselbuf (src/nnn.c:481), selbufpos (459) and      |
+|                           | nselected (449). Every path is NUL-TERMINATED,    |
+|                           | so selbufpos == sum(len_i) + N.                   |
+| On disk at selpath,       | NUL-SEPARATED with NO trailing NUL: writesel() is |
+| SHARED by both panes      | always called with selbufpos - 1, so N paths give |
+|                           | N-1 NULs. Caveat: plugins/dragdrop:46 appends a   |
+|                           | NUL after EVERY path, and main() writes selpath   |
+|                           | directly in picker mode, bypassing writesel().    |
++---------------------------+---------------------------------------------------+
+```
+
+Two features landed just before this bug and are what make it possible at all:
+
+- **`0a921705`** made `writesel()` ([src/nnn.c:1792](../src/nnn.c#L1792)) write a
+  sibling temp file and `rename(2)` it over `selpath` (atomic for external
+  readers), and added `readselfile()` ([src/nnn.c:2060](../src/nnn.c#L2060)) so
+  pressing `E` in a pane with nothing selected locally **adopts** the on-disk
+  selection and can edit it.
+- **`4a45a97e`** added the live cross-instance sync: `syncselfile()`
+  ([src/nnn.c:4806](../src/nnn.c#L4806)) polls `selpath` with one `stat(2)` at
+  the top of the `browse()` loop ([src/nnn.c:10148](../src/nnn.c#L10148)) and
+  replaces the local copy when the file changed.
+
+**This is the key point for Problem 9:** before the sync existed, a pane only
+ever held paths it had selected itself, so attributing the buffer to a local tab
+was always right. The sync is what makes a **foreign** selection appear inside a
+local buffer. This whole class of bug could only exist once that landed.
+
+Finally, what the tally must answer:
+
+```
+ASCII Table 9.3b: What g_selctxcount[i] means
++--------------------------------+-----------------------------------------------+
+| Question it must answer        | "How many CURRENTLY-selected paths did I      |
+|                                | select while sitting on context i?"           |
++--------------------------------+-----------------------------------------------+
+| Who is "I"                     | This process only. Another instance's tabs    |
+|                                | are not addressable from here.                |
+| What it drives                 | The context-bar tint in redraw()              |
+|                                | (src/nnn.c:9800): a tab OTHER than the        |
+|                                | current one lights up when it holds a         |
+|                                | selection, so a selection left behind on      |
+|                                | another tab is not forgotten.                 |
+| What it must NOT do            | Claim a selection this instance never made.   |
++--------------------------------+-----------------------------------------------+
+```
+
+The tint itself is one branch in the context-bar loop
+([src/nnn.c:9800](../src/nnn.c#L9800), the inline comment between the two lines
+is elided here):
+
+```c
+else if (g_selctxcount[i] && (i != cfg.curctx))
+        addch((i + '1') | (COLOR_PAIR(C_UND) | A_BOLD | A_UNDERLINE));
+```
+
+No extra character is printed: the loop emits exactly 2 columns per context, and
+`MIN_DISPLAY_COL` (`CTX_MAX * 2`, [src/nnn.c:246](../src/nnn.c#L246)) hardcodes that
+budget for the path string drawn right after it. `COLOR_PAIR(C_UND + 1)` was
+tried first (mirroring the `+1` convention used for icon coloring) but collides
+with the icon-color pair table in this icon-enabled build and renders
+black-on-black; `COLOR_PAIR(C_UND)` is the pair `init_fcolors()` assigns to
+`C_UND` and renders visibly red.
+
+### 9.4 Bug A mechanism -- the adopting pane credited its own current tab
+
+Both adopt paths (`readselfile()` on `E`, and `syncselfile()` on the poll)
+originally ended with the equivalent of
+`g_selctxcount[cfg.curctx] = nselected`. `cfg.curctx` is the context the
+**adopting** instance happens to be sitting on, which has nothing to do with
+where the paths were selected.
+
+```mermaid
+%% Bug A: an adopted selection is credited to whatever tab the adopting pane sits on
+sequenceDiagram
+    autonumber
+    participant L as "Left pane (on tab 1)"
+    participant F as "Shared .selection file"
+    participant R as "Right pane (parked on tab 4)"
+
+    Note over L: user selects 2 files on tab 1
+    L->>F: writesel(): 2 paths, temp file + rename(2)
+    Note over R: top of browse(): syncselfile() stat(2)<br/>sees a new mtime/size
+    F-->>R: 2 paths swapped into pselbuf
+    Note over R: OLD code: credit the whole list to cfg.curctx<br/>cfg.curctx is tab 4, purely because the pane sits there
+    Note over R: user switches the right pane to tab 1
+    R->>R: redraw(): g_selctxcount[tab 4] != 0 and tab 4 != cfg.curctx
+    Note over R: tab 4 renders red#59; it never selected anything
+```
+
+```
+ASCII Table 9.4: Components in the Bug A path
++----------------------+--------------------------------------------------------+
+| Component            | Role in the failure                                    |
++----------------------+--------------------------------------------------------+
+| writesel()           | Publishes the left pane's 2 paths to the shared file.  |
+| (src/nnn.c:1792)     | Correct; not implicated.                               |
+| syncselfile()        | Notices the file changed and swaps pselbuf. Correct;   |
+| (src/nnn.c:4806)     | the swap itself is exactly the intended feature.       |
+| cfg.curctx           | The ADOPTING pane's current tab. Used as the           |
+|                      | attribution target. THIS is the wrong part.            |
+| g_selctxcount[]      | Receives the credit and has no way to know it is wrong.|
+| redraw()             | Faithfully tints whatever the tally says.              |
+| (src/nnn.c:9800)     |                                                        |
++----------------------+--------------------------------------------------------+
+```
+
+`cb5b9db4` fixed exactly this by **zeroing** the tally on both adopt paths
+instead of crediting the current context, plus attributing an `E` edit to the
+current context only when the buffer had not been adopted. That removed the
+false claim. It also set up the next failure.
+
+### 9.5 Bug B mechanism -- zeroing on adopt discarded the pane's OWN attribution
+
+The shared file holds the **union** of what every instance selected. So when the
+right pane appends its 2 paths, the left pane's next poll adopts a 4-path list
+that **still contains the left pane's own 2 paths**. Zeroing on adopt threw away
+attribution that was still perfectly valid.
+
+```mermaid
+%% Bug B: zeroing on adopt wipes attribution the adopting pane still legitimately owns
+sequenceDiagram
+    autonumber
+    participant L as "Left pane (selected 2 on tab 1, now viewing tab 2)"
+    participant F as "Shared .selection file"
+    participant R as "Right pane (selects 2 on tab 2)"
+
+    Note over L: tab 1 correctly tinted: tally for tab 1 is 2
+    R->>F: writesel(): file now holds 4 paths<br/>(2 from left Downloads, 2 from right .dotfiles/bash)
+    Note over L: syncselfile() sees the change
+    F-->>L: pselbuf replaced with all 4 paths<br/>including the left pane's own 2
+    Note over L: FIRST FIX: zero the whole tally on adopt
+    L->>L: redraw(): every tally is 0, so no tab is tinted
+    Note over L: 'E' still lists all 4 files#59; tab 1's marker is gone
+```
+
+```
+ASCII Table 9.5: Components in the Bug B path
++----------------------+--------------------------------------------------------+
+| Component            | Role in the failure                                    |
++----------------------+--------------------------------------------------------+
+| Shared selpath       | Holds the UNION of both panes' selections, so an       |
+|                      | incoming list normally contains local paths too.       |
+| syncselfile()        | Replaces the whole buffer. Correct.                    |
+| The cb5b9db4 zeroing | Treats "the buffer was replaced" as "I own none of     |
+|                      | it". True for foreign paths, FALSE for the local ones. |
+| g_selctxcount[]      | Loses information it cannot reconstruct, because it    |
+|                      | never held path identities in the first place.         |
+| nselected            | Unaffected, which is why the status-bar count and 'E'  |
+|                      | kept showing all 4 files while no tab was tinted.      |
++----------------------+--------------------------------------------------------+
+```
+
+**The deeper cause, common to both bugs.** After a whole-buffer replace, the
+only sound question is "which of these incoming paths did I select, and where?".
+A running counter cannot answer it, so every possible repair is a guess:
+
+```
+ASCII Table 9.5b: Why every counter-based repair on adopt is wrong
++---------------------------+------------------------+-------------------------+
+| Repair on adopt           | Foreign paths          | Local paths in the list |
++---------------------------+------------------------+-------------------------+
+| Credit cfg.curctx         | WRONG (Bug A: tints a  | wrong tab if the pane   |
+|                           | tab that never chose   | moved since selecting   |
+|                           | them)                  |                         |
+| Zero the tally            | correct (no tab)       | WRONG (Bug B: loses a   |
+|                           |                        | valid marker)           |
+| Per-path ownership        | correct (no record ->  | correct (record ->      |
+| (the fix)                 | no tab)                | original tab)           |
++---------------------------+------------------------+-------------------------+
+```
+
+### 9.6 How both were diagnosed
+
+Both followed the same two-step pattern: confirm against the **live** instances
+first, then reproduce **deterministically** in isolation.
+
+```
+ASCII Table 9.6: Diagnosis steps
++-------+-------------------------------+----------------------------------------+
+| Bug   | Live confirmation             | Deterministic reproduction             |
++-------+-------------------------------+----------------------------------------+
+| A     | Both panes confirmed running  | In an ISOLATED tmux server: park the   |
+|       | with no NNN_SEL override, so  | right pane on tab 4, select 2 files on |
+|       | one shared file. The shared   | left tab 1, switch the right pane to   |
+|       | file confirmed to hold        | tab 1. The right pane's tab 4 then     |
+|       | exactly the 2 entries.        | renders with SGR 38;5;196 (red).       |
+| B     | The shared file confirmed to  | Same isolated server: the reported     |
+|       | hold 4 entries -- the first 2 | sequence (left tab 1 selects, left     |
+|       | from the left pane's          | switches to tab 2, right tab 2         |
+|       | Downloads, the last 2 from    | selects, right switches to tab 3)      |
+|       | the right pane's              | drops the left pane's tab 1 marker.    |
+|       | .dotfiles/bash.               |                                        |
++-------+-------------------------------+----------------------------------------+
+```
+
+The live-instance step mattered: it ruled out "the two panes are not actually
+sharing a file" and "the file does not contain what the user thinks", which are
+the two cheap explanations. Only after the file contents matched the report did
+the attribution logic become the suspect.
+
+### 9.7 Solution -- derived per-path ownership (`1bc07033`, the current design)
+
+Stop maintaining the tally incrementally. Record **which paths this instance
+selected and on which tab**, and rebuild the tally on demand by intersecting
+those records with the live `pselbuf`.
+
+```
+ASCII Table 9.7a: State (src/nnn.c:450-453)
++-----------------------------------+-------------------------------------------+
+| Declaration                       | Meaning                                   |
++-----------------------------------+-------------------------------------------+
+| uint16_t g_selctxcount[CTX_MAX]   | Per-context tally. DERIVED, never         |
+|                                   | incrementally maintained.                 |
+| char *g_selown                    | Records "<ctx byte><path>\0" for every    |
+|                                   | path THIS instance selected. Advisory: no |
+|                                   | file operation ever consumes it.          |
+| uint_t g_selownpos, g_selownlen   | Used length and allocated length.         |
+| bool g_selctxdirty                | The tally needs recomputing before read.  |
++-----------------------------------+-------------------------------------------+
+```
+
+```
+ASCII Table 9.7b: Helper functions
++-------------------------+---------+-------------------------------------------+
+| Function                | Line    | What it does                              |
++-------------------------+---------+-------------------------------------------+
+| selown_inbuf(path)      | 1882    | Is path currently present in pselbuf?     |
+| selown_del(path)        | 1899    | Forget any record for path, so a          |
+|                         |         | re-select MOVES attribution to the new    |
+|                         |         | context rather than duplicating it.       |
+| selown_add(path)        | 1924    | selown_del() first (dedup), then record   |
+|                         |         | "<cfg.curctx><path>" and mark dirty.      |
+|                         |         | On allocation failure it degrades quietly |
+|                         |         | to no-tint: the state is advisory, so it  |
+|                         |         | must never abort.                         |
+| selown_reset()          | 1946    | Drop all records and zero the tally.      |
+| selown_recompute()      | 1955    | Rebuild g_selctxcount by intersecting     |
+|                         |         | g_selown against the live pselbuf, and    |
+|                         |         | COMPACT g_selown by dropping records      |
+|                         |         | whose path is no longer selected (this is |
+|                         |         | what keeps g_selown bounded).             |
++-------------------------+---------+-------------------------------------------+
+```
+
+```
+ASCII Table 9.7c: Wiring
++--------------------------------+----------------------------------------------+
+| Site                           | Action                                       |
++--------------------------------+----------------------------------------------+
+| invertselbuf() 2nd pass (2283) | selown_add(): a path enters the selection    |
+| addtoselbuf() (2329)           | selown_add()                                 |
+| SEL_SEL toggle-on (10796)      | selown_add()                                 |
+| startselection() (2113)        | selown_reset(): a new round discards the old |
+|                                | records                                      |
+| clearselection() (2126)        | selown_reset()                               |
+| syncselfile() peer-cleared     | selown_reset(): nothing is selected anywhere |
+| branch (4869)                  | now                                          |
+| writesel() entry (1802)        | g_selctxdirty = TRUE. Every local selection  |
+|                                | change funnels through writesel(), so this   |
+|                                | one line covers them all generically.        |
+| readselfile() (2092) and       | Set g_selctxdirty themselves (they do not    |
+| syncselfile() adopt (4899)     | write) and deliberately KEEP g_selown.       |
+| redraw() (9794-9795)           | selown_recompute(), only when dirty.         |
++--------------------------------+----------------------------------------------+
+```
+
+```mermaid
+%% Lifecycle of the derived per-context tally
+flowchart TD
+    ADD["local select:<br/>invertselbuf / addtoselbuf / SEL_SEL toggle-on"] --> REC["selown_add(path):<br/>record ctx byte + path, mark dirty"]
+    REC --> W["writesel(): publish to selpath<br/>and mark dirty (covers every local change)"]
+    PEER["peer instance rewrites selpath"] --> SYNC["syncselfile(): swap the whole buffer,<br/>KEEP g_selown, mark dirty"]
+    ADOPT["'E' with nothing selected locally"] --> RSF["readselfile(): adopt,<br/>KEEP g_selown, mark dirty"]
+    W --> DIRTY{"g_selctxdirty"}
+    SYNC --> DIRTY
+    RSF --> DIRTY
+    DIRTY -->|"TRUE, at redraw()"| RC["selown_recompute():<br/>intersect g_selown with pselbuf,<br/>rebuild the tally, compact the records"]
+    DIRTY -->|"FALSE"| USE["tint the context bar from g_selctxcount"]
+    RC --> USE
+```
+
+```
+ASCII Table 9.7d: Nodes in the lifecycle diagram
++---------------------+---------------------------------------------------------+
+| Node                | Responsibility                                          |
++---------------------+---------------------------------------------------------+
+| selown_add()        | The ONLY place attribution is created. Records the      |
+|                     | current context together with the path.                 |
+| writesel()          | Generic invalidation point for every local change,      |
+|                     | including removals, because all of them write the file. |
+| syncselfile()       | Whole-buffer replace from a peer. Keeps ownership       |
+|                     | records; they are re-matched, not re-guessed.           |
+| readselfile()       | Same, for the 'E' adopt path.                           |
+| selown_recompute()  | Rebuilds the tally and compacts the record buffer.      |
+| redraw()            | The only reader. Recomputes lazily, only when dirty.    |
++---------------------+---------------------------------------------------------+
+```
+
+**Why removals need no handling.** There is no "remove" hook anywhere. A path
+that leaves the selection simply **stops matching** `selown_inbuf()` during the
+next recompute, so it contributes nothing to the tally and its record is dropped
+from `g_selown` in the same pass. All the paired increments and decrements that
+`e8ce68a7` had scattered next to every `nselected` mutation are gone.
+
+**Why the tally cannot drift.** It is never carried forward. Every read is
+preceded by a full rebuild from two sources of truth: `g_selown` (what this
+instance chose) and `pselbuf` (what is actually selected right now). A
+whole-buffer replace is therefore harmless -- it only sets a dirty flag. The
+approximation `e8ce68a7` had to document (removals debited to the current
+context rather than to the context that added the entry, self-healing only at
+the next full reset) no longer exists.
+
+**Why a foreign selection gets no tab.** A path that only ever existed in a
+peer's list matches no record in `g_selown`, so it is attributed to no context.
+`nselected` is untouched, so it still shows in the status-bar count and is still
+fully usable. That is exactly the behaviour Bug A asked for, now obtained
+without discarding local attribution (Bug B).
+
+### 9.8 Verification
+
+All checks below were run live in an **isolated tmux server**, not in the user's
+own panes, and the user's `~/.config/nnn/.selection` was not touched.
+
+```
+ASCII Table 9.8: Checks after 1bc07033
++-------------------------------------------+-----------------------------------+
+| Case                                      | Result                            |
++-------------------------------------------+-----------------------------------+
+| Left tab 1 selects, right pane then        | left tab 1 KEEPS its marker      |
+| selects into the shared list (Bug B repro) | (PASS)                           |
+| Right pane selects on one tab              | marks that tab and no other      |
+|                                            | (PASS)                           |
+| Adopted selection (nothing selected        | marks NO tab, still reported in  |
+| locally)                                   | the status-bar count (PASS)      |
+| Deselecting the entries                    | marker clears (PASS)             |
+| AddressSanitizer build driven through      | no reports                       |
+| select-all, invert, cross-tab selects,     |                                  |
+| mid-flight peer rewrites and peer clears   |                                  |
++-------------------------------------------+-----------------------------------+
+```
+
+Bug A's pre-fix reproduction (right pane parked on tab 4, left tab 1 selects 2
+files, right pane switches to tab 1, right tab 4 renders `SGR 38;5;196`) was
+also run in the same isolated server and is what pinned the attribution site.
+
+### 9.9 Lesson
+
+**Derived state beats incrementally-maintained state whenever something else can
+replace the underlying data wholesale.**
+
+An incremental counter is only correct while it sees **every** mutation. The
+cross-instance sync introduced a mutation it fundamentally could not see the
+details of: the entire buffer is swapped for a list produced by another process.
+At that instant a counter has to guess, and both available guesses (credit the
+current context, or zero everything) are wrong in a different case. Recording
+enough information to **re-derive** the answer -- here, one context byte per
+path -- turned an unfixable repair problem into a lazy recompute, removed every
+paired increment/decrement in the file, and eliminated a documented
+approximation at the same time.
+
+The cost is bounded and cheap because the derived state is **advisory**: it only
+drives a color, so it is allowed to degrade to "no tint" on an allocation
+failure instead of aborting, and its record buffer is compacted on every
+recompute.

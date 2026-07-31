@@ -170,7 +170,7 @@ Visit the [Tracker](https://github.com/jarun/nnn/issues/1546) thread for a list 
 
 # 🚀 Fork Enhancements
 
-This fork adds four major features on top of upstream nnn: **native Drag-and-Drop**, an **unlimited cross-instance directory history**, **session backup/restore and management**, and a **CWD guard** that protects against a subtle Unix shell trap. All are opt-in and designed to minimize merge friction with upstream — every C addition sits behind a build flag, so the default build stays byte-for-byte upstream.
+This fork adds five major features on top of upstream nnn: **native Drag-and-Drop**, an **unlimited cross-instance directory history**, **session backup/restore and management**, a **CWD guard** that protects against a subtle Unix shell trap, and a **shared selection across panes and tabs** (editable, live-synced, with a per-tab marker). The first four are designed to minimize merge friction with upstream: each is either behind a build flag or compiled in but inert until you set its env var, so a default build behaves like upstream. The shared-selection work is different: it is always compiled in **and** active by default (it changes how the selection file is read and written), and it is turned off at runtime with `NNN_NO_SELSYNC=1`.
 
 ---
 
@@ -495,6 +495,91 @@ The guard uses `stat -c '%d:%i'` inode comparison with `stat -L` on `$PWD` (syml
 
 ---
 
+## ◈ Shared Selection Across Panes and Tabs
+
+Two nnn instances that do not set their own `NNN_SEL` (the default in this fork's dual-pane setup) read and write the **same** selection file, `~/.config/nnn/.selection`. That sharing is deliberate: it is what makes "select on the left, paste on the right" work. Upstream never reads that file back into its own selection though: it only writes it, and at most dumps it read-only for you to look at. So each pane kept drifting away from the file it shares.
+
+This fork makes the shared file the **single source of truth**: it can be edited from either pane, changes propagate live, and each pane shows you which of *its own* tabs still holds files you selected.
+
+### Behavior Change Worth Knowing
+
+Both panes now share **one** selection, not two independent ones. Select 2 files on the left and 2 on the right, and both panes show **4** selected. Clearing from either pane clears it for both. If you want two genuinely independent selections, give each instance its own file (`NNN_SEL=/tmp/sel.left`, `NNN_SEL=/tmp/sel.right`). `NNN_NO_SELSYNC=1` is a weaker opt-out: it only stops a pane from picking up the file's changes, the panes still write the same file, so a selection made in one pane still replaces the file the other one wrote.
+
+### <kbd>E</kbd> Now Edits an External Selection
+
+Previously, pressing <kbd>E</kbd> in a pane that had nothing selected locally showed a **read-only dump** of whatever the other pane had selected: you could look at the list but not change it. Now that pane loads the on-disk selection into your editor and lets you edit it normally.
+
+Peek and commit are distinguished:
+
+| What you do in the editor | Result |
+|---------------------------|--------|
+| Save changes | The edited list is written out and becomes the selection for both panes, and this pane now holds it locally, so a paste, a delete or a drag from here acts on it. It does not light up a tab for files this pane never selected itself (see The Per-Tab Marker below). |
+| Quit without changing anything | Nothing happens. The adoption is rolled back, the shared file is left exactly as it was, and this pane goes back to having nothing selected. |
+
+So a peek has **no side effects**. Only a saved edit writes.
+
+### Live Sync Between Panes
+
+A selection change made in one pane shows up in the other within about a second, with **no keypress** in the receiving pane (the input loop already wakes on a 1-second timeout, so the poll happens while the pane sits idle). The check is one `stat(2)` per wake, so an unchanged file costs essentially nothing.
+
+The rule is simple: **the file is authoritative**. When the file's contents differ from what a pane holds in memory, the pane throws away its own copy and takes the file's. A pane never writes the file during a sync, only during a real selection action of yours. The two exceptions (the other pane quitting, and a half-finished operation in progress) are in the table below.
+
+**Sequence: a select in the right pane reaching the left pane**
+
+```mermaid
+sequenceDiagram
+    participant Right as Right pane
+    participant File as ~/.config/nnn/.selection
+    participant Left as Left pane
+    Right->>File: Space selects files#59; write temp file + rename(2)
+    Left->>File: idle poll (~1s): stat(2) shows new size/mtime
+    File-->>Left: read + validate every path
+    Left->>Left: replace local copy, redraw, keep own tab markers
+```
+
+Each pane polls the shared file while idle. The writer replaces the file atomically, the reader validates before adopting, and the reader re-derives its on-screen markers from the new list.
+
+### Safety
+
+| Situation | What happens |
+|-----------|--------------|
+| A pane writes the selection | Written to a sibling temp file and `rename(2)`d over the real one, so any reader (the other pane, `xargs`, a plugin) sees either the whole old list or the whole new one, never a half-written file. |
+| The other pane **quits** | Your selection is kept. nnn deletes the selection file on exit, and "file gone" is treated as "the peer left", not as "the selection was cleared". |
+| The other pane **clears** its selection | Your pane clears too. That is the shared selection actually being emptied, and it is distinguished from the case above. |
+| Something writes garbage to the file | Refused. Every entry must be a non-empty absolute path, and a short read is rejected outright rather than adopting a truncated path (a truncated absolute path is often still a valid path to a parent **directory**, which is exactly the kind of thing you do not want to hand to `rm` later). |
+| You are mid-operation (range select, a listing view, a drag, disk-usage mode) | The sync waits and retries, so nothing changes under a half-finished action. |
+
+### The Per-Tab Marker
+
+Each nnn instance has 8 contexts ("tabs", keys <kbd>1</kbd>-<kbd>8</kbd>, <kbd>Tab</kbd> to cycle). It is easy to select files on tab 1, move to tab 3, and forget. So **any tab other than the one you are on lights up (red, bold, underlined) when it holds files you selected**. No extra character is drawn, the digit itself just changes color, so the context bar keeps its exact width.
+
+The ownership rule is precise, and it is the part that took the most work to get right:
+
+| Case | Is the tab marked? |
+|------|--------------------|
+| You selected the files while on that tab, in **this** pane | Yes |
+| The files came from the **other** pane | No tab is marked here, but the files still count in this pane's status-bar selection total and are fully usable (paste, delete, edit with <kbd>E</kbd>) |
+| The tab you are currently sitting on | No. You can already see its selection in the listing. |
+| You selected on tab 1, then the other pane adds more files | Tab 1 stays marked. The other pane adding to the shared list does not erase what you selected. |
+| You re-select the same file while on a different tab | The marker moves to the new tab. |
+| You deselect the files, or clear the selection | The marker goes away. |
+
+In short: the marker answers "**which of my tabs did I select these on**", and it never guesses. Files with no local answer simply mark nothing.
+
+### Keys and Toggles
+
+| Key / Variable | Effect |
+|----------------|--------|
+| <kbd>E</kbd> | Edit the selection in `$EDITOR`, including a selection made by the other pane. Quitting without saving changes nothing. |
+| `NNN_NO_SELSYNC=1` | Turn off cross-instance live sync for that instance. It keeps its own in-memory selection and only re-reads the file when you press <kbd>E</kbd> with nothing selected locally. Its own writes still land in the shared file. |
+| `NNN_SEL=<path>` | Give this instance a private selection file, so it shares nothing at all. |
+
+Live sync is also off in picker mode (`-p`), where nnn's output is the selection file.
+
+For the design notes behind the editable-selection change, see [docs/design/fix-edit-selection-implementation-plan.md](docs/design/fix-edit-selection-implementation-plan.md).
+
+---
+
 ## ◈ Build Scripts
 
 This fork provides two convenience build scripts in the project root that encode the preferred feature set.
@@ -588,6 +673,7 @@ The repo includes scripts for a dual-pane tmux layout (`start_dual_nnn.sh`) that
 - **Cross-pane directory history** — both panes record to the same `.dirhistory`; the `nnn-history` picker can jump to a directory visited by the other pane.
 - **Cross-pane DnD** — OSC-72 drag-out works inside tmux with `allow-passthrough on` (the outbound escapes reach kitty through tmux's DCS passthrough wrapper).
 - **Cross-pane context switching** — `ctx_switcher` (`Alt-w`) lists the contexts of *both* panes and switches to any of them.
+- **Shared live selection**: neither pane sets `NNN_SEL`, so both read and write `~/.config/nnn/.selection`. Select on the left, paste on the right. A change in one pane appears in the other within about a second with no keypress, <kbd>E</kbd> edits the shared list from either side, and each pane marks its own tabs that still hold a selection you made. See § Shared Selection Across Panes and Tabs.
 - **Workspace snapshots** — because each pane auto-saves its session on every `cd`, `nnn-sessions` (`;S`, <kbd>Ctrl</kbd>+<kbd>w</kbd>) captures `left` + `right` + `@` as **one** labelled unit and restores both panes together. See § Session Backup, Restore and Management.
 
 Since both panes auto-save to the *same* session names, the manager warns before letting one pane adopt the other's session (they would otherwise fight over the file).
@@ -606,6 +692,7 @@ A running log of real problems hit while using this nnn setup, with investigatio
 6. **Dropped file doesn't bring nnn to front** (pty cannot focus own window; BEL + kitten fallback)
 7. **Self-drop opened the `>>>` prompt** (bare `]` consumed by ncurses before OSC-72 parser)
 8. **"Too many open files" on fresh start** (exhausted `fs.inotify.max_user_instances`, not fd limit)
+9. **The per-tab selection marker pointed at the wrong tab** (two connected bugs: a pane first credited the *other* pane's selection to whatever tab it happened to be sitting on, then the fix for that made a pane lose its own still-valid markers as soon as the peer selected anything; both came from a running counter that held numbers with no record of *which* paths they referred to, and both went away by switching to a tally derived from per-path ownership)
 
 ---
 

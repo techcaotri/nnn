@@ -29,10 +29,12 @@
    - 3.3 Collaboration Diagram
    - 3.4 5W1H Analysis of the Main Classes
    - 3.5 Dynamic Behaviour (activity, sequence, state, flowchart)
+     - 3.5.14 Cross-Instance Selection Sharing and Per-Tab Ownership
    - 3.6 Keyboard and Input Event Handling (Deep Dive)
    - 3.7 Drag-and-Drop Subsystem (kitty OSC-72)
 4. Cross-Cutting Concerns
 5. Traceability to the Fork Features (Part I and Part II)
+Appendix A. Source Map (selected)
 
 ---
 
@@ -377,6 +379,19 @@ classDiagram
         +char* startpos
         +size_t len
     }
+    class selstamp["Selection File Stamp (g_selstamp)"] {
+        +dev_t dev
+        +ino_t ino
+        +off_t size
+        +time_t mtsec
+        +long mtnsec
+        +bool valid
+        +bool exists
+    }
+    class selown["Ownership Record (packed in g_selown)"] {
+        +char ctx (1 byte, 0..CTX_MAX-1)
+        +char path (NUL-terminated)
+    }
     class kv["Key-Value Pair (kv)"] {
         +int key
         +int off
@@ -408,6 +423,9 @@ classDiagram
     du_group "1" --> "1" entry : writes size back
     thread_data "1" ..> "1" du_task : consumed by worker
     kv ..> settings : NNN_BMS / NNN_ORDER maps
+    selstamp "1" ..> "1" selmark : poll token for the shared selpath (syncselfile)
+    selown "0..*" --> "1" context : attributes a selected path to a ctx
+    selown "0..*" ..> "1" selmark : intersected with pselbuf by selown_recompute()
 ```
 
 **Explanation.** The center of gravity is **`context`**: nnn keeps an array of 8
@@ -418,7 +436,12 @@ context swaps `cfg` in and out (`savecurctx`/`setcfg`). The **`entry`** array
 `pdents[]` is the transient *view model* rebuilt on every scan. **`session_header_t`**
 is purely a serialisation descriptor for persisting all 8 contexts. The
 disk-usage trio (`du_task`/`du_group`/`thread_data`) exists only while a
-`blkorder` scan is running.
+`blkorder` scan is running. The two selection-sharing types added by this fork
+sit beside `selmark`: **`g_selstamp`** is the `stat(2)` token that tells the
+cross-instance poll whether the shared selection file changed, and the packed
+**ownership record** (`<ctx byte><path>` inside `g_selown`) is what lets a path
+in the shared selection be attributed back to the context that selected it
+here. Both are detailed in 3.5.14.
 
 ### 3.2 Class/Struct Summary Table
 
@@ -435,6 +458,8 @@ ASCII Table 3.2: Summary of the core "classes" (structs)
 |                      |                   |          | model)                         |
 | session_header_t     | (stack, on save)  | per-op   | On-disk session layout header  |
 | selmark              | (stack)           | per-op   | A run inside the selection buf |
+| g_selstamp (anon)    | g_selstamp        | program  | stat(2) poll token for the     |
+|                      |                   |          | shared selpath (3.5.14.4)      |
 | kv                   | bookmark/plug/    | program  | Parsed key:value env maps      |
 |                      | order             |          |                                |
 | du_task              | du_tasks[]        | per-scan | Queued dir for the du pool     |
@@ -454,6 +479,13 @@ ASCII Table 3.2b: Key global buffers (implicit state)
 +------------------+----------------------------------------------------------+
 | pselbuf/selbufpos| In-memory NUL-separated selection buffer + write head    |
 | selpath          | Path of the on-disk selection file (NNN_SEL)             |
+| g_selsync        | TRUE when the shared-selection poll is enabled: not a    |
+|                  | picker, selpath set, NNN_NO_SELSYNC unset (3.5.14.4)     |
+| g_selctxcount[]  | Per-context tally of paths THIS instance selected.       |
+|                  | DERIVED, drives the tab-bar tint (3.5.14.6)              |
+| g_selown         | Packed "<ctx byte><path>\0" ownership records            |
+| g_selownpos/len  | Write head + allocated length of g_selown                |
+| g_selctxdirty    | g_selctxcount must be recomputed before it is read       |
 | curssn           | Active session name ("" = none) -- Part I guard          |
 | cp / mv          | The cp/mv command strings -- Part II chokepoint via opstr|
 | g_buf / g_tmpfpath| Scratch command/temp-path buffers                       |
@@ -599,6 +631,14 @@ ASCII Table 3.4.5: 5W1H -- Selection subsystem
 |       | subtlety the Part II cpmv helper must handle when parsing.          |
 +-------+----------------------------------------------------------------------+
 ```
+
+The table above describes the single-owner case. When two instances share one
+`selpath` (the default dual-pane setup, since `NNN_SEL` is unset), the "Who"
+and "When" rows are no longer complete: the file gains a second writer, and the
+in-memory copy has to be re-read rather than assumed current. That is the
+subject of **3.5.14**, which also covers the derived per-tab ownership state
+(`g_selown`) that the context bar renders. The `Where` line numbers in this
+table are from the `ecf6d9a8` baseline; the current ones are in Appendix A.
 
 #### 3.4.6 Process Service (`spawn` / `xfork` / `join`)
 
@@ -1628,6 +1668,659 @@ no-op. The cycle therefore **excludes** the active window (and `hidden`, which i
 `alt-h`'s job) and ends on `$PREVIEW_WIN`, so every press changes something and
 the cycle returns to the configured default.
 
+#### 3.5.14 Cross-Instance Selection Sharing and Per-Tab Ownership
+
+`Fact`: line numbers in this subsection were read from the fork `HEAD`
+([src/nnn.c](../src/nnn.c), 12,448 lines), not from the `ecf6d9a8` baseline
+quoted in the document header. Where the two disagree, this subsection is the
+current one.
+
+**The setup this subsection is designed for.** Two nnn instances run side by
+side in tmux (`nnn_left` / `nnn_right`, started by `~/bin/start_dual_nnn.sh`).
+Neither exports `NNN_SEL`, so `setup_config()` builds the same default
+`selpath` in both ([src/nnn.c:11809-11821](../src/nnn.c#L11809)):
+`~/.config/nnn/.selection`. That sharing is deliberate. It is what makes
+"select in the left pane, paste in the right pane" work at all, because every
+consumer of a selection (`cpmvrm_selection`, archive, the plugins) reads the
+same file. On top of that, each instance independently owns 8 contexts
+("tabs", keys `1`-`8`, `Tab` to cycle).
+
+Upstream nnn assumes a single owner of the selection file. Three consequences
+follow from breaking that assumption, and this fork answers all three.
+
+```
+ASCII Table 3.5.14a: What breaks when selpath is shared, and what shipped
++-----------------------------+--------------------------------------------+
+| Problem                     | Shipped answer                             |
++-----------------------------+--------------------------------------------+
+| An external reader (xargs,  | writesel() publishes by rename(2) over a   |
+| a plugin) can observe a     | sibling temp file, so a reader sees either |
+| half-written selpath.       | the whole old file or the whole new one.   |
+| A pane with nothing         | readselfile() adopts the on-disk list into |
+| selected can only VIEW the  | pselbuf on 'E', with a peek-vs-commit rule |
+| other pane's selection.     | so merely looking has no side effects.     |
+| A pane that already owns a  | syncselfile() polls selpath with one       |
+| selection never re-reads    | stat(2) at the top of browse() and         |
+| selpath, so a peer's change | replaces the local copy when the file no   |
+| stays invisible forever.    | longer matches. It never WRITES selpath.   |
++-----------------------------+--------------------------------------------+
+```
+
+A fourth, purely cosmetic feature rides on the same state: contexts other than
+the current one are tinted in the context bar when they still hold a selection
+*this instance* made, so a selection left behind on another tab is not
+forgotten. Getting that attribution right across a shared file is what forced
+the ownership model in 3.5.14.6.
+
+##### 3.5.14.1 Two storage locations, two byte formats
+
+The selection lives in two places at once, and they do **not** use the same
+byte format. Almost every bug in this area traces back to that difference.
+
+```
+ASCII Table 3.5.14b: The two selection stores
++---------------+----------------------------+-----------------------------+
+| Property      | In memory (per process)    | On disk (shared)            |
++---------------+----------------------------+-----------------------------+
+| Where         | pselbuf / selbufpos /      | selpath, default            |
+|               | selbuflen / nselected      | ~/.config/nnn/.selection    |
+|               | (src/nnn.c:481, 459, 449)  | (built in setup_config())   |
+| Scope         | Private to one nnn process | Shared by every instance    |
+|               |                            | that does not set NNN_SEL   |
+| Format        | Every path NUL-TERMINATED  | NUL-SEPARATED, NO trailing  |
+|               |                            | NUL                         |
+| N paths give  | N NULs, so selbufpos ==    | N-1 NULs                    |
+|               | sum(len_i) + N             |                             |
+| Written by    | appendfpath() (1841)       | writesel() (1792), always   |
+|               | via selbufrealloc() (1853) | called with selbufpos - 1   |
++---------------+----------------------------+-----------------------------+
+```
+
+The `selbufpos - 1` at every `writesel()` call site is exactly what drops the
+final NUL, which is why the file has one fewer separator than the buffer has
+terminators.
+
+`Risk`: the on-disk format is not universally honoured by other writers.
+
+- [plugins/dragdrop:46](../plugins/dragdrop#L46) appends with
+  `printf '%s\0' "$@"`, so it emits a NUL after *every* path, including the
+  last. Its output therefore has a trailing NUL that `writesel()` never writes.
+- `main()` in picker mode writes `selpath` directly
+  ([src/nnn.c:12404](../src/nnn.c#L12404)) through `seltofile()`, bypassing
+  `writesel()` entirely, and uses `O_TRUNC` in place with no rename.
+
+Both readers in this subsystem normalise for that: `readselfile()` and
+`loadselfile()` each append a NUL only when the last byte is not already one.
+
+##### 3.5.14.2 Publishing atomically: `writesel()` and `rename(2)`
+
+`writesel()` ([src/nnn.c:1792](../src/nnn.c#L1792)) is the single place a local
+selection reaches disk. It now publishes instead of overwriting.
+
+1. Set `g_selctxdirty = TRUE` (line 1802). This is unconditional and happens
+   before the `!selpath` early return, so *every* local selection change
+   invalidates the derived per-tab tally (3.5.14.6) with no per-call-site
+   bookkeeping.
+2. Build a sibling temp name `"<selpath>.XXXXXX"` and `mkstemp()` it.
+3. Write the whole buffer, `close()`, then `rename(tmp, selpath)`. A rename
+   within one directory is atomic and needs no lock, so a concurrent reader
+   sees either the entire previous file or the entire new one.
+4. On any failure after `mkstemp()` succeeded: `unlink(tmp)`, `printwarn()`,
+   return. No partial file is left behind under `selpath`.
+5. If `mkstemp()` itself fails (for example an unwritable `selpath`
+   directory), fall back to the original in-place
+   `open(O_CREAT | O_WRONLY | O_TRUNC)` write, so behaviour never regresses
+   relative to upstream.
+
+`Decision`: the fallback is kept rather than failing hard, because losing the
+ability to select at all on an odd filesystem is worse than losing atomicity
+there.
+
+##### 3.5.14.3 Adopting on `E`: `readselfile()` and the peek-vs-commit rule
+
+`readselfile()` ([src/nnn.c:2060](../src/nnn.c#L2060)) is the inverse of
+`writesel()`. It loads `selpath` into `pselbuf` so an externally-made selection
+becomes locally editable. The function itself has no emptiness guard; its only
+call site, `editselection()`, invokes it only when the local buffer is empty
+(`if (!allowemptysel && !selbufpos)`, [src/nnn.c:2453](../src/nnn.c#L2453)).
+
+Steps, in order:
+
+1. Bail out if there is no `selpath`, no file, or the file is empty.
+2. `selbufpos = 0`, then `selbufrealloc(st_size + 1)` to make room for the
+   NUL that the on-disk format omits.
+3. `read()` once and compare: `if (count != sb.st_size) return FALSE;`
+4. Append a NUL if the last byte is not one (tolerating `dragdrop`).
+5. Recount `nselected` by counting NULs. Return `nselected > 0`.
+
+`Risk` (and the reason for step 3): a torn read of an absolute path usually
+still *looks* like a valid path, because truncating `/home/me/Downloads/a.iso`
+yields `/home/me/Downloads`, an existing **directory**. That truncated path
+would then be written back to the shared file on the next save and later handed
+to `rm` or `mv`. An explicit short-read refusal is the only cheap defence, so
+the function refuses rather than adopting anything it is not sure it read
+whole.
+
+**The peek-vs-commit rule.** `editselection()`
+([src/nnn.c:2444](../src/nnn.c#L2444)) tracks a local `bool adopted`. When
+nothing is selected locally it calls `readselfile()`; on success it sets
+`adopted = TRUE`, and only on failure does it fall through to the read-only
+`listselfile()` dump ([src/nnn.c:2038](../src/nnn.c#L2038), the
+`tr '\0' '\n' < selpath` view). After `$EDITOR` exits, the saved `mtime` says
+whether the user actually changed anything.
+
+```mermaid
+%% Sequence: pressing 'E' on a selection this pane does not own
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant E as editselection()
+    participant R as readselfile()
+    participant Buf as Local buffer (pselbuf)
+    participant F as Shared selpath
+    participant Ed as $EDITOR
+
+    U->>E: press 'E' (nothing selected locally)
+    E->>R: adopt the on-disk list
+    R->>F: stat + single read + short-read check
+    F-->>R: NUL-separated paths
+    R->>Buf: NUL-terminated copy, nselected recounted
+    E->>Ed: spawn on a temp file (mtime saved first)
+    alt editor exits WITHOUT saving (a peek)
+        Ed-->>E: mtime unchanged
+        E->>Buf: revert by hand#59; selbufpos = 0, nselected = 0
+        Note over E,F: NO clearselection() and NO writesel()#59;<br/>the shared file is left exactly as found
+    else editor saved a real edit (a commit)
+        Ed-->>E: mtime changed, list can only have shrunk
+        E->>Buf: reparse the pruned list
+        E->>F: writesel(pselbuf, selbufpos - 1)
+        Note over E,F: this pane now genuinely owns the selection
+    end
+```
+
+**Explanation.** The revert branch is deliberately hand-written
+([src/nnn.c:2509-2515](../src/nnn.c#L2509)) instead of calling
+`clearselection()`. `clearselection()`
+([src/nnn.c:2123](../src/nnn.c#L2123)) also calls `writesel(NULL, 0)`, which
+would truncate a shared file this instance never claimed, destroying the very
+selection the user only wanted to look at. So a peek has no side effects
+anywhere: `Q` does not dump it to stdout as a picker, a drag does not export
+it, the `-u` current-vs-selection prompt does not change. Once a real edit is
+saved, all of those become correct, because the pane genuinely owns the list.
+
+`Fact`: the commit branch needs no new guard. The pre-existing "an edit can
+only shrink" checks (`sb.st_size > selbufpos` and `lines > nselected`) work
+unchanged, because adoption restores the invariant they already assumed.
+
+##### 3.5.14.4 Live sync: `g_selstamp`, `loadselfile()`, `syncselfile()`
+
+Adoption on `E` only helps a pane with an empty buffer. A pane that already
+owns a selection never re-reads `selpath`, so clearing the selection from the
+right pane left the left pane showing a stale copy. `syncselfile()`
+([src/nnn.c:4806](../src/nnn.c#L4806)) closes that gap with a rule that is
+stated once and never bent: **the file is authoritative, the local copy is
+replaced when they differ, and this code never writes `selpath`.**
+
+```
+ASCII Table 3.5.14c: State owned by the live sync
++------------------+--------------------------------------------------------+
+| Symbol           | Role                                                   |
++------------------+--------------------------------------------------------+
+| g_selstamp       | Anonymous struct at src/nnn.c:4738-4746. Poll token:   |
+|                  | dev + ino + size + mtim.tv_sec + tv_nsec, plus 'valid' |
+|                  | (a previous observation exists) and 'exists' (selpath  |
+|                  | was there at that observation).                        |
+| g_selsync        | src/nnn.c:4748, set once in setup_config() at 11825:   |
+|                  | !g_state.picker && selpath && !getenv("NNN_NO_SELSYNC")|
+| loadselfile()    | src/nnn.c:4755. Reads selpath into a FRESH heap buffer |
+|                  | (never into pselbuf), normalises the trailing NUL and  |
+|                  | validates. Returns NULL on any problem.                |
+| syncselfile()    | src/nnn.c:4806. The poll, the defer set, the decision  |
+|                  | tree and the atomic swap. Returns TRUE iff local state |
+|                  | was replaced.                                          |
++------------------+--------------------------------------------------------+
+```
+
+**`loadselfile()` validates before anything is adopted.** It reads into its own
+`malloc()`ed buffer so that a rejection costs the caller nothing, refuses a
+short read, appends the missing trailing NUL, and then walks the buffer
+checking that every entry is non-empty and starts with `/`. Any violation frees
+the buffer and returns `NULL`. This is what stops a foreign or torn write from
+injecting a mangled path into a buffer that eventually feeds `rm`.
+
+```mermaid
+%% syncselfile(): the decision path from one stat(2) to an atomic swap
+flowchart TD
+    Enter["syncselfile() at the top of the browse() loop"] --> Off{"g_selsync<br/>and selpath?"}
+    Off -->|"no"| NoOp["return FALSE (opted out, or picker mode)"]
+    Off -->|"yes"| Stat["stat(selpath) -> exists = ok and S_ISREG"]
+    Stat --> Same{"matches g_selstamp?<br/>(exists, dev, ino, size,<br/>mtim sec + nsec)"}
+    Same -->|"yes"| NoOp2["return FALSE (the common case, one syscall)"]
+    Same -->|"no"| Defer{"rangesel or listpath<br/>or g_dnd_b64<br/>or cfg.blkorder?"}
+    Defer -->|"yes"| Retry["return FALSE WITHOUT recording the stamp<br/>so the next poll retries"]
+    Defer -->|"no"| Record["record the new stamp: the change is now consumed"]
+    Record --> Gone{"selpath still<br/>exists?"}
+    Gone -->|"no"| Keep["peer EXITED and unlinked it<br/>keep the local selection, return FALSE"]
+    Gone -->|"yes"| Empty{"st_size == 0?"}
+    Empty -->|"yes"| Cleared["peer CLEARED it: mirror clearselection()'s<br/>LOCAL effects only, selown_reset(), return TRUE"]
+    Empty -->|"no"| Load["loadselfile(): fresh buffer, short-read refusal,<br/>every entry non-empty and absolute"]
+    Load --> Bad{"returned NULL?"}
+    Bad -->|"yes"| Invalidate["g_selstamp.valid = FALSE<br/>(transient: retry next poll), return FALSE"]
+    Bad -->|"no"| Self{"same length and<br/>memcmp equal?"}
+    Self -->|"yes"| Mine["our own write coming back<br/>free and return FALSE"]
+    Self -->|"no"| Swap["atomic swap: pselbuf, selbufpos, nselected<br/>selmode = 1, findselpos = NULL, resetselind()<br/>g_selctxdirty = TRUE, KEEP g_selown, return TRUE"]
+```
+
+```
+ASCII Table 3.5.14d: Nodes in the syncselfile() decision path
++--------------+------------------------------------------------------------+
+| Node         | What it does and why                                       |
++--------------+------------------------------------------------------------+
+| Off          | g_selsync is FALSE in picker mode and when NNN_NO_SELSYNC  |
+|              | is set, so the whole feature costs nothing when opted out. |
+| Same         | The fast path. One stat(2) per loop iteration and no read  |
+|              | at all while nothing changes.                              |
+| Defer        | See ASCII Table 3.5.14e. Returning without recording the   |
+|              | stamp is the load-bearing detail: the change is DEFERRED,  |
+|              | not dropped.                                               |
+| Gone         | main() unlinks selpath at every non-picker exit            |
+|              | (src/nnn.c:12412, and printerr() at 1661). Treating "gone" |
+|              | as "cleared" would wipe the survivor's selection every     |
+|              | time the peer simply quit.                                 |
+| Empty        | A zero-length file is a real clear. It mirrors             |
+|              | clearselection()'s local effects only: resetselind(),      |
+|              | findselpos = NULL, selbufpos = 0, nselected = 0,           |
+|              | selown_reset(), selmode = 0. It never calls writesel().    |
+| Load         | Validation happens on a throwaway buffer, so a rejection   |
+|              | leaves caller state untouched.                             |
+| Bad          | Clearing g_selstamp.valid rather than keeping the newly    |
+|              | recorded stamp makes the failure retryable, which matters  |
+|              | when the read raced a peer's rename.                       |
+| Self         | Without this memcmp, the pane's own writesel() would come  |
+|              | back on the next poll as a "change" and force a pointless  |
+|              | full reload on every single selection keystroke.           |
+| Swap         | selmode = 1 is set so the pane's next Space APPENDS. See   |
+|              | the note below.                                            |
++--------------+------------------------------------------------------------+
+```
+
+```
+ASCII Table 3.5.14e: The defer set (src/nnn.c:4840)
++------------------+--------------------------------------------------------+
+| Condition        | Meaning                                                |
++------------------+--------------------------------------------------------+
+| g_state.rangesel | A range selection is half-finished. It spans the two   |
+|                  | SEL_SELMUL presses, and the browse()-local selstartid  |
+|                  | indexes pdents[] across that gap. This is the only     |
+|                  | condition the source justifies in detail.              |
+| listpath         | List mode (-l): the listing is a synthetic tree.       |
+| g_dnd_b64        | A drag is in flight and its base64 text/uri-list       |
+|                  | payload (src/nnn.c:3840) was built from the current    |
+|                  | selection.                                             |
+| cfg.blkorder     | du mode: a disk-usage scan is populating pdents[].     |
++------------------+--------------------------------------------------------+
+```
+
+`Assumption`: the source comment explains only `g_state.rangesel` at length.
+The other three are conservative guards over operations that hold in-flight
+state derived from the current buffer; the exact failure each one prevents is
+`Not verified`.
+
+**Why `g_state.selmode` is deliberately NOT in the defer set.**
+`startselection()` ([src/nnn.c:2108](../src/nnn.c#L2108)) sets
+`g_state.selmode` on the **first** `Space` and it stays set for the whole
+selection round. Gating the sync on it would permanently disable the sync in
+exactly the pane that owns a selection, which is the pane that most needs to
+see a peer's change. Only `g_state.rangesel` is genuinely transient, so only it
+is used.
+
+**Why the swap sets `g_state.selmode = 1`.** After adopting, the pane's
+selection round is conceptually already in progress. Without this, a pane
+sitting at `selmode == 0` would call `startselection()` on its next `Space`,
+and `startselection()` calls `writesel(NULL, 0)`, truncating the shared file
+and destroying whatever the peer had just selected.
+
+##### 3.5.14.5 The call site, and why it must force `SEL_REDRAW`
+
+```c
+/* src/nnn.c:10148, top of the browse() main loop */
+if (!presel && syncselfile())
+        presel = CONTROL('L');
+```
+
+`CONTROL('L')` is bound to `SEL_REDRAW` ([src/nnn.h:220](../src/nnn.h#L220)),
+which `browse()` handles by setting `refresh = TRUE` and re-entering the
+`begin:` path, so `populate()` and `dentfill()` run again. The `!presel` guard
+means the sync never clobbers a synthetic keystroke that some other handler has
+already queued (3.6.6).
+
+Forcing a full reload is **not** cosmetic. nnn keeps a *materialized view* of
+`pselbuf` in two places outside the buffer, and only a reload re-derives them.
+
+```
+ASCII Table 3.5.14f: The materialized view of pselbuf, and its only writers
++-------------------------+------------------------------------------------+
+| Derived state           | Rebuilt only by                                |
++-------------------------+------------------------------------------------+
+| pdents[i].flags bits    | dentfill() (src/nnn.c:8606) clears them on a   |
+| FILE_SELECTED /         | rescan#59; resetselind() (2101) can clear      |
+| FILE_SCANNED            | FILE_SELECTED but never re-derives it.         |
+| findselpos (src/nnn.c:  | scanselforpath() (2350). redraw() calls it at  |
+| 481), a raw char* INTO  | 9875 (showselsize() also does, at 9930). A     |
+| pselbuf                 | plain in-place swap would leave it dangling    |
+|                         | into a realloc'd buffer.                       |
++-------------------------+------------------------------------------------+
+```
+
+`syncselfile()` sets `findselpos = NULL` and calls `resetselind()` before
+returning `TRUE`, so the stale pointer and the stale flags are at least *safe*;
+the forced reload is what makes them *correct* again.
+
+##### 3.5.14.6 Derived per-tab ownership, and the tab tint
+
+The context bar tints a tab digit when a tab other than the current one still
+holds a selection this instance made. That requires answering a question a
+plain counter cannot answer: **how many currently-selected paths did I select
+while I was on context `i`?**
+
+```
+ASCII Table 3.5.14g: Ownership state (src/nnn.c:450-453)
++--------------------------+---------------------------------------------+
+| Symbol                   | Role                                        |
++--------------------------+---------------------------------------------+
+| g_selctxcount[CTX_MAX]   | uint16_t per-context tally. DERIVED: never  |
+|                          | incrementally maintained.                   |
+| g_selown                 | Packed records "<ctx byte><path>\0". What   |
+|                          | THIS instance selected, and where.          |
+| g_selownpos / g_selownlen| Write head and allocated length of g_selown.|
+| g_selctxdirty            | g_selctxcount must be recomputed before it  |
+|                          | is next read.                               |
++--------------------------+---------------------------------------------+
+```
+
+```
+ASCII Table 3.5.14h: Ownership helpers
++---------------------+------+----------------------------------------------+
+| Function            | Line | Behaviour                                    |
++---------------------+------+----------------------------------------------+
+| selown_inbuf()      | 1882 | Is this path currently in pselbuf?           |
+| selown_del()        | 1899 | Forget any record for a path, so a re-select |
+|                     |      | MOVES attribution to the new context.        |
+| selown_add()        | 1924 | selown_del() first (dedup), then append      |
+|                     |      | "<cfg.curctx><path>" and mark dirty.         |
+| selown_reset()      | 1946 | Drop all records and zero the tally.         |
+| selown_recompute()  | 1955 | Rebuild the tally by intersecting g_selown   |
+|                     |      | with the live pselbuf, and COMPACT g_selown  |
+|                     |      | by dropping records whose path is gone.      |
++---------------------+------+----------------------------------------------+
+```
+
+```mermaid
+%% How the per-tab tally is rebuilt (selown_recompute, called only when dirty)
+flowchart TD
+    Redraw["redraw() (src/nnn.c:9755)"] --> Dirty{"g_selctxdirty?"}
+    Dirty -->|"no"| Use["use g_selctxcount as-is"]
+    Dirty -->|"yes"| Reset["g_selctxdirty = FALSE<br/>memset g_selctxcount to 0"]
+    Reset --> Walk["walk g_selown record by record<br/>rlen = 1 + strlen(path) + 1"]
+    Walk --> InBuf{"selown_inbuf(path)?<br/>(is it still selected?)"}
+    InBuf -->|"yes"| Credit["++g_selctxcount[ctx] (if ctx < CTX_MAX)<br/>memmove the record down: KEEP it"]
+    InBuf -->|"no"| Drop["skip the record: it is dropped,<br/>which is what keeps g_selown bounded"]
+    Credit --> Next["next record"]
+    Drop --> Next
+    Next --> Walk
+    Walk --> Done["g_selownpos = compacted length"]
+    Done --> Bar["context-bar loop (src/nnn.c:9797-9813)"]
+    Bar --> Tint{"g_selctxcount[i]<br/>and i != cfg.curctx?"}
+    Tint -->|"yes"| Red["addch((i + '1') | COLOR_PAIR(C_UND) | A_BOLD | A_UNDERLINE)"]
+    Tint -->|"no"| Normal["addch with the usual per-context color pair"]
+```
+
+```
+ASCII Table 3.5.14i: Nodes in the tally rebuild
++-----------+------------------------------------------------------------------+
+| Node      | Detail                                                           |
++-----------+------------------------------------------------------------------+
+| Dirty     | The only read of g_selctxcount is the context bar, so the        |
+|           | recompute is lazy: it runs at most once per redraw, and only     |
+|           | after something actually changed.                                |
+| Walk      | Records are variable-length. The 1-byte context prefix means a   |
+|           | record is never confusable with a bare path.                     |
+| InBuf     | selown_inbuf() is a linear scan of pselbuf, so the recompute is  |
+|           | O(records x entries). Bounded in practice by the selection size, |
+|           | and it runs only on a dirty redraw.                              |
+| Drop      | Removals need NO explicit handling anywhere. A path that leaves  |
+|           | the selection simply stops matching here.                        |
+| Tint      | The branch sits AFTER the "context not active" branch, so an     |
+|           | inactive context is never tinted. No extra character is printed: |
+|           | the loop emits exactly 2 columns per context, and                |
+|           | MIN_DISPLAY_COL (CTX_MAX * 2, src/nnn.c:246) hardcodes that      |
+|           | budget for the path string printed right after it.               |
++-----------+------------------------------------------------------------------+
+```
+
+```
+ASCII Table 3.5.14j: Where ownership state is touched
++------------------------------+---------------------------------------------+
+| Site                         | Action                                      |
++------------------------------+---------------------------------------------+
+| invertselbuf() second pass   | selown_add(): a path enters the selection   |
+| (src/nnn.c:2283)             | locally.                                    |
+| addtoselbuf() (2329)         | selown_add(): same.                         |
+| SEL_SEL toggle-on (10796)    | selown_add(): same.                         |
+| startselection() (2113)      | selown_reset(): a new round discards the    |
+|                              | old records.                                |
+| clearselection() (2126)      | selown_reset().                             |
+| syncselfile() peer-cleared   | selown_reset(): nothing is selected         |
+| branch (4869)                | anywhere now.                               |
+| writesel() entry (1802)      | g_selctxdirty = TRUE. Covers EVERY local    |
+|                              | selection change generically.               |
+| readselfile() (2092) and     | g_selctxdirty = TRUE, and deliberately KEEP |
+| syncselfile() swap (4899)    | g_selown. These are the two adopt paths.    |
+| editselection() peek-revert  | g_selctxdirty = TRUE.                       |
+| (2513)                       |                                             |
+| redraw() (9794-9795)         | selown_recompute() when dirty.              |
++------------------------------+---------------------------------------------+
+```
+
+`Decision` on the color pair: `COLOR_PAIR(C_UND + 1)` was tried first, copying
+the `+ 1` offset convention used for icon coloring. On an icon-enabled build it
+collides with the icon color-pair table, which `initcurses()` seeds under
+`#ifdef ICONS_ENABLED` as `init_pair(C_UND + 1 + init_colors[i], ...)`
+([src/nnn.c:2761](../src/nnn.c#L2761)), and renders black on black.
+`COLOR_PAIR(C_UND)` (no offset) is the pair `init_fcolors()`
+([src/nnn.c:2634](../src/nnn.c#L2634)) actually assigns to `C_UND` in its
+`C_BLK .. C_UND` loop, and renders as a visible red.
+
+`Fact`: `g_selown` is advisory. It is never consumed by any file operation, so
+an allocation failure in `selown_add()` degrades to "no tint" rather than
+aborting ([src/nnn.c:1934-1937](../src/nnn.c#L1934)).
+
+##### 3.5.14.7 How the derived design was arrived at: two bugs, one root cause
+
+The tint originally kept a running counter, incremented and decremented next to
+every `nselected` mutation. Two failures in a row came from that single choice,
+and the second one only became visible after the first was fixed. Both are
+recorded here because the shape of the failure is the argument for the current
+design.
+
+```mermaid
+%% Sequence: bug A, an adopted selection credited to the wrong tab
+sequenceDiagram
+    autonumber
+    participant L as Left pane (on tab 1)
+    participant F as Shared selpath
+    participant R as Right pane (parked on tab 4)
+
+    L->>F: select 2 files on tab 1, writesel()
+    R->>F: syncselfile() sees the change
+    F-->>R: 2 paths adopted into pselbuf
+    Note over R: OLD behaviour: credit all 2 to cfg.curctx == tab 4
+    R->>R: user switches to tab 1
+    Note over R: tab 4 now renders red, but tab 4<br/>never selected anything
+```
+
+```mermaid
+%% Sequence: bug B, the mirror failure that zeroing on adopt created
+sequenceDiagram
+    autonumber
+    participant L as Left pane (selected on tab 1, now on tab 2)
+    participant F as Shared selpath
+    participant R as Right pane (selecting on tab 2)
+
+    Note over L: left tab 1 correctly renders red
+    R->>F: select 2 more files on its tab 2, writesel()
+    Note over F: the file now holds 4 paths:<br/>2 from the left pane, 2 from the right
+    F-->>L: syncselfile() adopts the merged 4-entry list
+    Note over L: FIRST-FIX behaviour: zero the tally on adopt
+    L->>L: left tab 1 loses its marker
+    Note over L: yet 'E' still shows all 4 files,<br/>including the left pane's own 2
+```
+
+```
+ASCII Table 3.5.14k: The two failures and what they proved
++--------+--------------------------------+-----------------------------------+
+| Bug    | Symptom                        | Root cause, and what it proved    |
++--------+--------------------------------+-----------------------------------+
+| A      | Only left tab 1 had 2 selected | Root cause: the adopt paths       |
+| cb5b9  | files (confirmed with 'E'), yet| credited the whole adopted list   |
+| db4    | RIGHT tab 4 rendered red.      | to cfg.curctx, the current tab of |
+|        | Reproduced deterministically:  | the ADOPTING instance. First fix: |
+|        | park right on tab 4, select 2  | zero the tally on adopt instead   |
+|        | on left tab 1, switch right to | of crediting the current context. |
+|        | tab 1 -> right tab 4 renders   | That is correct for foreign paths |
+|        | with SGR 38;5;196 (red).       | and wrong for local ones.         |
+| B      | Select 2 on left tab 1, switch | Root cause: zeroing on adopt threw|
+| 1bc07  | left to tab 2 (tab 1 red,      | away the left pane's OWN still-   |
+| 033    | correct). Then select 2 on     | valid attribution. Its 2 paths    |
+|        | right tab 2 and switch right   | were right there in the merged    |
+|        | to tab 3: LEFT tab 1 is no     | list, but the counter had no way  |
+|        | longer red, although 'E' still | to recognise them.                |
+|        | shows all 4 files selected.    |                                   |
++--------+--------------------------------+-----------------------------------+
+```
+
+The hash under each bug letter is the commit that **fixed** it, not the one that
+caused it: `cb5b9db4` for A (an intermediate fix, superseded the same day) and
+`1bc07033` for B (the design described in 3.5.14.6, which is current).
+
+**The deeper cause, and the reason both bugs happened.** A running counter
+holds only numbers, with no record of *which* paths they refer to. The
+cross-instance sync replaces the whole buffer at once, so after a swap it is
+impossible to tell which incoming paths this instance had already attributed to
+a context. Crediting the current context is wrong (bug A). Zeroing is also
+wrong (bug B). There is no third answer available to a counter, because the
+information needed to answer was never stored.
+
+Only per-path ownership can answer it, which is what `g_selown` and
+`selown_recompute()` introduced. With a derived tally:
+
+- a whole-buffer replace costs nothing but a dirty flag;
+- paths this instance selected keep their tab for as long as they stay
+  selected;
+- paths that only ever existed in a peer's list match no record and are
+  attributed to no tab;
+- the tally cannot drift, because it is never incrementally maintained.
+
+The earlier design's documented approximation, that removals were debited to
+the current context rather than to the context that added the entry, is gone,
+and so are all the paired increments and decrements it needed.
+
+```
+ASCII Table 3.5.14l: Counter design versus derived design
++----------------------+---------------------------+-------------------------+
+| Aspect               | Running counter (old)     | Derived tally (current) |
++----------------------+---------------------------+-------------------------+
+| Stored information   | 8 numbers                 | "<ctx><path>" per path  |
+| Cost per selection   | O(1) increment            | O(1) amortised append,  |
+| change               |                           | plus a dedup scan       |
+| Cost per redraw      | none                      | one recompute, only     |
+|                      |                           | when dirty              |
+| Removal handling     | explicit decrement at     | none: the path stops    |
+|                      | every removal site        | matching                |
+| Cross-instance swap  | unanswerable (both bugs)  | harmless: mark dirty    |
+| Drift                | possible, self-healed on  | impossible by           |
+|                      | the next full reset       | construction            |
++----------------------+---------------------------+-------------------------+
+```
+
+##### 3.5.14.8 Configuration, rejected alternatives, limits
+
+```
+ASCII Table 3.5.14m: Configuration surface
++--------------------+-------------------------------------------------------+
+| Knob               | Effect                                                |
++--------------------+-------------------------------------------------------+
+| NNN_SEL            | Per-instance selection file. Setting it to different  |
+|                    | values in the two panes opts out of SHARING: each     |
+|                    | file is single-owner again, so nothing in this        |
+|                    | subsection has a peer to observe. The code still      |
+|                    | runs (g_selsync only needs a selpath), it just never  |
+|                    | sees a foreign change.                                |
+| NNN_NO_SELSYNC=1   | Keeps the shared file but disables the live poll      |
+|                    | (g_selsync, src/nnn.c:11825). Adoption on 'E' and the |
+|                    | atomic write still apply.                             |
+| picker mode (-p)   | g_selsync is forced FALSE: a picker owns its output   |
+|                    | file and writes it directly at exit (12404).          |
++--------------------+-------------------------------------------------------+
+```
+
+`Decision`: terminal focus events were **rejected** as the sync trigger.
+Mode 1004 / tmux `focus-events` would fire exactly when a pane regains focus,
+which sounds ideal, but: nnn has no focus-event support to build on; it would
+require a tmux configuration change on the user's side; it silently does
+nothing on terminals that do not implement 1004; and `ESC[I` / `ESC[O` collide
+with nnn's Alt-key path (3.6.3), where a misparse *runs a plugin*. The poll was
+chosen instead because an unfocused pane receives no keystrokes anyway, so a
+poll at the top of `browse()` lands before the first key after focus returns,
+which is the behaviour that was actually wanted.
+
+```
+ASCII Table 3.5.14n: Known limits and risks
++----------+----------------------------------------------------------------+
+| Label    | Note                                                           |
++----------+----------------------------------------------------------------+
+| Risk     | The poll is per browse() iteration, so a pane blocked inside a |
+|          | modal sub-loop or a spawned child does not sync until it       |
+|          | returns to the loop.                                           |
+| Risk     | Two panes writing at the same instant both publish atomically, |
+|          | so no file is torn, but last-rename-wins: one pane's list can  |
+|          | replace the other's. The loser sees the winner's list on its   |
+|          | next poll, so nothing is silently half-applied.                |
+| Risk     | main() unlinks selpath at every non-picker exit (12412). The   |
+|          | ENOENT branch keeps the survivor's selection, but that also    |
+|          | means a deliberate external `rm` of selpath is treated as      |
+|          | "peer exited", not "cleared".                                  |
+| Fact     | g_selown is per process and never persisted, so the tab tint   |
+|          | does not survive restarting an instance even when the shared   |
+|          | selection does.                                                |
+| Open     | selown_inbuf() is a linear scan per record. No profiling was   |
+| question | done for very large selections.                                |
++----------+----------------------------------------------------------------+
+```
+
+**Verification actually performed** (from the commit records, reproduced here
+without re-running):
+
+- `0a921705`: adoption, peek-revert and the atomic write reviewed against the
+  plan in
+  [docs/design/fix-edit-selection-implementation-plan.md](design/fix-edit-selection-implementation-plan.md).
+- `4a45a97e`: verified against the reported repro plus the peer-exit,
+  garbage-input, trailing-NUL, self-churn and opt-out cases, and an
+  AddressSanitizer build driven through the swap, shrink, deselect and invert
+  paths reported nothing.
+- `cb5b9db4`: bug A reproduced deterministically in an isolated tmux server
+  before the fix.
+- `1bc07033`: left tab 1 keeps its marker when the right pane selects into the
+  shared list; the right pane marks the tab it selected on and no other; an
+  adopted selection marks nothing while still showing in the status-bar count;
+  deselecting clears the marker. An AddressSanitizer build driven through
+  select-all, invert, cross-tab selects, mid-flight peer rewrites and peer
+  clears reported nothing.
+
+`Not verified`: behaviour with three or more instances sharing one `selpath`,
+and behaviour when `selpath` lives on a network filesystem where `rename(2)`
+atomicity and `st_mtim` nanosecond resolution are weaker.
+
 ---
 
 ### 3.6 Keyboard and Input Event Handling (Deep Dive)
@@ -2606,6 +3299,23 @@ ASCII Table 5: How the fork features map onto this design
 |          |                            | bracketed-paste fallback in tmux) asking  |
 |          |                            | copy/move. nnn-dnd libX11 helper covers   |
 |          |                            | non-OSC-72 terminals. See Problems 2-7.   |
+| Cross-   | Selection (3.4.5, 3.5.14) +| selpath is shared when NNN_SEL is unset. |
+| pane sel | Browser Event Loop (3.4.8, | writesel() publishes by rename(2), so an |
+| sync     | 3.5.2)                     | external reader never sees a torn file.  |
+|          |                            | readselfile() adopts it on 'E' (a peek   |
+|          |                            | reverts, only a saved edit commits).     |
+|          |                            | syncselfile() polls it with one stat(2)  |
+|          |                            | at the loop top and swaps the local copy |
+|          |                            | in, forcing SEL_REDRAW. Never writes it. |
+|          |                            | Opt out: NNN_NO_SELSYNC=1.               |
+| Per-tab  | Renderer (3.5.10, context  | g_selown records the ctx that selected   |
+| sel tint | bar) + Selection (3.5.14.6)| each path here. selown_recompute()       |
+|          |                            | intersects it with pselbuf to derive     |
+|          |                            | g_selctxcount, so a tab other than the   |
+|          |                            | current one is tinted (C_UND, bold+      |
+|          |                            | underline) while it holds YOUR selection.|
+|          |                            | Derived, so a cross-instance whole-buffer|
+|          |                            | swap cannot misattribute it or drift.    |
 +----------+----------------------------+------------------------------------------+
 ```
 
@@ -2663,4 +3373,37 @@ ASCII Table A: Where to find each design element in the source
 | ']' -> SEL_PROMPT binding      | src/nnn.h:274                                 |
 | nnn-dnd libX11 helper          | src/nnn-dnd.c (built with O_DND=1)            |
 +--------------------------------+-----------------------------------------------+
+| CROSS-INSTANCE SELECTION       | see 3.5.14. Line numbers below were read      |
+| (3.5.14)                       | from HEAD, not from the ecf6d9a8 baseline     |
++--------------------------------+-----------------------------------------------+
+| Selection globals (ownership)  | 450-453 (g_selctxcount/g_selown/dirty)        |
+| pselbuf / selbufpos / nselected| 481 / 459 / 449                               |
+| writesel (atomic, rename(2))   | 1792                                          |
+| appendfpath / selbufrealloc    | 1841 / 1853                                   |
+| selown_inbuf / selown_del      | 1882 / 1899                                   |
+| selown_add / selown_reset      | 1924 / 1946                                   |
+| selown_recompute               | 1955                                          |
+| listselfile (read-only dump)   | 2038                                          |
+| readselfile (adopt on 'E')     | 2060                                          |
+| resetselind                    | 2101                                          |
+| startselection / clearselection| 2108 / 2123                                   |
+| invertselbuf / addtoselbuf     | 2178 / 2294                                   |
+| rmfromselbuf / scanselforpath  | 2338 / 2350                                   |
+| editselection (peek vs commit) | 2444 (revert branch 2509-2515)                |
+| g_selstamp / g_selsync         | 4738-4746 / 4748                              |
+| loadselfile / syncselfile      | 4755 / 4806                                   |
+| syncselfile defer set          | 4840                                          |
+| Tally recompute in redraw      | 9794-9795                                     |
+| Context-bar tint               | 9797-9813 (tint branch 9800-9806)             |
+| syncselfile call site (browse) | 10148                                         |
+| selown_add call sites          | 2283 / 2329 / 10796                           |
+| g_selsync init (setup_config)  | 11825                                         |
+| Picker writes selpath directly | 12404                                         |
+| main unlinks selpath on exit   | 12412 (also printerr 1661)                    |
++--------------------------------+-----------------------------------------------+
 ```
+
+`Fact`: the rows above the `CROSS-INSTANCE SELECTION` separator were mapped
+against the `ecf6d9a8` baseline named in the document header. The rows below it
+were read from the fork `HEAD` (`src/nnn.c`, 12,448 lines) while writing 3.5.14.
+The two sets are not interchangeable.
