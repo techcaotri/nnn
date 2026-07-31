@@ -1950,11 +1950,17 @@ static bool readselfile(void)
 	selbufpos = (uint_t)count;
 
 	nselected = 0;
+	/*
+	 * Leave g_selctxcount all-zero: these paths were selected in ANOTHER
+	 * instance, so no context of THIS instance owns them. Crediting the
+	 * current context would tint that tab as soon as the user moves off it,
+	 * claiming a selection the tab never made. nselected still drives the
+	 * status-bar count, so the selection remains visible.
+	 */
 	memset(g_selctxcount, 0, sizeof(g_selctxcount));
 	for (ssize_t i = 0; i < count; ++i)
 		if (pselbuf[i] == '\0')
 			++nselected;
-	g_selctxcount[cfg.curctx] = nselected; /* whole adopted selection attributed to "now" */
 
 	return (nselected > 0);
 }
@@ -2427,8 +2433,15 @@ static int editselection(bool allowemptysel)
 	}
 
 	nselected = lines;
+	/*
+	 * Attribute the edited list to this context only when it was already
+	 * this instance's own selection. An adopted list belongs to whichever
+	 * instance selected it; curating it here does not move ownership, and
+	 * crediting the current context would falsely tint this tab later.
+	 */
 	memset(g_selctxcount, 0, sizeof(g_selctxcount));
-	g_selctxcount[cfg.curctx] = lines;
+	if (!adopted)
+		g_selctxcount[cfg.curctx] = lines;
 	writesel(pselbuf, selbufpos - 1);
 
 	return 1;
@@ -4749,8 +4762,14 @@ static bool syncselfile(void)
 	memcpy(pselbuf, buf, len);
 	selbufpos = len;
 	nselected = count;
+	/*
+	 * All-zero, deliberately: this selection came from another instance, so
+	 * none of THIS instance's contexts selected it. Crediting the current
+	 * context would light that tab up the moment the user switches away,
+	 * pointing at a tab that never made the selection. The status-bar count
+	 * (nselected) still reports it.
+	 */
 	memset(g_selctxcount, 0, sizeof(g_selctxcount));
-	g_selctxcount[cfg.curctx] = count;
 	free(buf);
 
 	/*
