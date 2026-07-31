@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+clear
+
 . "$(dirname "$0")"/.nnn-plugin-helper
 
 # Plugin for nnn to list and switch between contexts across tmux panes
@@ -172,7 +174,7 @@ if [ "$LINES" -eq 0 ]; then
 fi
 
 # Use fzf for selection
-SELECTED=$(fzf --height=50% --layout=reverse --border \
+SELECTED=$(fzf --height=100% --layout=reverse --border \
 	--prompt="Select a pane and context to switch to: " \
 	--header="Available contexts (total: $LINES)" <"$TMPFILE")
 
