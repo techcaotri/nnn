@@ -215,7 +215,7 @@
 #define LIST_FILES_MAX  (1 << 14) /* Support listing 16K files */
 #define LIST_INPUT_MAX  ((size_t)LIST_FILES_MAX * PATH_MAX)
 #define SCROLLOFF       3 /* Leave top 2 lines */
-#define ONSCREEN        (xlines - 4) /* Leave top 2 and bottom 2 lines */
+#define ONSCREEN        (xlines - 5) /* Leave top 2 and bottom 3 lines */
 #define COLOR_256       256
 #define CREATE_NEW_KEY  (-1)
 #define SIZE_8KB        (8 * 1024) /* 8 KB in bytes */
@@ -927,6 +927,7 @@ static haiku_nm_h haiku_hnd;
 
 /* Function forward declarations */
 static void redraw(char *path);
+static void printfullname(void);
 static int spawn(char *command, char *arg1, char *arg2, char *arg3, ushort_t flag);
 static void move_cursor(int target, int ignore_scrolloff);
 static char *load_input(int fd, const char *path);
@@ -1621,7 +1622,7 @@ static void handle_key_resize(void)
 /* Clear the old prompt from the info line to the botton of the screen */
 static void clearoldprompt(void)
 {
-	move(xlines - 2, 0);
+	move(xlines - 3, 0);
 	clrtobot();
 	handle_key_resize();
 }
@@ -5098,17 +5099,19 @@ static void showfilterinfo(void)
 	int i = 0;
 	char info[REGEX_MAX] = "\0\0\0\0\0";
 
+	printfullname();
+
 	i = getorderstr(info);
 
 	if (cfg.fileinfo && ndents && get_output("file", "-b", pdents[cur].name, -1, FALSE))
-		mvaddstr(xlines - 2, 2, g_buf);
+		mvaddstr(xlines - 3, 2, g_buf);
 	else {
 		const char *mode = cfg.regex ? "reg" : (cfg.fuzzy ? "fzy" : "str");
 		snprintf(info + i, REGEX_MAX - i - 1, "  %s [/], %s [:]",
 			 mode, ((fnstrstr == &strcasestr) ? "ic" : "noic"));
 	}
 
-	mvaddstr(xlines - 2, xcols - xstrlen(info), info);
+	mvaddstr(xlines - 3, xcols - xstrlen(info), info);
 }
 
 static void showfilter(char *str)
@@ -5427,7 +5430,7 @@ static int filterentries(char *path, char *lastname)
 	}
 end:
 	/* Clear the info line after the down arrow */
-	move(xlines - 2, 2);
+	move(xlines - 3, 2);
 	clrtoeol();
 
 	/* Save last working filter in-filter */
@@ -6937,10 +6940,61 @@ static bool buffer_command_output(char * const cmds[], char *arg1, char *arg2, s
 }
 
 /*
+ * Hard-wrap every line in [content, content+content_len) to at most `width`
+ * bytes, inserting '\n' at each break, so a popup can show the whole thing
+ * instead of horizontally scrolling/truncating it. Returns a new NUL-
+ * terminated heap buffer the caller must free; NULL on allocation failure
+ * (caller should fall back to the original unwrapped buffer in that case).
+ */
+static char *wraplines(const char *content, size_t content_len, int width, size_t *out_len)
+{
+	if (width < 1)
+		width = 1;
+
+	/* Generous, easily-provable upper bound: every byte could end up on a
+	 * line of its own, each needing its own added '\n', plus a NUL.
+	 */
+	size_t cap = (content_len * 3) + 64;
+	char *out = malloc(cap);
+
+	if (!out)
+		return NULL;
+
+	size_t o = 0, linestart = 0;
+
+	for (size_t i = 0; i <= content_len; ++i) {
+		if (i != content_len && content[i] != '\n')
+			continue;
+
+		size_t linelen = i - linestart, p = 0;
+
+		do {
+			size_t chunk = MIN((size_t)width, linelen - p);
+
+			memcpy(out + o, content + linestart + p, chunk);
+			o += chunk;
+			p += chunk;
+			out[o++] = '\n';
+		} while (p < linelen);
+
+		linestart = i + 1;
+	}
+
+	out[o] = '\0';
+	*out_len = o;
+	return out;
+}
+
+/*
  * Shows the content of a buffer in a floating window.
  * Helps with navigating the entries in the directory.
+ * When `wrap` is set, every line is hard-wrapped to the window's content
+ * width up front instead of being horizontally scrolled/truncated -- used
+ * for file stat output, where the "File: <full path>" line can be much
+ * wider than the window.
  */
-static bool show_content_in_floating_window(char *content, size_t content_len, enum action *action, bool perfile)
+static bool show_content_in_floating_window(char *content, size_t content_len, enum action *action, bool perfile,
+					     bool wrap)
 {
 	/* Calculate window dimensions */
 	int win_height = MIN(20, xlines - 4);
@@ -6952,13 +7006,28 @@ static bool show_content_in_floating_window(char *content, size_t content_len, e
 	if (win_width < 20)
 		win_width = 20;
 
+	int max_display_width = win_width - 2; /* Account for border */
+	char *wrapped = NULL;
+
+	if (wrap) {
+		size_t wrapped_len;
+
+		wrapped = wraplines(content, content_len, max_display_width, &wrapped_len);
+		if (wrapped) {
+			content = wrapped;
+			content_len = wrapped_len;
+		}
+	}
+
 	int start_y = (xlines - win_height) / 2;
 	int start_x = (xcols - win_width) / 2;
 
 	/* Create floating window */
 	WINDOW *win = newwin(win_height, win_width, start_y, start_x);
-	if (!win)
+	if (!win) {
+		free(wrapped);
 		return FALSE;
+	}
 
 	keypad(win, TRUE); /* Enable special keys */
 
@@ -6973,7 +7042,6 @@ static bool show_content_in_floating_window(char *content, size_t content_len, e
 
 	/* Display content with scrolling */
 	int max_lines = win_height - 3; /* Account for border and help line */
-	int max_display_width = win_width - 2; /* Account for border */
 	int scroll_offset = 0;
 	int hscroll_offset = 0; /* Horizontal scroll offset */
 	int max_line_width = 0; /* Maximum line width in content */
@@ -7137,6 +7205,7 @@ static bool show_content_in_floating_window(char *content, size_t content_len, e
 	}
 
 	delwin(win);
+	free(wrapped);
 	refresh(); /* Refresh main screen */
 	return TRUE;
 }
@@ -7174,7 +7243,7 @@ static bool show_stats(char *pathbuf, char *dir)
 
 		action = SEL_MAX;
 
-		ret = show_content_in_floating_window(content, content_len, &action, TRUE);
+		ret = show_content_in_floating_window(content, content_len, &action, TRUE, TRUE);
 
 		free(content);
 		content = NULL;
@@ -7900,7 +7969,8 @@ static void run_cmd_as_plugin(const char *file, ushort_t flags, enum action *act
 		char * const cmds[] = { utils[UTIL_SH_EXEC], };
 
 		if (buffer_command_output(cmds, g_buf, NULL, ELEMENTS(cmds), &content, &content_len))
-			show_content_in_floating_window(content, content_len, action, strstr(g_buf, "$nnn") != NULL);
+			show_content_in_floating_window(content, content_len, action, strstr(g_buf, "$nnn") != NULL,
+							 FALSE);
 		free(content);
 	} else
 		spawn(utils[UTIL_SH_EXEC], g_buf, NULL, NULL, flags);
@@ -9312,6 +9382,24 @@ static bool set_time_type(int *presel)
 	return ret;
 }
 
+/*
+ * Print the current entry's full name (no path) on the middle line of the
+ * 3-line bottom status area. The per-entry name in the listing itself is
+ * truncated to the narrow per-pane column budget (icon + date + perms +
+ * size, halved again in a side-by-side tmux layout), so this line, which
+ * spans the full pane width with none of those competing columns, often
+ * shows a name the listing itself had to cut off.
+ */
+static void printfullname(void)
+{
+	move(xlines - 2, 0);
+	clrtoeol();
+	if (ndents) {
+		move(xlines - 2, 2);
+		addstr(pdents[cur].name);
+	}
+}
+
 static void statusbar(char *path)
 {
 	int i = 0, len = 0;
@@ -9319,6 +9407,7 @@ static void statusbar(char *path)
 	pEntry pent = &pdents[cur];
 
 	if (!ndents) {
+		printfullname(); /* clears the name line too, nothing to show */
 		printmsg("0/0");
 		return;
 	}
@@ -9336,8 +9425,10 @@ static void statusbar(char *path)
 
 	attron(COLOR_PAIR(cfg.curctx + 1));
 
+	printfullname();
+
 	if (cfg.fileinfo && get_output("file", "-b", pdents[cur].name, -1, FALSE))
-		mvaddstr(xlines - 2, 2, g_buf);
+		mvaddstr(xlines - 3, 2, g_buf);
 
 	tolastln();
 
@@ -9544,7 +9635,7 @@ static void preview_pane(const char *path)
 
 			char widthbuf[16], heightbuf[16];
 			snprintf(widthbuf, sizeof(widthbuf), "%d", previewwidth);
-			snprintf(heightbuf, sizeof(heightbuf), "%d", xlines - 2);
+			snprintf(heightbuf, sizeof(heightbuf), "%d", xlines - 3);
 
 			execlp(previewer, previewer, fpath,
 			       widthbuf, heightbuf,
@@ -9558,7 +9649,7 @@ static void preview_pane(const char *path)
 			if (fp) {
 				char line[PREVIEW_MAX_LINE];
 				int row = 1;
-				int maxrows = xlines - 2;
+				int maxrows = xlines - 3;
 
 				while (row < maxrows && fgets(line, sizeof(line), fp)) {
 					size_t len = xstrlen(line);
@@ -9611,7 +9702,7 @@ static void preview_pane(const char *path)
 		int count = 0;
 		struct dirent *dp;
 		char namebuf[PATH_MAX];
-		int maxlines = xlines - 4; /* Leave header and status lines */
+		int maxlines = xlines - 5; /* Leave header and status lines */
 
 		mvaddstr(1, PREVIEW_COL, "[directory]");
 
@@ -9664,7 +9755,7 @@ static void preview_pane(const char *path)
 
 		char line[PREVIEW_MAX_LINE];
 		int row = 1;
-		int maxrows = xlines - 2; /* Leave top and bottom lines */
+		int maxrows = xlines - 3; /* Leave top and bottom lines */
 
 		while (row < maxrows && fgets(line, sizeof(line), fp)) {
 			/* Strip trailing newline */
@@ -9894,7 +9985,7 @@ static void redraw(char *path)
 
 	/* Go to last entry */
 	if (onscreen < ndents) {
-		move(xlines - 2, 0);
+		move(xlines - 3, 0);
 #ifdef ICONS_ENABLED
 		addstr(ICON_ARROW_DOWN);
 #else
@@ -10226,8 +10317,8 @@ nochange:
 			}
 #endif
 
-			/* Toggle filter mode on left click on last 2 lines */
-			if (event.y >= xlines - 2 && event.bstate == BUTTON1_PRESSED) {
+			/* Toggle filter mode on left click on last 3 lines */
+			if (event.y >= xlines - 3 && event.bstate == BUTTON1_PRESSED) {
 				clearfilter();
 				cfg.filtermode ^= 1;
 				if (cfg.filtermode) {

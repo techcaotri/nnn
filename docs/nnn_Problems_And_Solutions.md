@@ -784,6 +784,98 @@ This is a common developer-machine condition (VS Code's docs recommend raising
 the same limit). It is unrelated to the DnD feature but blocked testing it, so
 it is recorded here.
 
+### 8.5 Recurrence -- 2026-07-31, and why 128 is too low on this machine
+
+The same failure hit again while live-testing the icon and status-bar fixes in
+Problems 10 and 11 below: a brand-new throwaway `nnn` instance exited
+immediately with `12364: Too many open files` (the line number matches
+[src/nnn.c:12364](../src/nnn.c#L12364), confirming the exact same
+`inotify_init1()` call as 8.2).
+
+**Fact:** a live count on this machine at the time of the recurrence:
+
+```sh
+cat /proc/sys/fs/inotify/max_user_instances   # 128
+find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | wc -l   # 178
+```
+
+178 live instances against a cap of 128. Per-process breakdown (instances,
+processes) for every command holding more than one:
+
+```
+ASCII Table 8.5: inotify instances by process, 2026-07-31
++------------------+-----------+-----------+
+| Command          | Instances | Processes |
++------------------+-----------+-----------+
+| code-insiders    |        53 |        37 |
+| claude           |        16 |         9 |
+| Typora           |         9 |         5 |
+| systemd          |         5 |         1 |
+| nvim             |         5 |         5 |
+| qlicense         |         4 |         4 |
+| pet              |         4 |         4 |
+| nnn              |         4 |         4 |
+| cpptools-srv2    |         4 |         4 |
+| cpptools         |         4 |         4 |
++------------------+-----------+-----------+
+(remaining ~40 commands hold 1-3 instances each)
+```
+
+**Root cause, restated precisely:** `128` is the Linux kernel default for
+`fs.inotify.max_user_instances`, set decades before editors, language
+servers, and AI-assistant CLIs each opened their own file watcher per
+window/workspace/session. One VS Code window alone (`code-insiders`, 37
+worker/extension-host processes) accounts for 53 instances -- over 40% of the
+default cap -- by itself, before any other app runs. On a desktop with an
+editor, a couple of `claude` sessions, a note app, and normal desktop
+services all open at once, exhausting 128 is the **expected**, not the
+exceptional, case. Every subsequent program that calls `inotify_init()` --
+`nnn` among them -- gets `EMFILE` and, for `nnn` specifically, cannot start
+at all (8.2).
+
+**Solution -- raise the cap, and raise it enough that this class of machine
+does not hit it again:**
+
+```sh
+# transient (until reboot), test the new value:
+sudo sysctl -w fs.inotify.max_user_instances=1024
+
+# persist across reboots:
+echo 'fs.inotify.max_user_instances=1024' | sudo tee /etc/sysctl.d/40-inotify.conf
+sudo sysctl --system   # reload without rebooting
+```
+
+`Assumption`: 1024 is a generous multiple of the observed 178-instance
+baseline (about 5.7x headroom) without approaching any practical resource
+concern -- each inotify instance is a small kernel object, not a per-watch
+cost. `1024` is also the value VS Code's own troubleshooting docs suggest
+when the *watch* limit is being raised, applied here to the (separate)
+*instance* limit for the same reason: normal multi-app desktop use grows
+faster than a decades-old default anticipated.
+
+While tuning it, also check the companion limit, which governs the number of
+individual paths watched (not the number of watcher handles), since it can
+be exhausted by the same class of apps for a different reason (usually a
+`git`-tracked repo with a very large working tree):
+
+```sh
+cat /proc/sys/fs/inotify/max_user_watches   # 524288 on this machine, already generous
+```
+
+`Fact`: `max_user_watches` was NOT the problem here (524288, far from
+exhausted) -- only `max_user_instances` was. Do not conflate the two when
+diagnosing a similar report; `find /proc/*/fd -lname "anon_inode:inotify" |
+wc -l` (used above) counts instances, not watches, and is the right first
+check when `nnn` (or anything else) fails to start with an `EMFILE`-flavored
+message.
+
+**Verification:** `Not verified end-to-end after raising the sysctl` in this
+session -- the recurrence was diagnosed and the fix identified, but the
+sysctl was not actually changed on the user's machine (a system-wide kernel
+tuning change, left for the user to apply and confirmed only by root cause
+and precedent from 8.2/8.3, not by re-running the failing command after the
+change).
+
 ---
 
 ## Problem 9 -- The tab-bar tint marked a tab that never made the selection, then stopped marking the one that did
@@ -1214,3 +1306,365 @@ The cost is bounded and cheap because the derived state is **advisory**: it only
 drives a color, so it is allowed to degrade to "no tint" on an allocation
 failure instead of aborting, and its record buffer is compacted on every
 recompute.
+
+---
+
+## Problem 10 -- Some file-type icons rendered as blank space, but only in one of the two dual-pane instances
+
+### 10.1 Symptom (as reported)
+
+> I'm using the `O_EMOJI=1` build flag but the nnn cannot show the icon for
+> some MIME types such as ELF binary and ASCII text files.
+
+Environment: kitty terminal, inside tmux (`start_dual_nnn.sh`'s left/right
+split). Follow-up reports as the investigation progressed:
+
+1. "I ran with `start_dual_nnn.sh` and the left pane could show the icon
+   correctly. However, the right pane just show blank icon."
+2. After a full restart of both panes: "the issue is still persisted."
+3. "I can see the issues on every directory and tabs of the right pane."
+
+Point 3 was the pivotal clue: not tied to one file, one extension, or one
+directory -- tied to **which of the two nnn processes** was drawing.
+
+### 10.2 Initial hypothesis (partly right, incomplete)
+
+`get_icon()` ([src/nnn.c:6144](../src/nnn.c#L6144)) only matches by exact
+filename or extension (`icons_name[]` / `icons_ext[]`, by design -- see the
+comment at [src/icons.h:198-207](../src/icons.h#L198)): no `file`/magic-byte
+sniffing, to keep directory listings cheap. Real ELF binaries and plain-text
+files usually carry **no extension at all**, so they fall through to the
+`ent->mode & 0100` check and land on `exec_icon` or `file_icon`.
+
+First theory: some of those fallback glyphs are built from a base codepoint
+plus Unicode's `U+FE0F` "variation selector 16" (VS16, forces emoji/color
+presentation on a character that defaults to narrow/monochrome "text"
+presentation), and some *lacked* VS16 entirely on a codepoint that needs it.
+Both look like plausible "sometimes no icon" bugs. This was tested and
+partly confirmed (10.5), but it could not explain the left/right split in
+report 1 -- a rendering bug tied to a Unicode property would hit both panes
+identically, since they share one physical terminal (one kitty
+`KITTY_WINDOW_ID`, confirmed via `/proc/<pid>/environ`).
+
+### 10.3 Investigation
+
+**Ruled out with direct evidence, in order:**
+
+```
+ASCII Table 10.3: what was ruled out, and how
++---------------------------------+---------------------------------------------------------+
+| Candidate cause                 | How it was ruled out                                     |
++---------------------------------+---------------------------------------------------------+
+| Font / terminal cannot render   | Both panes are one kitty window (same                   |
+| the glyph                       | KITTY_WINDOW_ID); a per-pane split cannot be a           |
+|                                  | font-rendering limit.                                    |
+| Environment differs between the | Full `diff` of /proc/<left-pid>/environ vs               |
+| two panes                       | /proc/<right-pid>/environ: identical except              |
+|                                  | TMUX_PANE and ATUIN_SESSION.                             |
+| Directory-content-dependent     | A brand-new nnn instance, same terminal, same            |
+| (some file in ~/bin triggers it)| directory (~/bin), rendered every icon correctly.         |
+| Session-restore state baked     | Copied the real ~/.config/nnn/sessions/{left,right}      |
+| into the "right" session file   | into a throwaway HOME and loaded them: rendered fine.     |
+| nnn's own string data corrupted | See 10.3.1 (gdb, /proc/<pid>/mem) -- bytes were intact.  |
+| in the broken process           |                                                            |
++---------------------------------+---------------------------------------------------------+
+```
+
+**10.3.1 Live forensics on the actual broken process (read-only, non-destructive)**
+
+With the user's real, currently-broken right-pane `nnn` process still
+running, `tmux capture-pane -p -e` (raw cell content plus SGR codes) on that
+exact pane showed the smoking gun at the byte level: for `nnn-dnd*` (no
+extension, executable, should get `exec_icon`), the row was
+
+```
+...34.6K [39m  [38;5;46m [39m [38;5;46mnnn-dnd[39m*
+```
+
+-- i.e. `attron(green)`, **one literal space**, `attroff`, not the expected
+gear glyph -- while an adjacent `.sh` file (extension-matched, unrelated code
+path) rendered its icon correctly in the **same** process. The color (green,
+`C_EXE`) was correct, so the row *was* being drawn; only the glyph bytes were
+missing.
+
+Two more checks nailed down that this was not an nnn bug:
+
+- **Address computation + `/proc/<pid>/mem` read.** Found `exec_icon`'s
+  string constant's file offset in the (unstripped) binary via a byte
+  search, mapped it through the ELF `LOAD` segment table (`readelf -l`) to a
+  vaddr, added the live ASLR base for that exact segment from
+  `/proc/<pid>/maps`, and read the resulting address directly out of the
+  **running, broken** process. Result: `e2 9a 99 ef b8 8f 20 00` -- the
+  exact, uncorrupted `"gear + VS16 + space"` bytes. The data was never wrong.
+- **`gdb -p <pid>` read-only attach, breakpoint on `waddnstr`** (the real
+  linked symbol behind the `addstr()` macro -- confirmed via
+  `objdump -T nnn | grep addstr` showing `waddnstr@NCURSESW6` /
+  `waddnwstr@NCURSESW6`), logging every string argument while forcing a
+  redraw (`tmux send-keys`). Confirmed nnn called `waddnstr()` with the
+  fully correct bytes for `LICENSE`'s icon (`"⚖️ "`, has VS16) on every
+  redraw, in the broken process, and that row still rendered blank on
+  screen -- while `Makefile`'s icon (`"🛠 "`, no VS16, a different codepoint
+  entirely) rendered correctly a few rows later in that **same** trace.
+  `detach` was used to release the process afterward with no state changed.
+
+### 10.4 Root cause
+
+`Fact`, established by the evidence above: nnn's code and data were correct
+in every observed case -- the right bytes reached the right ncurses call
+every time. The failure is in how that specific terminal/ncurses stack
+renders a base codepoint immediately followed by `U+FE0F` (VS16), and it is
+consistent **per process** rather than per file or per directory: two
+otherwise-identical `nnn` invocations (`-s left` vs `-s right`, differing
+only in that one argv string) can differ in whether this renders.
+
+`Assumption`: the exact mechanism inside ncursesw/kitty was not isolated
+further (that would need source-level debugging of ncursesw's wide-character
+cell composition or kitty's own font-fallback path, both out of scope for an
+nnn fix). `Decision`: rather than keep chasing a third-party rendering
+detail, remove the trigger from nnn's own icon table -- every icon can be a
+single codepoint that Unicode's own data says defaults to full-color
+presentation, so no variation selector is ever needed.
+
+### 10.5 Solution -- audit against Unicode's own data, replace every risky icon
+
+Downloaded the authoritative source directly from Unicode.org (the same file
+browsers and terminal emulators are expected to consult):
+
+```sh
+curl -s "https://www.unicode.org/Public/UCD/latest/ucd/emoji/emoji-data.txt" -o emoji-data.txt
+```
+
+`Emoji_Presentation=Yes` in that file means "renders full-color/full-width by
+default, no VS16 needed"; anything in the `Emoji=Yes` set but *absent* from
+`Emoji_Presentation` defaults to narrow/text presentation and needs VS16 to
+reliably render as an icon (exactly the class of codepoint the earlier
+`ICON_MAKEFILE`/`ICON_DOCUMENT`/arrow icons used, and exactly what the VS16
+sequences added on top of, in the icons that actually went blank).
+
+A small harness resolved every `ICON_*` macro to its literal `EMOJI`-column
+string (`gcc -E -P` on a synthetic file that `#define`s `EMOJI` and
+`ICONS_ENABLED` then references each macro name bare, so the preprocessor
+does the `ICON_STR(...)` resolution), then cross-referenced every codepoint
+in every icon against the parsed `Emoji_Presentation` set. It found 14
+definitions in [src/icons.h](../src/icons.h) either containing a literal
+`U+FE0F`, or built from a codepoint that needs one and never had it:
+
+```
+ASCII Table 10.5: every icon changed, old -> new (all new values are Emoji_Presentation=Yes, no VS16)
++---------------------+--------------------------+------------------------+----------------------------+
+| Macro                | Used for                | Old (unsafe)           | New (safe)                 |
++---------------------+--------------------------+------------------------+----------------------------+
+| ICON_DOCUMENT        | .txt, and via ICON_TEX  | spiral note pad, no    | U+1F4C4 page facing up     |
+|                      | .tex/.bib/.sty/.cls     | VS16 (text-default)    |                             |
+| ICON_LICENSE         | LICENSE (exact name)    | scales + VS16          | U+1F4D1 bookmark tabs      |
+| ICON_DATABASE        | .db extension           | card box + VS16        | U+1F4BE floppy disk        |
+| ICON_DESKTOP         | Desktop (exact name)    | desktop PC + VS16      | U+1F4BB personal computer  |
+| ICON_MAKEFILE        | Makefile, .cmake, .mk   | hammer+wrench, no VS16 | U+1F9F0 toolbox            |
+| ICON_PHOTOSHOP       | .psd, .psb              | paintbrush + VS16      | U+1F3A8 artist palette     |
+| ICON_PICTUREFILE     | .jpg/.png/.gif/... (ext)| framed picture + VS16  | U+1F4F7 camera             |
+| ICON_VIDEOFILE       | .mp4/.mkv/.avi/... (ext)| film frames, no VS16   | U+1F3A5 movie camera       |
+| ICON_EXT_NIX         | .nix extension          | snowflake + VS16       | U+1F9CA ice cube           |
+| ICON_ARROW_UP        | "more above" indicator  | up arrow, no VS16      | U+23EB double up triangle  |
+| ICON_ARROW_DOWN      | "more below" indicator  | down arrow, no VS16    | U+23EC double down tri.    |
+| ICON_ARROW_FORWARD   | defined, unused in code | right arrow, no VS16   | U+23E9 double right tri.   |
++---------------------+--------------------------+------------------------+----------------------------+
+ICON_EXEC and ICON_CHESS: see 10.6, kept a different resolution by request.
+```
+
+`.txt` -> `ICON_DOCUMENT` and no-extension executables -> `exec_icon` were
+exactly the two categories in the original report.
+
+Verified against the same authoritative data before landing: a second
+audit pass (identical harness) confirmed zero remaining icons contain
+`U+FE0F` and zero remaining icons resolve to a codepoint outside
+`Emoji_Presentation=Yes`, except the two explicit exceptions in 10.6.
+
+### 10.6 User-requested exceptions: keep gear and pawn
+
+The user asked, after seeing the safe replacements, to keep the gear icon
+for executables and the pawn icon for chess files specifically ("I insist"),
+despite both being exactly the VS16-needing class this fix removes
+everywhere else. Resolution: use the **bare base codepoint with no VS16
+suffix** (`U+2699` gear alone, `U+265F` pawn alone) instead of either the
+original VS16 form or an unrelated substitute glyph. This keeps the
+requested glyph while dropping the one sequence proven (10.3.1) to trigger
+the blank-render bug. Live-verified in a fresh instance in the same
+terminal: both render correctly, matching the `ICON_MAKEFILE`
+(no-VS16-needed-but-renders-fine-anyway) precedent observed during the gdb
+trace.
+
+### 10.7 Verification
+
+```sh
+./build.sh                          # clean build, only the pre-existing unused-fuzzyentrycmp warning
+```
+
+Live, in the exact terminal/tmux setup the bug was reported in:
+
+- Fresh instance on `~/bin` (the directory from the original report): every
+  extensionless executable/symlink icon (gear) rendered.
+- Synthetic `.fen`/`.pgn` files: pawn icon rendered.
+- Full second Unicode-data audit pass: 0 icons with `U+FE0F`, 0 icons
+  outside `Emoji_Presentation=Yes` other than the two named exceptions.
+
+Committed as commit `29686303` `fix(icons): stop using Unicode variation
+selectors in emoji icons` (includes the 10.6 exceptions, applied in the same
+session before the commit).
+
+### 10.8 Lesson
+
+A glyph that "should" need `U+FE0F` per the Unicode standard, and a glyph
+that already has it, are not equally safe in every terminal stack -- **this
+kitty + tmux + ncursesw combination silently drops the VS16 sequence in one
+of two otherwise-identical processes**, a failure mode invisible from
+reading nnn's source, invisible from checking environment variables, and
+invisible from testing a single fresh instance. It only became reproducible
+once the *comparison* (working pane vs broken pane, same terminal) was
+treated as the primary evidence rather than an afterthought. Once
+reproducible, `gdb` read-only attach plus a direct `/proc/<pid>/mem` read
+turned "maybe it's memory corruption" into a two-command disproof, which is
+what actually pointed the fix at the terminal-rendering layer instead of
+nnn's C code. The general takeaway for icon or symbol tables aimed at
+terminals: prefer codepoints Unicode itself marks `Emoji_Presentation=Yes`
+and skip variation selectors entirely wherever an equally suitable
+already-safe codepoint exists; they are not just "more portable in theory,"
+they route around a real, silent, process-dependent failure mode that is
+very expensive to diagnose after the fact.
+
+---
+
+## Problem 11 -- Long filenames get cut off in the narrow dual-pane column, with no way to see the full name or full path
+
+### 11.1 Symptom (as reported)
+
+> With dual pane of nnn inside TMUX, some file names are cut off on the
+> right.
+
+Each pane in `start_dual_nnn.sh`'s side-by-side layout is roughly half the
+terminal's columns; the listing further subtracts date, permissions, size,
+and icon columns (`adjust_cols()`, [src/nnn.c:9792](../src/nnn.c#L9792)),
+leaving a narrow budget for the name itself. A long filename is truncated at
+that budget with no indication of what the rest of it is. Pressing `f` (file
+stat, `SEL_STATS`) to check showed the same problem one level deeper: the
+popup's `File: <full path>` line was itself wider than the popup and got
+horizontally scrolled/truncated rather than shown in full.
+
+### 11.2 Requested solution (given directly by the user)
+
+1. Extend the bottom status area from 2 lines to 3, with the new middle line
+   showing the current entry's full name (no path).
+2. Make the `f` (file stat) popup wrap the full-path line instead of cutting
+   it off.
+
+### 11.3 Why the bottom status line is a good place for the full name
+
+The listing row's name budget is squeezed by icon + date + permission + size
+columns, and in a dual-pane layout the pane itself is already only ~half the
+terminal. The bottom status area spans the **full pane width** with none of
+those competing columns, so a name the listing had to cut off in a ~50-60
+column budget will frequently fit, in full, in a ~100+ column status line.
+
+### 11.4 Implementation -- 3-line status area
+
+`ONSCREEN` ([src/nnn.c:218](../src/nnn.c#L218)) changed from `xlines - 4`
+("leave top 2 and bottom 2 lines") to `xlines - 5` ("... bottom 3 lines").
+The two pre-existing bottom rows keep their relative roles, both shifted up
+by one to make room for a new row between them:
+
+```
+ASCII Table 11.4: the 3-line bottom status area (bottom-up)
++------------+---------------------------------------------------------------+
+| Row        | Content                                                        |
++------------+---------------------------------------------------------------+
+| xlines - 1 | Unchanged: index/selection/permissions/size/sort line          |
+|            | (tolastln(), also the filter/rename/prompt input line).       |
+| xlines - 2 | NEW: current entry's full name (no path), via                 |
+|            | printfullname() (src/nnn.c:9393).                              |
+| xlines - 3 | Unchanged content, shifted from xlines-2: file-mime info       |
+|            | (cfg.fileinfo) or sort/filter-mode indicator, or the "more     |
+|            | entries below" down-arrow.                                    |
++------------+---------------------------------------------------------------+
+```
+
+`printfullname()` is a small shared helper, forward-declared at
+[src/nnn.c:930](../src/nnn.c#L930) (needed because `showfilterinfo()` at
+line 5097, which also calls it, is defined earlier in the file than its
+primary caller `statusbar()` at line 9403). It clears the row and, if
+`ndents`, draws `pdents[cur].name`; called from both `statusbar()` (normal
+browsing) and `showfilterinfo()` (type-to-filter mode) so the line never
+goes stale in either state.
+
+Every other `xlines - 2` reference tied to the old 2-line convention moved
+to `xlines - 3` to keep sharing that row correctly with the new one:
+`clearoldprompt()` (1625), the filter-mode info line and its post-filter
+cleanup (5107/5114/5432), the "down arrow, more entries" indicator in
+`redraw()` (9988), the preview pane's row budgets for both the external
+`.npreview` plugin path and the built-in fallback previewer
+(9638/9652/9758), the built-in directory-preview line budget (`xlines - 4`
+-> `xlines - 5`, 9705), and the mouse-click boundary that toggles filter
+mode on a click in the bottom rows (10320, comment updated to "last 3
+lines"). The preview pane's vertical border loop
+([src/nnn.c:9606](../src/nnn.c#L9606)) needed no change: it is already
+expressed relative to the fixed bottom-most line (`xlines - 1`), not a
+"2-line status area" assumption, so it automatically continues to span
+through the new row.
+
+### 11.5 Implementation -- wrap the file-stat popup's full path
+
+`show_stats()` ([src/nnn.c:7217](../src/nnn.c#L7217)) builds its content by
+shelling out to `file`/`stat` and hands the combined output to
+`show_content_in_floating_window()` ([src/nnn.c:6996](../src/nnn.c#L6996)),
+a popup shared with one other caller (arbitrary plugin output via
+`run_cmd_as_plugin()`, `F_WINDOW` flag). That popup's original behavior for
+every line was **horizontal-scroll-and-truncate** (`<`/`>` indicators,
+`KEY_LEFT`/`KEY_RIGHT` to scroll) -- fine for preserving column-aligned
+plugin output, wrong for a single very long `File: <path>` line from `stat`.
+
+Added a `bool wrap` parameter. When set, a new helper,
+`wraplines()` ([src/nnn.c:6949](../src/nnn.c#L6949)), hard-wraps every line
+in the content buffer to the popup's content width (`win_width - 2`) **before**
+the existing line-count/rendering logic runs, by inserting `'\n'` at each
+`width`-byte boundary into a freshly allocated buffer (freed at the
+function's single exit point, alongside the existing `delwin(win)`). No
+other line in `show_content_in_floating_window()` needed to change: since
+every wrapped line is now `<= max_display_width` by construction, the
+existing "show horizontal-scroll indicators" condition
+(`max_line_width > max_display_width`) is simply never true anymore, so the
+now-pointless `<`/`>` indicators and `KEY_LEFT`/`KEY_RIGHT` handling degrade
+to silent no-ops without needing their own special case. Vertical scrolling
+(`KEY_UP`/`KEY_DOWN`/page keys) is unaffected -- it now scrolls through more,
+shorter lines.
+
+`show_stats()`'s call passes `wrap = TRUE`; the plugin-output call in
+`run_cmd_as_plugin()` ([src/nnn.c:7972](../src/nnn.c#L7972)) passes
+`wrap = FALSE`, deliberately preserving its existing horizontal-scroll
+behavior, since arbitrary plugin output (tables, source code, `ls -la`) can
+have meaningful column alignment that wrapping would break, and the user's
+request was specifically about file-stat's path line.
+
+### 11.6 Verification
+
+```sh
+./build.sh   # clean build, only the pre-existing unused-fuzzyentrycmp warning
+```
+
+Live, in a throwaway directory with a name-heavy nested path, resized to a
+realistic dual-pane width (105 columns):
+
+- Listing row: `📄 this-is-a-very-long-filename-that-should-definitely-get-`
+  `cut-off-in-a-` -- confirmed still truncated (unavoidable, fixed listing
+  column budget).
+- New middle status line, same moment: the full 104-character filename,
+  uncut.
+- `f` (file stat): the `File:` line, previously cut off mid-path, now wraps
+  across five lines inside the popup showing the complete absolute path with
+  no `<`/`>` indicators; scrolling down (`KEY_DOWN`) continued smoothly into
+  the unaffected `Size:`/`Device:`/`Inode:` lines below it.
+
+### 11.7 Note -- unrelated system-resource failure hit while testing
+
+While setting up throwaway verification instances for this fix, a fresh
+`nnn` process failed to start with `12364: Too many open files`. This is the
+same, pre-existing `fs.inotify.max_user_instances` exhaustion documented in
+Problem 8 -- unrelated to this change, recorded with fresh evidence and a
+stronger recommended fix in Problem 8, section 8.5.
