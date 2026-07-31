@@ -582,48 +582,77 @@ For the design notes behind the editable-selection change, see [docs/design/fix-
 
 ## ◈ Build Scripts
 
-This fork provides two convenience build scripts in the project root that encode the preferred feature set.
+This fork provides two convenience build scripts in the project root that encode the preferred feature set. Run `./build.sh` from the repo root to produce the full-featured `nnn` binary described throughout this README.
+
+> **Fact:** an earlier revision of `build.sh` carried three dead flags — `0_NERD=1` (digit `0`, not letter `O`), `O_PCRE=1` (the production `Makefile` names the variable `O_PCRE2`), and `O_CTX8=1` (removed from the production `Makefile`; 8 contexts is now unconditional, see `CTX_MAX` in `src/nnn.c`). `make` silently ignores unknown variables, so the binary built by that script never actually linked PCRE2 and never used Nerd Font icons — it only got emoji icons, POSIX regex, and (harmlessly) 8 contexts anyway. The script below is corrected and verified: `ldd nnn` now shows `libpcre2-8.so`.
 
 ### `build.sh` — Production Build
 
 ```sh
-make -j$((`nproc`-2)) 0_NERD=1 O_EMOJI=1 O_PCRE=1 O_CTX8=1 O_QSORT=1 \
-  O_SSN_ON_CD=1 O_SSN_PIPE=1 O_FZ_CPMV=1 O_HIST=1 O_DND=1 \
-  NNN_DND_OSC72=1 NNN_DND_DEBUG=1
+#!/usr/bin/env bash
+set -e
+
+make -j$(($(nproc) - 2)) \
+	O_EMOJI=1 \
+	O_PCRE2=1 \
+	O_QSORT=1 \
+	O_SSN_ON_CD=1 \
+	O_SSN_PIPE=1 \
+	O_FZ_CPMV=1 \
+	O_HIST=1 \
+	O_DND=1
 ```
 
 **What each flag enables:**
 
 | Flag | Feature | What it does |
 |------|---------|--------------|
-| `0_NERD=1` | Nerdfont icons | File-type icons using Nerd Font glyphs in the terminal. Requires a Nerd Font installed. Mutually exclusive with `O_ICONS` and `O_EMOJI`. |
-| `O_EMOJI=1` | Emoji icons | File-type icons using emoji characters. Mutually exclusive with `O_ICONS` and `O_NERD`. |
-| `O_PCRE=1` | PCRE regex | Links with PCRE2 for Perl-compatible regex in filters (`/` search). Without it, nnn uses POSIX regex (BRE/ERE). |
-| `O_CTX8=1` | 8 contexts | Enables all 8 contexts (tabs/workspaces). Without it, nnn uses 4 contexts. |
+| `O_EMOJI=1` | Emoji icons | File-type icons using emoji characters. Mutually exclusive with `O_ICONS` and `O_NERD` — swap to `O_NERD=1` instead if you want Nerd Font glyphs (requires a Nerd Font installed in your terminal). |
+| `O_PCRE2=1` | PCRE2 regex | Links with PCRE2 for Perl-compatible regex in filters (`/` search). Without it, nnn uses POSIX regex (BRE/ERE). |
 | `O_QSORT=1` | Quick sort | Uses Alexey Tourbin's optimized QSORT implementation for faster sorting of large directories. |
 | `O_SSN_ON_CD=1` | Session auto-save | Automatically saves the session on every directory change, so nnn always restores to the last state after a crash or restart. Also what makes the on-disk session a **live mirror**, which the session backups rely on. |
 | `O_SSN_PIPE=1` | Session load via pipe | Adds the `NNN_PIPE` op `<ctx>s<name>` → `load_session()`, so the `nnn-sessions` plugin can activate/restore a session at full fidelity (sort, filter, cursor, colors across all 8 contexts). Exports `NNN_SSN_PIPE=1` and `NNN_SESSION` for plugins. Without it the plugin degrades to a directory-only `cd`. See § Session Backup, Restore and Management. |
 | `O_FZ_CPMV=1` | FileZilla-style copy/move | Enables conflict-resolution prompts (overwrite/skip/rename) during copy/move via the `cpmv` plugin. |
 | `O_HIST=1` | Shared directory history | Enables the visit-recorder C hook — appends every directory change to the shared `.dirhistory` log used by the `nnn-history` plugin. See § Unlimited Cross-Instance Directory History. |
-| `O_DND=1` | Drag-and-drop helper | Builds the `nnn-dnd` XDND helper binary alongside nnn. Links `-lX11`. The `NNN_DND_OSC72=1` env var is separate and handled at runtime. |
+| `O_DND=1` | Drag-and-drop helper | Builds the `nnn-dnd` XDND helper binary alongside nnn. Links `-lX11`. |
+
+8 contexts (tabs) and the shared-selection feature need no flag — both are unconditional in this fork's `src/nnn.c` (`CTX_MAX 8`, and the selection-sync code described in § Shared Selection Across Panes and Tabs).
 
 **Additional parameters:**
-- `-j$((\`nproc\`-2))` — parallel build using all but 2 CPU cores (leaves headroom for the desktop).
-- `NNN_DND_OSC72=1` is **already compiled in** (always-on code path, no link dependency) — the env var at runtime gates whether the protocol is active; no rebuild needed to toggle it.
-- `NNN_DND_DEBUG=1` — enables the DnD debug log output (set to `1` for default path `/tmp/nnn-dnd.log`, or a custom path).
+- `-j$(($(nproc) - 2))` — parallel build using all but 2 CPU cores (leaves headroom for the desktop).
+- `set -e` — the script stops on the first failed command instead of silently continuing past a broken build.
+
+**Runtime environment variables (not build flags — no rebuild needed to change these):**
+
+| Variable | Purpose |
+|----------|---------|
+| `NNN_DND_OSC72=1` | Enables the kitty OSC-72 drag-and-drop protocol, which is **already compiled in** by every build (always-on code path, no link dependency). |
+| `NNN_DND_DEBUG=1` or `NNN_DND_DEBUG=/path/to/log` | Logs DnD debug output (default path `/tmp/nnn-dnd.log`, or a custom path). |
 
 **Prerequisites:**
 - **C compiler** (gcc/clang) with `-std=c11` support.
 - **libX11** (for `O_DND=1`): `libx11-dev` (Debian/Ubuntu) or `libX11-devel` (Fedora).
-- **libpcre2** (for `O_PCRE=1`): `libpcre2-dev` (Debian/Ubuntu) or `pcre2-devel` (Fedora).
+- **libpcre2** (for `O_PCRE2=1`, `build.sh`): `libpcre2-dev` (Debian/Ubuntu) or `pcre2-devel` (Fedora).
+- **libpcre** (for `O_PCRE=1`, `build_debug.sh` only — `Makefile_debug` links the legacy PCRE library, not PCRE2): `libpcre3-dev` (Debian/Ubuntu) or `pcre-devel` (Fedora).
 - **libreadline** (default, unless `O_NORL=1`): `libreadline-dev`.
-- **Nerd Font** (for `O_NERD=1`): e.g., `ttf-firacode-nerd` or `fonts-nerd-fonts`.
+- **Nerd Font** (for `O_NERD=1`, an alternative to `O_EMOJI=1`): e.g., `ttf-firacode-nerd` or `fonts-nerd-fonts`.
 
 ### `build_debug.sh` — Debug Build
 
 ```sh
-make -j$((`nproc`-2)) 0_NERD=1 O_EMOJI=1 O_PCRE=1 O_CTX8=1 O_QSORT=1 \
-  O_SSN_ON_CD=1 O_SSN_PIPE=1 O_FZ_CPMV=1 O_HIST=1 O_DEBUG=1 -f Makefile_debug
+#!/usr/bin/env bash
+set -e
+
+make -j$(($(nproc) - 2)) \
+	O_EMOJI=1 \
+	O_PCRE=1 \
+	O_QSORT=1 \
+	O_SSN_ON_CD=1 \
+	O_SSN_PIPE=1 \
+	O_FZ_CPMV=1 \
+	O_HIST=1 \
+	O_DEBUG=1 \
+	-f Makefile_debug
 ```
 
 **Differences from `build.sh`:**
@@ -631,9 +660,9 @@ make -j$((`nproc`-2)) 0_NERD=1 O_EMOJI=1 O_PCRE=1 O_CTX8=1 O_QSORT=1 \
 | Aspect | `build.sh` (production) | `build_debug.sh` (debug) |
 |--------|------------------------|--------------------------|
 | Makefile | `Makefile` | `Makefile_debug` |
+| Regex flag | `O_PCRE2=1` (PCRE2) | `O_PCRE=1` (legacy PCRE — `Makefile_debug` has not been renamed to match) |
 | `O_DEBUG` | not set | `O_DEBUG=1` → `-DDEBUG` + `-g3` |
-| `O_DND` | `=1` (builds nnn-dnd) | not set (DnD helper excluded) |
-| `NNN_DND_OSC72` | set at build time | not set (add at runtime if needed) |
+| `O_DND` | `=1` (builds nnn-dnd) | not set (DnD helper excluded — `Makefile_debug` has no `O_DND`) |
 | Binary size | stripped, optimized (`-O3`) | unstripped, debug symbols (`-g3`), with `-DDEBUG` preprocessor flag |
 | Use case | Everyday use, full features | gdb/valgrind debugging, core dumps, development |
 
