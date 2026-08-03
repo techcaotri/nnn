@@ -170,69 +170,69 @@ Visit the [Tracker](https://github.com/jarun/nnn/issues/1546) thread for a list 
 
 # 🚀 Fork Enhancements
 
-This fork adds five major features on top of upstream nnn: **native Drag-and-Drop**, an **unlimited cross-instance directory history**, **session backup/restore and management**, a **CWD guard** that protects against a subtle Unix shell trap, and a **shared selection across panes and tabs** (editable, live-synced, with a per-tab marker). The first four are designed to minimize merge friction with upstream: each is either behind a build flag or compiled in but inert until you set its env var, so a default build behaves like upstream. The shared-selection work is different: it is always compiled in **and** active by default (it changes how the selection file is read and written), and it is turned off at runtime with `NNN_NO_SELSYNC=1`.
+This fork adds five major features on top of upstream nnn: **Drag-and-Drop** (via `dragon` and the kitty OSC-72 protocol), an **unlimited cross-instance directory history**, **session backup/restore and management**, a **CWD guard** that protects against a subtle Unix shell trap, and a **shared selection across panes and tabs** (editable, live-synced, with a per-tab marker). The first four are designed to minimize merge friction with upstream: each is either behind a build flag or compiled in but inert until you set its env var, so a default build behaves like upstream. The shared-selection work is different: it is always compiled in **and** active by default (it changes how the selection file is read and written), and it is turned off at runtime with `NNN_NO_SELSYNC=1`.
 
 ---
 
-## ◈ Native Drag-and-Drop (DnD)
+## ◈ Drag-and-Drop (DnD)
 
-Drag files **OUT** of nnn into GUI apps (browsers, file managers, chat uploads, image editors), and drop files **IN** from GUI apps. A TUI owns no window, so drag-and-drop must be delegated. This fork provides **two complementary approaches**, automatically chosen at runtime.
+Drag files **OUT** of nnn into GUI apps (browsers, file managers, chat uploads, image editors), and drop files **IN** from GUI apps. A TUI owns no window, so drag-and-drop must be delegated.
+
+Two paths are supported, and they are **not** alternatives that get auto-selected — they are triggered by **different user actions** and you pick between them by *how you start the drag*:
+
+| Path | You trigger it with | What performs the drag |
+|------|---------------------|------------------------|
+| **dragon** — external GUI helper | the <kbd>D</kbd> key (or `;d`) | [`dragon`](https://github.com/mwh/dragon), a small GTK3 window |
+| **kitty OSC-72** — in-terminal protocol | a **mouse drag** directly on the pane | kitty itself, over escape codes |
+
+> **Decision (2026-08-03): `nnn-dnd` is retired.**
+> This fork used to ship `nnn-dnd`, a bundled libX11 XDND helper ([src/nnn-dnd.c](src/nnn-dnd.c)). It is **no longer the preferred path and is not installed**. The source stays in-tree and `build.sh` still passes `O_DND=1`, so the binary is still produced next to `nnn` — but because it is not on `$PATH`, both `getutil("nnn-dnd")` in [src/nnn.c](src/nnn.c) and the `type nnn-dnd` probe in [plugins/dragdrop](plugins/dragdrop) fail, and every <kbd>D</kbd> drag falls through to `dragon`. That fall-through **is** the supported configuration now. To make the retirement explicit you may drop `O_DND=1` from `build.sh`; nothing else changes.
 
 ### Why a TUI Cannot "Just Drag" by Itself
 
-Drag-and-drop on X11 (XDND) and Wayland (`wl_data_device`) is a window-to-window conversation — the X server delivers DnD messages to the window under the pointer. That window belongs to the **terminal emulator**, not to nnn. nnn is a pty-bound process, and everything it receives arrives as bytes through the pty with no drawing surface the display server can address. So every TUI delegates DnD to something that does own a window — either a small helper GUI process (Approach B) or the terminal emulator itself via escape codes (Approach D).
+Drag-and-drop on X11 (XDND) and Wayland (`wl_data_device`) is a window-to-window conversation — the display server delivers DnD messages to the window under the pointer. That window belongs to the **terminal emulator**, not to nnn. nnn is a pty-bound process: everything it receives arrives as bytes through the pty, and it has no drawing surface the display server can address. So a TUI must delegate DnD to something that *does* own a window — either a helper GUI process (`dragon`) or the terminal emulator itself via escape codes (OSC-72).
 
-### Key Binding
+### Path 1 — `dragon` (the <kbd>D</kbd> key)
 
-<kbd>D</kbd> — `SEL_DRAGDROP`: prompt for **(d)rag out** or **\(r)eceive** (drop in).
-
-### Approach B — `nnn-dnd`: Bundled Native XDND Helper (libX11)
-
-A small C helper ([src/nnn-dnd.c](src/nnn-dnd.c), ~900 lines) that implements the XDND protocol version 5 directly on **libX11** — no GTK/Qt dependency. It is a CLI-compatible drop-in replacement for `dragon`/`ripdrag`.
-
-**How it works:**
+<kbd>D</kbd> (`SEL_DRAGDROP`) prompts **drag out (d) / receive (r)**, then hands off to the [`dragdrop`](plugins/dragdrop) plugin, which opens a `dragon` window.
 
 | Direction | Flow |
 |-----------|------|
-| **Drag OUT** | nnn spawns `nnn-dnd` detached with the selection; the helper creates a small window, owns `XdndSelection`, and drives the XDND handshake (XdndEnter → XdndPosition → XdndDrop → serve `text/uri-list`). nnn never blocks. |
-| **Drop IN** | `nnn-dnd --target` creates an `XdndAware` window; on drop it parses the received `file://` URIs, prints plain paths, and the core (or plugin) appends them to `NNN_SEL` and shows them via `NNN_PIPE` list mode. |
+| **Drag OUT** | nnn sets `NNN_DND_MODE=drag` and runs the plugin, which launches `dragon` in the background with the selection (or, with nothing selected, the hovered file). A small GTK window appears; you drag **from that window** into the target app. nnn never blocks. |
+| **Drop IN** | nnn sets `NNN_DND_MODE=receive`; the plugin runs `dragon -x --print-path --target` in the **foreground**. Drag files from a GUI app onto that window; the received paths are appended to the selection and shown back in nnn as a fresh list via `$NNN_PIPE`. Web URLs are fetched with `curl` into the current directory. |
 
-**Build:** `make O_DND=1` — the default build is unchanged and links no new library. With `O_DND=1`, the Makefile also compiles `nnn-dnd` (links `-lX11` only — nnn itself gains no new dependency).
+**Helper resolution order** in [plugins/dragdrop](plugins/dragdrop) is `nnn-dnd` → `dragon-drag-and-drop` → `dragon-drop` → `dragon` → `ripdrag`. With `nnn-dnd` retired, `dragon` wins.
 
-**CLI (dragon-compatible subset):**
+**Notes and known rough edges:**
 
-| Flag | Meaning |
-|------|---------|
-| `(none) FILE...` | Source mode: offer files for dragging out |
-| `-t, --target` | Target mode: receive a drop, print paths to stdout |
-| `-x, --and-exit` | Exit after the first completed drag or drop |
-| `-a, --all` | Offer all files as a single combined drag |
-| `-p, --print-path` | Print plain paths instead of `file://` URIs |
-| `-T, --on-top` | Keep the helper window always on top |
-| `-I, --stdin` | Read file list from stdin (NUL or newline) |
+- The drag-out window for a **single hovered file** is spawned without `-x`, so it stays open until you close it. Repeated drags accumulate windows (`wmctrl -lx | grep -i dragon` to list them).
+- The **receive** branch truncates the shared selection file before listening, so a pending cross-pane selection is cleared when you press <kbd>D</kbd> <kbd>r</kbd>. See § Shared Selection Across Panes and Tabs.
+- `dragon` is GTK3 and needs `$DISPLAY` (or XWayland). It is unrelated to `NNN_DND_OSC72` and works whether or not that variable is set.
 
-**Wayland:** The helper works on most Wayland desktops via XWayland (the compositor bridges XDND to native Wayland). For pure-Wayland setups, it falls back to `ripdrag` (GTK4).
+### Path 2 — kitty OSC-72 Terminal Protocol (in-process, no helper)
 
-### Approach D — kitty OSC-72 Terminal Protocol (in-process, no helper)
+An in-process escape-code protocol. nnn writes OSC 72 sequences to the terminal, and **kitty** performs the real window-system drag on its behalf. **Zero helper, zero libX11, works over SSH and inside tmux.**
 
-An in-process escape-code protocol. nnn writes OSC 72 escape sequences to the terminal, and **kitty** (≥ 0.47.1) performs the real window-system drag on its behalf. **Zero helper, zero libX11, and it works over SSH and inside tmux.**
+> **There is no key binding for this path.** OSC-72 drag-out is started **only** by a mouse drag on the pane. Pressing <kbd>D</kbd> will *never* exercise it — <kbd>D</kbd> always goes to `dragon`. This is the single most common source of "OSC-72 doesn't work" reports; see § Troubleshooting Drag-and-Drop.
 
 **Protocol overview (drag-OUT direction):**
 
 ```
-EnableDrag (once at startup) → user mouse-drags on terminal
-→ kitty sends inbound OFFER → nnn answers agree + present + start
-→ kitty performs the OS drag
+EnableDrag (once at startup) -> user mouse-drags on the pane
+-> kitty sends an inbound OFFER (t=o) -> nnn answers agree + present + start
+-> kitty replies t=E;OK and performs the OS drag -> kitty reports t=e:x=4 when done
 ```
 
 The protocol is **mouse-gesture-driven and bidirectional**: nnn declares itself a drag source once; the **user's mouse gesture** triggers the drag; the terminal sends nnn an inbound offer that nnn must answer.
 
 **Prerequisites:**
 
-- **kitty ≥ 0.47.1** (Ghostty has accepted the protocol).
-- **Opt-in** via `NNN_DND_OSC72=1` (because enabling it changes the terminal's mouse-gesture handling).
-- Inside **tmux**: additionally requires `set -g allow-passthrough on` (tmux 3.3+).
-- **Debug mode:** `NNN_DND_DEBUG=/tmp/nnn-dnd.log` (or `=1` for the default log path) traces all inbound/outbound OSC-72 events to a file without corrupting the curses screen.
+- **kitty ≥ 0.47.0** — the version that introduced the protocol, per kitty's own spec (`.. versionadded:: 0.47.0` in `dnd-protocol.rst`). Verified working here on **kitty 0.47.4**.
+- **Opt-in** via `NNN_DND_OSC72=1` (enabling it changes the terminal's mouse-gesture handling, and costs a 100 ms <kbd>Esc</kbd> peek — see below).
+- Inside **tmux**: `set -g allow-passthrough on` (tmux 3.3+). Verified working here on **tmux 3.7b**, in both directions, with `mouse on`.
+- **Debug log:** `NNN_DND_DEBUG=/tmp/nnn-dnd.log` (or `=1` for that default path) traces every inbound and outbound OSC-72 event to a file without corrupting the curses screen.
+
+**Cost of the opt-in.** While the drag source is registered, nnn waits **100 ms** after a bare <kbd>Esc</kbd> instead of 0 ms, so that a `ESC ] 72 ; … ST` event split across reads is not mistaken for a lone Escape ([src/nnn.c](src/nnn.c), `nextsel()`). <kbd>Esc</kbd> therefore feels slightly less immediate with `NNN_DND_OSC72=1` than without it.
 
 **Five bugs discovered and fixed during implementation (see [docs/nnn_Problems_And_Solutions.md](docs/nnn_Problems_And_Solutions.md) Problems 2–7):**
 
@@ -246,9 +246,19 @@ The protocol is **mouse-gesture-driven and bidirectional**: nnn declares itself 
 
 **Additional fixes for robustness:**
 
-- **Post-subprocess resync** — opening a file runs a curses-suspending subprocess that makes kitty forget nnn is a drag source; a `g_dnd_resync` flag re-sends EnableDrag on return.
-- **tmux pane-border protection** — dragging across a tmux pane boundary would resize panes; during an in-flight drag, tmux mouse is temporarily toggled off and restored on drag-end.
-- **Self-drop prevention** — dropping a drag back onto nnn's own pane is a no-op (suppressed click, consumed bare `]` OSC-72 events).
+- **Post-subprocess resync** — a curses-suspending subprocess (`F_NORMAL` spawns: opener, pager, editor, plugins) makes kitty forget nnn is a drag source; a `g_dnd_resync` flag re-sends EnableDrag on return. Detached GUI openers (`F_NOWAIT`) never suspend curses and so never need it.
+- **tmux pane-border protection, with a crash-proof restore** — dragging across a tmux pane boundary would resize panes, so nnn turns tmux's mouse off for the duration of the drag. But `mouse` is a **global tmux server option**, so that toggle is a lock only nnn knows how to release: a `kill -9` mid-drag (no `atexit`), or a drag whose end the terminal never reports, would leave **every session, window and pane of that tmux server without a mouse, indefinitely**. So the grab is recorded *in tmux*, not only in the process:
+
+  | Mechanism | Purpose |
+  |-----------|---------|
+  | `@nnn_dnd_mouse = "<pid>.<token>:<value before the grab>"` | The grab is visible to anything that can talk to the tmux server, and the **actual** previous value is restored — a user running with `mouse off` no longer has it silently switched on |
+  | Watchdog armed with `tmux run-shell -b` | Runs **inside the tmux server**, so it outlives nnn. Restores within ~1 s of the owner disappearing (`kill -0` poll), and unconditionally after 60 s |
+  | `<token>` in the marker | Distinguishes successive grabs by the same pid, so a stale watchdog cannot cancel a newer drag |
+  | Ownership check on every restore path | Exactly one restore wins; the other pane never releases a grab it does not hold |
+  | Startup repair | On the first `EnableDrag`, a marker naming a dead pid is restored and cleared — covers a crash where the watchdog itself never ran |
+
+  Regression test: [misc/test/test-dnd-tmux-mouse.sh](misc/test/test-dnd-tmux-mouse.sh) (isolated tmux server, 21 assertions). See [docs/nnn_Problems_And_Solutions.md](docs/nnn_Problems_And_Solutions.md) Problem 13.
+- **Self-drop prevention** — dropping a drag back onto nnn's own pane is a no-op for 600 ms after the drag ends (suppressed click, consumed bare `]` OSC-72 events).
 - **Window focus** — on drop, emits BEL (urgency hint, always works) + attempts `kitten @ focus-window` (if kitty remote control is enabled).
 
 ### Drop-IN (Files INTO nnn from GUI apps)
@@ -257,7 +267,7 @@ Two capture paths converge on one copy/move handler:
 
 | Mechanism | Works in tmux? | Notes |
 |-----------|---------------|-------|
-| **Native OSC-72** (`EnableDrop`) | No | tmux does not route inbound drop events to the pane; used in bare kitty only |
+| **Native OSC-72** (`EnableDrop`, `t=a`) | No | Only sent when nnn is **not** inside tmux. Through tmux it would make kitty stop pasting dropped paths (killing the fallback) while the structured events are not routed back, so drops would vanish. |
 | **Bracketed-paste capture** (always active) | Yes | kitty wraps the drop-paste in `ESC[200~`…`ESC[201~`; tmux forwards it. Portable. |
 
 On drop, nnn parses paths (handles `file://` URI percent-decoding, newline/space separated, quotes, backslash escapes), keeps only existing paths, asks **c**opy or **m**ove, then reuses the exact NUL-separated `xargs -0 cp/mv ... .` command that selection copy uses. A paste with **no** real files is silently swallowed — plain text pastes no longer leak as keystrokes.
@@ -266,9 +276,226 @@ On drop, nnn parses paths (handles `file://` URI percent-decoding, newline/space
 
 | Variable | Purpose |
 |----------|---------|
-| `NNN_DND_OSC72=1` | Enable kitty OSC-72 drag-and-drop (opt-in; changes terminal mouse gestures) |
+| `NNN_DND_OSC72=1` | Enable kitty OSC-72 drag-and-drop (opt-in; changes terminal mouse gestures, adds a 100 ms Esc peek) |
 | `NNN_DND_DEBUG=1` or `NNN_DND_DEBUG=/path/to/log` | Log all inbound/outbound OSC-72 events for diagnosis |
-| `O_DND=1` (build flag) | Build the `nnn-dnd` XDND helper alongside nnn |
+| `NNN_DND_MODE` | Set by nnn around the <kbd>D</kbd> key to tell the `dragdrop` plugin `drag` or `receive` and skip its own prompt. Not for manual use. |
+| `O_DND=1` (build flag) | Builds the retired `nnn-dnd` helper alongside nnn. Optional; the helper is not installed or used. |
+
+### How the Dual-Pane Setup Wires It Up
+
+Both DnD paths are configured outside this repo, in the two scripts that start the dual-pane layout:
+
+**`~/.dotfiles/nnn/nnn_config.sh`** — sourced by the shell, sets the shared environment for both panes:
+
+```sh
+# `d:dragdrop` binds the plugin to ;d in addition to the built-in D key
+export NNN_PLUG='...;d:dragdrop;...'
+
+export NNN_DND_OSC72=1
+export NNN_DND_DEBUG=/tmp/nnn-dnd.log
+
+alias nnn_left='/home/tripham/bin/nnn -e -a -o -r -R -i -d -H -P a -P p -s left  -S -f'
+alias nnn_right='/home/tripham/bin/nnn -e -a -o -r -R -i -d -H -P a -P p -s right -S -f'
+```
+
+**`~/bin/start_dual_nnn.sh`** — splits the current tmux window and starts both panes:
+
+```sh
+export NNN_DND_OSC72=1
+tmux kill-pane -a -t $TMUX_PANE
+tmux split-window -h -d
+tmux select-pane -t "{right-of}"; tmux send-keys 'nnn_right' Enter
+tmux select-pane -t "{left-of}";  tmux send-keys 'nnn_left'  Enter
+```
+
+Both instances therefore register as OSC-72 drag sources independently and write to the **same** debug log, so `/tmp/nnn-dnd.log` interleaves events from the left and right panes. The `X=`/`Y=` pixel coordinates in an inbound offer tell you which pane the gesture landed in.
+
+`allow-passthrough` lives in the tmux config, not in these scripts:
+
+```sh
+# ~/.config/tmux/tmux.conf.local
+set -g allow-passthrough on
+```
+
+> **`on` vs `all`:** with `on`, tmux only forwards a pane's passthrough escapes while that pane is **visible**. Both dual-pane instances are in the same window, so both qualify. A pane in a background window would be silently unable to register as a drag source until you switch to it; `set -g allow-passthrough all` removes that restriction.
+
+---
+
+## ◈ Troubleshooting Drag-and-Drop
+
+Work top-down. Step 0 resolves most reports on its own.
+
+### Step 0 — Confirm which path you are actually testing
+
+This is the most common failure, and it is not a bug:
+
+| Symptom | Cause | Action |
+|---------|-------|--------|
+| Pressed <kbd>D</kbd>, a small GTK window appeared, `/tmp/nnn-dnd.log` gained nothing | You exercised **dragon**, not OSC-72. <kbd>D</kbd> never emits OSC-72. | Working as designed. To test OSC-72, **mouse-drag on the pane** instead. |
+| Mouse-dragged on the pane, nothing happened, log gained nothing | OSC-72 offer never arrived | Continue to Step 1 |
+| Pressed <kbd>D</kbd>, no window appeared at all | dragon problem | Jump to § Diagnosing the dragon path |
+
+### Step 1 — Confirm the opt-in reached the running process
+
+Environment variables cannot be injected into a process after it starts, so check the **live process**, not your shell:
+
+```sh
+pgrep -af 'nnn .*-s (left|right)'
+tr '\0' '\n' < /proc/$(pgrep -f 'nnn .*-s left' | head -1)/environ \
+  | grep -E 'NNN_DND|TERM=|DISPLAY'
+```
+
+Expect `NNN_DND_OSC72=1`, `NNN_DND_DEBUG=…`, `TERM=tmux-256color` (or `xterm-kitty` outside tmux), `DISPLAY=:N`. If `NNN_DND_OSC72` is missing, the instance was started before the export existed — restart it; editing `nnn_config.sh` does not affect running panes.
+
+### Step 2 — Confirm the terminal supports the protocol
+
+```sh
+kitty --version        # need >= 0.47.0
+```
+
+### Step 3 — Probe the transport in both directions (no mouse needed)
+
+The protocol defines its own support query, `OSC 72 ; t=q:i=<id> ST`, which a supporting terminal must answer with `OSC 72 ; t=q:i=<id> ; … ST`. That makes it possible to test the **whole round trip** without performing any gesture. Save this as `osc72_probe.py`:
+
+```python
+#!/usr/bin/env python3
+"""Probe the kitty OSC-72 DnD protocol round trip. Run inside the pane you care about."""
+import os, sys, termios, time
+
+def tmux_wrap(seq):                       # tmux DCS passthrough, ESC doubled
+    return "\x1bPtmux;" + seq.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+
+tty = open("/dev/tty", "r+b", buffering=0)
+fd = tty.fileno()
+old = termios.tcgetattr(fd); new = termios.tcgetattr(fd)
+new[3] &= ~(termios.ICANON | termios.ECHO)
+new[6][termios.VMIN] = 0; new[6][termios.VTIME] = 0
+termios.tcsetattr(fd, termios.TCSANOW, new)
+try:
+    query = "\x1b]72;t=q:i=7\x1b\\"
+    tty.write((tmux_wrap(query) if os.environ.get("TMUX") else query).encode())
+    tty.write(b"\x1b[c")                  # DA1, deliberately unwrapped
+    buf = b""; deadline = time.time() + 2.0
+    while time.time() < deadline:
+        chunk = os.read(fd, 4096)
+        if chunk:
+            buf += chunk; deadline = time.time() + 0.35
+        else:
+            time.sleep(0.02)
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, old)
+
+print("raw reply:", buf)
+print("OSC-72 answered:", b"t=q" in buf)
+```
+
+Run it **in the pane you are debugging** (it needs that pane's real tty):
+
+```sh
+python3 osc72_probe.py
+```
+
+| Reply | Meaning |
+|-------|---------|
+| `b'\x1b]72;t=q:i=7\x1b\\\x1b[?62;52;c'` | Healthy in bare kitty — the DnD answer arrives **before** DA1 |
+| `b'\x1b[?1;2c\x1b]72;t=q:i=7\x1b\\'` | Healthy through tmux — tmux answers DA1 itself first, kitty's DnD answer follows |
+| DA1 only, no `t=q` | The protocol is not reachable on this path: wrong terminal, or `allow-passthrough` off, or the pane is in a background window with `allow-passthrough on` |
+| Nothing at all | Nothing is answering — check you ran it on the right tty |
+
+> **Caveat:** kitty's spec says "if a DA1 response arrives before the query response, the terminal does not support the protocol". **That heuristic gives a false negative under tmux**, because tmux answers DA1 itself, instantly, without consulting kitty. Judge by *presence* of the `t=q` answer, not by ordering.
+
+### Step 4 — Read the debug log signatures
+
+```sh
+: > /tmp/nnn-dnd.log      # clear, then reproduce
+tail -f /tmp/nnn-dnd.log
+```
+
+A healthy drag-out is exactly four beats:
+
+```
+72;t=o:x=65:y=26:X=1186:Y=969                     <- kitty: gesture -> offer (cell + pixel coords)
+out: \e]72;t=o:o=3;text/uri-list\e\ … t=p … t=P:x=-1\e\
+offer -> agree + present + start (batched)        <- nnn: one atomic answer
+72;t=E:m=0;OK                                     <- kitty: drag started
+72;t=e:x=4:y=0                                    <- kitty: finished (y=1 = user cancelled)
+drag finished
+```
+
+| Log line | Meaning | What to do |
+|----------|---------|------------|
+| `enable sent (drag offering on)` and nothing else, ever | nnn registered as a drag source but **no gesture was ever recognised** | You are almost certainly pressing <kbd>D</kbd> instead of mouse-dragging. See Step 0. |
+| No `enable sent` at all | `NNN_DND_OSC72` is not `1` in the process | Step 1 |
+| `offer -> nothing to drag` | Empty directory and nothing selected | Hover a file or select some |
+| `offer ignored (just ended)` | Within 600 ms of the previous drag — the self-drop guard | Wait a moment and drag again |
+| `offer ignored (drag already active)` | A previous drag never received its `t=e:x=4` end event | Open any file and return (forces a resync), or restart the pane |
+| `status t=E (OK or error)` with a payload that is not `OK` | kitty refused: `EPERM` (gesture already over, or self-drop), `EFBIG`/`ENOMEM` (payload too large) | Read the raw line above it for the error name |
+| `72;t=e:x=4:y=1` | The drag was **cancelled by the user** — released over nothing that accepts the drop | Drop onto an app that accepts `text/uri-list` |
+| `72;t=e:x=5:y=0` then `data request -> sent` | kitty asked for the data separately instead of using the pre-sent copy | Normal; not an error |
+
+To decode what was actually offered:
+
+```sh
+b64=$(grep -o 'ZmlsZTov[A-Za-z0-9+/]*' /tmp/nnn-dnd.log | tail -1)
+pad=$(( (4 - ${#b64} % 4) % 4 ))            # nnn emits UNPADDED base64 by design
+printf '%s%*s' "$b64" $pad '' | tr ' ' '=' | base64 -d
+```
+
+### Step 5 — Environment-level checks
+
+```sh
+tmux -V                                    # need >= 3.3 for allow-passthrough
+tmux show -p allow-passthrough             # expect: allow-passthrough on
+tmux show -g mouse                         # 'on' is fine, kitty still detects the gesture
+tmux show -gv @nnn_dnd_mouse               # expect: "invalid option" (no drag holds the mouse)
+echo "$XDG_SESSION_TYPE $DISPLAY $WAYLAND_DISPLAY"
+```
+
+**If the mouse stopped working in tmux entirely** (no pane selection, no scroll, in *any* window), a drag grabbed it and the grab was not released:
+
+```sh
+tmux show -gv @nnn_dnd_mouse       # e.g. "38608.1:on" -> pid 38608 holds it, it was 'on' before
+tmux set -g mouse on               # manual escape hatch
+tmux set -gu @nnn_dnd_mouse
+```
+
+This should now self-heal: the watchdog restores within ~1 s of the owning nnn dying and after 60 s regardless, and the next nnn start repairs a marker whose pid is gone. If you ever have to run the commands above by hand, that is a bug worth reporting — note whether `@nnn_dnd_mouse` was set and which pid it named.
+
+Verified-good reference environment for this setup:
+
+| Component | Version / value |
+|-----------|-----------------|
+| kitty | 0.47.4 |
+| tmux | 3.7b, `allow-passthrough on`, `mouse on` |
+| Session | X11 (`XDG_SESSION_TYPE=x11`, `DISPLAY=:1`), GNOME Shell |
+| nnn | this fork, built by `build.sh` |
+
+> **`mouse on` is not a blocker.** It is reasonable to assume that tmux's mouse tracking would swallow the drag gesture before kitty could see it. Measured here, it does not: inbound offers arrive with `mouse on`, carrying correct cell coordinates. nnn only turns tmux's mouse off *after* an offer arrives, to stop pane-border resizes mid-drag.
+
+### Diagnosing the dragon path
+
+```sh
+type dragon dragon-drop dragon-drag-and-drop ripdrag 2>&1   # which helper wins
+type nnn-dnd                                                 # expected: not found (retired)
+DISPLAY=:1 wmctrl -lx | grep -i dragon                       # is a window actually mapped?
+ps -ef | grep '[d]ragon'                                     # leftover windows from earlier drags
+```
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| No window appears | `$DISPLAY` unset in the nnn process, or no helper found | Check Step 1's `DISPLAY`; install `dragon` |
+| Windows pile up | The single-file drag-out branch spawns without `-x`, by design | Close them, or select the file first so the `--all` branch runs |
+| Selection vanished after <kbd>D</kbd> <kbd>r</kbd> | The receive branch truncates the shared selection file first | Expected; re-select after receiving |
+| Plugin runs but nothing happens | Errors are hidden by `2>/dev/null` in the plugin | Run the helper by hand: `dragon --verbose <file>` |
+
+### Quick decision table
+
+| Question | Answer |
+|----------|--------|
+| I want a drag I can aim carefully, or I am not on kitty | Use <kbd>D</kbd> → dragon |
+| I want to drag straight out of the listing with no extra window | Use the mouse on the pane → OSC-72 |
+| I am on SSH | OSC-72 (dragon needs a local X display) |
+| I need to drop files **into** nnn | Either: <kbd>D</kbd> <kbd>r</kbd> (dragon target window), or just drop onto the pane (bracketed-paste capture) |
 
 ---
 
@@ -614,7 +841,7 @@ make -j$(($(nproc) - 2)) \
 | `O_SSN_PIPE=1` | Session load via pipe | Adds the `NNN_PIPE` op `<ctx>s<name>` → `load_session()`, so the `nnn-sessions` plugin can activate/restore a session at full fidelity (sort, filter, cursor, colors across all 8 contexts). Exports `NNN_SSN_PIPE=1` and `NNN_SESSION` for plugins. Without it the plugin degrades to a directory-only `cd`. See § Session Backup, Restore and Management. |
 | `O_FZ_CPMV=1` | FileZilla-style copy/move | Enables conflict-resolution prompts (overwrite/skip/rename) during copy/move via the `cpmv` plugin. |
 | `O_HIST=1` | Shared directory history | Enables the visit-recorder C hook — appends every directory change to the shared `.dirhistory` log used by the `nnn-history` plugin. See § Unlimited Cross-Instance Directory History. |
-| `O_DND=1` | Drag-and-drop helper | Builds the `nnn-dnd` XDND helper binary alongside nnn. Links `-lX11`. |
+| `O_DND=1` | Retired DnD helper | Builds the `nnn-dnd` XDND helper binary alongside nnn (links `-lX11`). **Optional as of 2026-08-03**: `nnn-dnd` is retired in favour of `dragon` plus kitty OSC-72, and is not installed on `$PATH`, so the binary it produces is never invoked. Drop the flag if you want a smaller build. See § Drag-and-Drop. |
 
 8 contexts (tabs) and the shared-selection feature need no flag — both are unconditional in this fork's `src/nnn.c` (`CTX_MAX 8`, and the selection-sync code described in § Shared Selection Across Panes and Tabs).
 
@@ -697,10 +924,17 @@ make -f Makefile_debug clean  # Clean the debug Makefile
 
 ## ◈ Dual-Pane tmux Setup
 
-The repo includes scripts for a dual-pane tmux layout (`start_dual_nnn.sh`) that launches two nnn instances side-by-side — `nnn_left` (`-s left`) and `nnn_right` (`-s right`). They share a common `NNN_FIFO` (`/tmp/nnn.fifo`) and `NNN_PLUG` configuration, enabling:
+The dual-pane tmux layout is driven by two scripts kept **outside** this repo, in the user's dotfiles:
+
+| Script | Role |
+|--------|------|
+| `~/.dotfiles/nnn/nnn_config.sh` | Sourced by the shell. Exports `NNN_PLUG`, `NNN_FIFO`, `NNN_TRASH`, `NNN_HIST`, `NNN_SSN_KEEP`, `NNN_DND_OSC72`, `NNN_DND_DEBUG`, the bash `cwd-guard` hook, and the `nnn_left` / `nnn_right` aliases. |
+| `~/bin/start_dual_nnn.sh` | Run from inside a tmux window: kills the other panes, splits horizontally, and starts `nnn_right` then `nnn_left`. |
+
+They launch two nnn instances side-by-side — `nnn_left` (`-s left`) and `nnn_right` (`-s right`) — sharing a common `NNN_FIFO` (`/tmp/nnn.fifo`) and `NNN_PLUG` configuration, enabling:
 
 - **Cross-pane directory history** — both panes record to the same `.dirhistory`; the `nnn-history` picker can jump to a directory visited by the other pane.
-- **Cross-pane DnD** — OSC-72 drag-out works inside tmux with `allow-passthrough on` (the outbound escapes reach kitty through tmux's DCS passthrough wrapper).
+- **Cross-pane DnD** — both panes register as OSC-72 drag sources independently and share one `/tmp/nnn-dnd.log`; drag-out works inside tmux with `allow-passthrough on` (the outbound escapes reach kitty through tmux's DCS passthrough wrapper, and kitty's inbound offers are forwarded back to the focused pane). The <kbd>D</kbd> key opens a `dragon` window from whichever pane you pressed it in. See § Drag-and-Drop and § Troubleshooting Drag-and-Drop.
 - **Cross-pane context switching** — `ctx_switcher` (`Alt-w`) lists the contexts of *both* panes and switches to any of them.
 - **Shared live selection**: neither pane sets `NNN_SEL`, so both read and write `~/.config/nnn/.selection`. Select on the left, paste on the right. A change in one pane appears in the other within about a second with no keypress, <kbd>E</kbd> edits the shared list from either side, and each pane marks its own tabs that still hold a selection you made. See § Shared Selection Across Panes and Tabs.
 - **Workspace snapshots** — because each pane auto-saves its session on every `cd`, `nnn-sessions` (`;S`, <kbd>Ctrl</kbd>+<kbd>w</kbd>) captures `left` + `right` + `@` as **one** labelled unit and restores both panes together. See § Session Backup, Restore and Management.
@@ -722,6 +956,10 @@ A running log of real problems hit while using this nnn setup, with investigatio
 7. **Self-drop opened the `>>>` prompt** (bare `]` consumed by ncurses before OSC-72 parser)
 8. **"Too many open files" on fresh start** (exhausted `fs.inotify.max_user_instances`, not fd limit)
 9. **The per-tab selection marker pointed at the wrong tab** (two connected bugs: a pane first credited the *other* pane's selection to whatever tab it happened to be sitting on, then the fix for that made a pane lose its own still-valid markers as soon as the peer selected anything; both came from a running counter that held numbers with no record of *which* paths they referred to, and both went away by switching to a tally derived from per-path ownership)
+10. **Some file-type icons rendered as blank space in only one of the two panes** (Unicode variation selectors)
+11. **Long filenames cut off in the narrow dual-pane column** (3-line bottom status, wrapped file-stat path)
+12. **"Drag-and-drop doesn't work" in the dual-pane setup** — no defect: `nnn-dnd` was never installed (so <kbd>D</kbd> always used `dragon`, correctly), and OSC-72 has **no key binding** at all, so pressing <kbd>D</kbd> can never exercise it. Includes the non-interactive `t=q` transport probe, a log-signature reference, and the measured facts that tmux forwards inbound OSC-72 to the pane and that `mouse on` does not suppress the gesture.
+13. **A drag that dies mid-flight can leave the whole tmux server without a mouse** (`set -g mouse off` is a global lock only nnn released; fixed with a tmux-side marker, a `run-shell -b` watchdog that outlives nnn, per-grab ownership tokens, and a startup repair)
 
 ---
 

@@ -1668,3 +1668,488 @@ While setting up throwaway verification instances for this fix, a fresh
 same, pre-existing `fs.inotify.max_user_instances` exhaustion documented in
 Problem 8 -- unrelated to this change, recorded with fresh evidence and a
 stronger recommended fix in Problem 8, section 8.5.
+
+---
+
+## Problem 12 -- "Drag-and-drop doesn't work" in the running dual-pane setup
+
+### 12.1 Symptom (as reported)
+
+> The current dual nnn running instance in the first window of the `main_fish`
+> tmux session has problems that drag and drop doesn't work.
+
+Reported alongside a decision: abandon the bundled `nnn-dnd` helper and use
+`dragon` instead, together with the kitty OSC-72 protocol.
+
+### 12.2 TL;DR root cause
+
+**There was no defect.** Two independent things were true at once, and together
+they produced the impression of a broken feature:
+
+1. `nnn-dnd` had **never been installed on `$PATH`**, so the <kbd>D</kbd> key had
+   always been falling through to `dragon`. That fall-through is correct, and is
+   now the intended configuration -- but it also meant the "bundled helper" the
+   docs advertised as *preferred* had never actually run.
+2. **The kitty OSC-72 drag-out path has no key binding at all.** It is started
+   *only* by a mouse drag on the pane. Pressing <kbd>D</kbd> can never exercise
+   it. Every attempt in the log up to that point had been a <kbd>D</kbd> press,
+   which is why the OSC-72 debug log contained the drag-source registration and
+   nothing else.
+
+The transport was healthy the entire time. Once a real mouse drag was performed
+on the pane, the full handshake completed on the first try, with no change to
+any source file, script, tmux option or environment variable.
+
+```
+ASCII Table 12.2: What each user action actually exercises
++----------------------------------+---------------------+-----------------------+
+| User action                       | Path taken          | OSC-72 log traffic    |
++----------------------------------+---------------------+-----------------------+
+| Press D, answer (d)               | dragdrop -> dragon  | none (only a resync)  |
+| Press D, answer (r)               | dragdrop -> dragon  | none (only a resync)  |
+| Press ;d                          | dragdrop -> dragon  | none (only a resync)  |
+| Mouse-drag on the pane            | kitty OSC-72        | full handshake        |
+| Drop a file onto the pane         | bracketed paste     | none (paste capture)  |
++----------------------------------+---------------------+-----------------------+
+```
+
+### 12.3 The environment, measured
+
+Every value below was read from the live system, not assumed.
+
+```
+ASCII Table 12.3: Verified environment
++---------------------+--------------------------------------------------------+
+| Component           | Value                                                  |
++---------------------+--------------------------------------------------------+
+| kitty               | 0.47.4 (protocol added in 0.47.0)                      |
+| tmux                | 3.7b                                                   |
+| allow-passthrough   | on (pane-scoped read: `tmux show -p allow-passthrough`)|
+| tmux mouse          | on                                                     |
+| Session             | X11, DISPLAY=:1, GNOME Shell                           |
+| nnn instances       | pid 38608 (-s left, pts/6), 38841 (-s right, pts/2)    |
+| NNN_DND_OSC72       | 1  (present in BOTH /proc/<pid>/environ)               |
+| NNN_DND_DEBUG       | /tmp/nnn-dnd.log                                       |
+| nnn-dnd on PATH     | NO -- `which nnn-dnd` is empty                         |
+| dragon              | ~/bin/dragon -> .../dragon/dragon, v1.2.0, GTK3        |
++---------------------+--------------------------------------------------------+
+```
+
+**Fact:** `~/bin/nnn` is a symlink to the built binary, but no corresponding
+`~/bin/nnn-dnd` symlink was ever created. Both the C fast path
+(`getutil("nnn-dnd")` in `SEL_DRAGDROP`) and the plugin probe
+(`type nnn-dnd` in [plugins/dragdrop](../plugins/dragdrop)) therefore fail, and
+`dragon` wins the resolution order.
+
+### 12.4 Evidence trail from the debug log
+
+`/tmp/nnn-dnd.log` is the single most useful artifact. Before the first real
+mouse drag it contained **only**:
+
+```
+out: \e]72;t=o:x=1;\e\
+enable sent (drag offering on)          <- pid 38608 at startup
+out: \e]72;t=o:x=1;\e\
+enable sent (drag offering on)          <- pid 38841 at startup
+out: \e]72;t=o:x=1;\e\
+enable sent (drag offering on)          <- resync after the dragdrop plugin ran
+```
+
+Three registrations, **zero inbound events**. Read correctly, that line-up says:
+nnn did its half (it is a registered drag source) and the terminal never had a
+gesture to report. The third entry is `dnd_osc72_resync()` firing after the
+`dragdrop` plugin returned -- itself proof that a <kbd>D</kbd> press, not a mouse
+drag, was the action being performed.
+
+Corroborating evidence from the process table at the same timestamps:
+
+```
+351044  09:16:41  dragon VinhHT_Performance_Review.png
+385256  09:19:30  dragon HuynhThanhVinh_Performance_Review_202606.md
+```
+
+Both re-parented to `systemd --user` (the plugin backgrounds them), both with
+`cwd=/home/tripham/Downloads`. So the <kbd>D</kbd> path was working correctly
+and visibly the whole time.
+
+After a real mouse drag on the pane, the same log gained the complete handshake,
+three times:
+
+```
+72;t=o:x=65:y=26:X=1186:Y=969             <- inbound offer (cell 65,26; pixel 1186,969)
+out: \e]72;t=o:o=3;text/uri-list\e\ ... t=p:x=0 ... t=P:x=-1\e\
+offer -> agree + present + start (batched)
+72;t=E:m=0;OK                             <- kitty: drag started
+72;t=e:x=4:y=0                            <- finished, y=0 = NOT cancelled
+drag finished
+```
+
+Decoding the pre-sent payload confirms the right file was offered:
+
+```sh
+b64=$(grep -o 'ZmlsZTov[A-Za-z0-9+/]*' /tmp/nnn-dnd.log | tail -1)
+pad=$(( (4 - ${#b64} % 4) % 4 ))
+printf '%s%*s' "$b64" $pad '' | tr ' ' '=' | base64 -d
+# file:///home/tripham/Downloads/HuynhThanhVinh_Performance_Review_202606.md
+```
+
+(nnn emits **unpadded** base64 by design -- see Problem 2, bug 3 -- so padding
+must be added back before `base64 -d` will accept it.)
+
+### 12.5 Diagnostic technique -- probing the transport with no mouse
+
+The hardest thing to establish was whether the *transport* was at fault, because
+the only documented way to trigger drag-out is a physical gesture. It turns out
+the protocol carries its own non-interactive test: the support query
+`OSC 72 ; t=q:i=<id> ST`, which a supporting terminal **must** answer with
+`OSC 72 ; t=q:i=<id> ; <payload> ST`.
+
+That makes it possible to test the **complete round trip** -- app to terminal and
+back -- without dragging anything. The probe used is preserved as a copy-paste
+script in the README (§ Troubleshooting Drag-and-Drop, Step 3). Its results here:
+
+```
+ASCII Table 12.5: Transport probe results
++-----------------------------+-------------------------------------------------+
+| Path                        | Raw reply                                       |
++-----------------------------+-------------------------------------------------+
+| bare kitty (no tmux)        | \e]72;t=q:i=7\e\  \e[?62;52;c                    |
+| inside tmux (passthrough on)| \e[?1;2c  \e]72;t=q:i=7\e\                       |
++-----------------------------+-------------------------------------------------+
+```
+
+Both answered. **Fact: the OSC-72 round trip works through tmux 3.7b in both
+directions.** Outbound reaches kitty through tmux's DCS passthrough wrapper;
+inbound comes back because tmux does not recognise OSC 72 (`strings $(which
+tmux)` finds no DnD handling at all) and passes the unrecognised bytes through to
+the focused pane as input -- which is exactly how nnn's `nextsel()` parser gets
+to see them, and also why a bare `]` had to be special-cased (Problem 7).
+
+> **Caveat worth remembering.** kitty's spec says: *"if a response for the device
+> attributes is received before a response for the queries, then the terminal
+> does not support this protocol."* **That heuristic gives a false negative under
+> tmux**, because tmux answers DA1 itself, immediately, without asking kitty --
+> see the reversed order in the table above. Judge by the *presence* of the `t=q`
+> answer, never by its ordering.
+
+### 12.6 Hypotheses tested and rejected
+
+Recording these because each is a plausible-sounding theory that measurement
+killed, and re-deriving them later would waste time.
+
+```
+ASCII Table 12.6: Rejected root causes
++------------------------------------+---------------------------------------------+
+| Hypothesis                          | Why it is wrong                            |
++------------------------------------+---------------------------------------------+
+| tmux does not route inbound OSC-72  | It does. Proven by the t=q probe (12.5) and |
+| back to the pane                    | by Problem 7, where OSC bytes reached nnn.  |
+| tmux `mouse on` grabs the pointer   | It does not suppress it. The working offers |
+| so kitty never sees the gesture     | in 12.4 all arrived with `mouse on`; nnn    |
+|                                     | only turns it off AFTER an offer arrives.   |
+| allow-passthrough was off           | `tmux show -p allow-passthrough` -> on.     |
+| The opt-in env var was missing      | Present in /proc/<pid>/environ for BOTH     |
+|                                     | instances, read BEFORE the first good drag. |
+| kitty 0.47.4 changed the protocol   | Changelog 0.47.0-0.47.4 has no protocol     |
+|                                     | change; the shipped spec matches the code.  |
+| An env var was fixed externally     | Impossible: a process's environment cannot  |
+|                                     | be modified from outside after exec().      |
++------------------------------------+---------------------------------------------+
+```
+
+**Fact:** nothing was changed to make it work. `git status --porcelain` was empty
+throughout, and the mtimes of `nnn_config.sh` (2026-07-16),
+`start_dual_nnn.sh` (2026-06-17), `tmux.conf.local` (2026-07-13) and the `nnn`
+binary (2026-07-31) were all unchanged on the day of the investigation.
+
+### 12.7 Solution
+
+No code change was required for the symptom itself. The resolution is a
+**decision plus documentation**:
+
+```
+ASCII Table 12.7: Resolution
++---+--------------------------------------------------------------------------+
+| 1 | `nnn-dnd` is retired. `dragon` (D key) and kitty OSC-72 (mouse drag) are  |
+|   | the two supported paths. The helper source stays in-tree and `O_DND=1`    |
+|   | still builds it, but it is not installed and never invoked.               |
+| 2 | README rewritten: the two paths are presented as chosen by DIFFERENT USER |
+|   | ACTIONS, with an explicit "D never emits OSC-72" warning.                 |
+| 3 | A full troubleshooting chapter added to the README, opening with "confirm |
+|   | which path you are actually testing" because that is the real failure.    |
+| 4 | The t=q transport probe preserved as a runnable script.                   |
+| 5 | A log-signature reference table added, mapping every line the DnD logger  |
+|   | can emit to its meaning and next action.                                  |
++---+--------------------------------------------------------------------------+
+```
+
+### 12.8 Documentation corrections made
+
+The README and design doc asserted things the source and kitty's own shipped
+spec contradict:
+
+```
+ASCII Table 12.8: Doc claims corrected
++------------------------------------------+-----------------------------------------+
+| Claim (before)                            | Corrected to                           |
++------------------------------------------+-----------------------------------------+
+| "nnn-dnd ... (preferred)"                 | Retired; dragon is the D-key helper.    |
+| "two complementary approaches,            | Not auto-chosen -- selected by WHICH    |
+|  automatically chosen at runtime"         | ACTION the user performs.               |
+| "Key Binding: D" under the DnD heading,   | D drives dragon only. OSC-72 has NO key |
+|  implying it drives DnD generally         | binding; it is mouse-gesture-only.      |
+| "kitty >= 0.47.1"                         | >= 0.47.0 (kitty's own versionadded);   |
+|                                           | verified working on 0.47.4.             |
+| "Ghostty has accepted the protocol"       | Removed -- unverifiable here. kitty's   |
+|                                           | shipped spec lists only kitty, its dnd  |
+|                                           | kitten, and yazi.                       |
++------------------------------------------+-----------------------------------------+
+```
+
+### 12.9 Verification
+
+```sh
+# 1. Transport, both paths (see README Step 3 for the script)
+python3 osc72_probe.py            # bare kitty : t=q answered
+python3 osc72_probe.py            # inside tmux: t=q answered
+
+# 2. End-to-end drag-out, from the live left pane
+: > /tmp/nnn-dnd.log
+# ... mouse-drag a file off the pane ...
+cat /tmp/nnn-dnd.log
+```
+
+Result: three complete `t=o` -> agree/present/start -> `t=E;OK` -> `t=e:x=4:y=0`
+handshakes, `y=0` on each (finished, not cancelled). The dragged URI decoded to
+the file under the pane's cursor. **PASS.**
+
+The `dragon` path was confirmed working by the user and was deliberately left
+untouched.
+
+### 12.10 Lesson
+
+When a feature has two implementations behind **different triggers**, "it does
+not work" is ambiguous until you establish *which trigger was pulled*. The debug
+log answered this instantly and was the only artifact that did: a registration
+with no inbound events is not a broken protocol, it is a gesture that never
+happened. Any troubleshooting guide for this subsystem must therefore start with
+"which path are you testing", not with protocol internals -- which is how the
+README's chapter is now ordered.
+
+Second lesson: a spec's own diagnostic advice can be wrong for your topology.
+kitty's "DA1 first means unsupported" rule is sound between an app and a
+terminal, and false as soon as a multiplexer that answers DA1 itself sits in the
+middle.
+
+---
+
+## Problem 13 -- A drag that dies mid-flight can leave the whole tmux server without a mouse
+
+### 13.1 Symptom (as reported)
+
+> Regarding the `set mouse off` during dragging, it's to avoid the issue that
+> the dragging accidentally moves the tmux pane separator when dragging through
+> it. However, this could be an issue if the dragging is aborted in the middle
+> and never set back to on.
+
+A design review rather than an observed failure, and a correct one.
+
+### 13.2 TL;DR root cause
+
+To stop tmux resizing panes when a drag crosses a pane border (Problem 4), nnn
+ran `tmux set -g mouse off` at drag start and `tmux set -g mouse on` at drag end.
+
+`mouse` is a **global tmux server option**. That toggle is therefore a lock on a
+resource shared by every session, window and pane of the server -- and the only
+thing that knew how to release it was the nnn process that took it. The old code
+also tracked the grab **only in process memory** (`g_dnd_tmux_grabbed`), so the
+lock and its owner died together.
+
+### 13.3 Failure modes of the original design
+
+```
+ASCII Table 13.3: How the grab could be stranded
++----+----------------------------------+--------------------------------------------+
+| #  | Trigger                           | Consequence                               |
++----+----------------------------------+--------------------------------------------+
+| F1 | nnn killed mid-drag by SIGKILL,   | atexit()/cleanup() never runs. Mouse stays |
+|    | SIGSEGV, SIGBUS, OOM              | off SERVER-WIDE, forever, until the user   |
+|    |                                   | knows to run `tmux set -g mouse on`.       |
+| F2 | Terminal never sends t=e:x=4      | g_dnd_b64 stays set, so every later offer  |
+|    | (kitty dies, drop target hangs,   | is refused with "drag already active" AND  |
+|    | event lost)                       | the mouse stays off while nnn keeps        |
+|    |                                   | running. Only a resync or quit recovers.   |
+| F3 | User runs with `mouse off`        | Restore was hard-coded to `on`, so a drag  |
+|    |                                   | silently turned ON a setting the user had  |
+|    |                                   | deliberately turned off.                   |
+| F4 | Dual pane, overlapping grabs      | One global option, two independent private |
+|    |                                   | flags. A peer's release could re-enable    |
+|    |                                   | the mouse under an instance that still     |
+|    |                                   | believed it held the grab.                 |
++----+----------------------------------+--------------------------------------------+
+```
+
+F1 is the serious one: the blast radius of the *protection* is far larger than
+the blast radius of the *problem it protects against*. A stranded pane resize
+costs one accidental resize; a stranded `mouse off` costs the mouse everywhere.
+
+**Fact (why `atexit` is not enough):** `cleanup()` does call
+`dnd_osc72_disable()` -> `dnd_clear_data()` -> `dnd_release_tmux_mouse()`, and
+`clean_exit_sighandler()` routes SIGTERM/SIGHUP/SIGQUIT through `exit()` so
+`atexit` fires. But SIGKILL and SIGSEGV cannot be caught, and they are exactly
+what a mid-drag crash looks like.
+
+### 13.4 Design constraints for the fix
+
+1. Must survive the owner being killed **at any instant**, including between the
+   `set mouse off` and any bookkeeping.
+2. Must restore the value that was **actually in effect**, not a hard-coded `on`.
+3. Must not let one pane release a grab held by the other.
+4. Must not let a **stale** watchdog cancel a **newer**, legitimate drag.
+5. Must not add a dependency, a daemon, or a per-keystroke cost.
+
+Constraint 1 rules out anything that lives only inside nnn. The state has to be
+held by something that outlives nnn -- and tmux itself already is that thing.
+
+### 13.5 Solution -- state in tmux, watchdog in the tmux server
+
+The grab is recorded as a tmux user option, and the recovery is armed as a tmux
+background job, so both survive nnn's death:
+
+```
+@nnn_dnd_mouse = "<pid>.<token>:<mouse value before the grab>"
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant N as nnn
+    participant T as tmux server
+    participant W as watchdog<br/>(run-shell -b)
+    N->>T: if marker unset: save "pid.token:<current mouse>"
+    N->>T: set -g mouse off
+    N->>T: run-shell -b (arm watchdog)
+    T-->>W: starts INSIDE the server
+    alt drag ends normally
+        N->>T: owner matches? restore saved value#59; clear marker
+        W->>T: marker no longer ours -> exit, do nothing
+    else nnn killed
+        W->>W: kill -0 pid fails (polled 1/s)
+        W->>T: restore saved value#59; clear marker
+    else drag never ends
+        W->>W: 60s cap reached
+        W->>T: restore saved value#59; clear marker
+    end
+```
+
+```
+ASCII Table 13.5: Fix components
++-------------------------+------------------------------+----------------------------+
+| Component               | Where it lives               | Failure mode it closes     |
++-------------------------+------------------------------+----------------------------+
+| @nnn_dnd_mouse marker   | tmux server option           | F1, F3 (saved value)       |
+| run-shell -b watchdog   | tmux SERVER process          | F1 (~1s), F2 (60s cap)     |
+| <pid> in the marker     | ownership                    | F4                         |
+| <token> in the marker   | per-grab generation counter  | stale watchdog vs new drag |
+| Ownership check on every| grab / release / watchdog /  | F4, double restore         |
+| restore path            | repair                       |                            |
+| Startup repair          | first EnableDrag, once/proc  | watchdog itself never ran  |
++-------------------------+------------------------------+----------------------------+
+```
+
+Three functions in [src/nnn.c](../src/nnn.c) replace the old
+`dnd_tmux_mouse(bool)`:
+
+- `dnd_grab_tmux_mouse()` -- records the marker **only if nobody already holds
+  it** (so a second grabber cannot save the already-off value as the one to
+  restore), turns the mouse off, arms the watchdog.
+- `dnd_release_tmux_mouse()` -- restores **only if we still own the marker**.
+- `dnd_repair_tmux_mouse()` -- run once per process on the first `EnableDrag`:
+  if the marker names a pid that no longer exists, restore and clear it.
+
+The watchdog polls with the shell's `kill -0` **builtin**, so the loop forks
+nothing: it is a `sleep` plus a builtin, once a second, only while a drag is in
+flight, capped at `DND_MOUSE_GRAB_MAX_SEC` (60).
+
+**Why the token matters.** Without it, this sequence breaks: nnn grabs (watchdog
+A armed), the drag ends normally, nnn grabs again 3 seconds later, then watchdog
+A wakes at its cap, sees a marker with a matching pid, and restores the mouse in
+the middle of the *second* drag. The token makes watchdog A's ownership test
+fail, so it exits harmlessly. This is covered by test T6.
+
+**What was deliberately not changed.** Narrowing the grab from `set -g mouse off`
+to unbinding only `MouseDrag1Border` was considered and rejected: `mouse off` is
+the form that was empirically verified against the original symptom in Problem 4,
+and unbinding a key the user may have customised introduces a *new* restore
+problem rather than removing one. The grab was made safe instead of narrower.
+
+### 13.6 Verification
+
+A regression test drives the exact shell the C code emits, against an isolated
+tmux server on socket `mousetest`, so a live session is never touched:
+
+```sh
+misc/test/test-dnd-tmux-mouse.sh          # watchdog cap shortened to 4s
+MAX=10 misc/test/test-dnd-tmux-mouse.sh   # slower machines
+```
+
+```
+ASCII Table 13.6: Test coverage
++----+--------------------------------------------------+---------------------+
+| T  | Scenario                                          | Asserts             |
++----+--------------------------------------------------+---------------------+
+| T1 | Normal grab then release                          | off, marker, on     |
+| T2 | Owner SIGKILLed mid-drag                          | restored in ~1s     |
+| T3 | Drag never ends, owner alive                      | restored at the cap |
+| T4 | User preference `mouse off` preserved             | stays off           |
+| T5 | Dual pane: 2nd grabber does not overwrite         | only A restores     |
+| T6 | Stale watchdog vs newer grab by the same pid      | new grab survives   |
+| T7 | Startup repair of a marker with a dead pid        | restored, cleared   |
+| T8 | Repair must NOT touch a live grab                 | left alone          |
++----+--------------------------------------------------+---------------------+
+```
+
+Actual run, 2026-08-03:
+
+```
+==================  PASS=21  FAIL=0  ==================
+```
+
+Build:
+
+```sh
+./build.sh
+# clean; only the pre-existing 'fuzzyentrycmp defined but not used' warning
+```
+
+Isolation confirmed after the run: the live server still reports `mouse on`, and
+`tmux show -gv @nnn_dnd_mouse` reports `invalid option` (no marker present).
+
+**Not verified:** an end-to-end kill of a real nnn process during a real mouse
+drag. The kill path is covered at the shell level by T2, which drives the same
+script with a real process that is really `kill -9`ed, but the full-stack
+rehearsal was not performed on the live dual-pane session.
+
+### 13.7 Manual escape hatch
+
+Should the mouse ever be stranded anyway, the state is now inspectable rather
+than invisible:
+
+```sh
+tmux show -gv @nnn_dnd_mouse   # e.g. "38608.1:on" -- pid 38608 holds it, it was 'on'
+tmux set -g mouse on
+tmux set -gu @nnn_dnd_mouse
+```
+
+Needing this is now itself a bug report: note whether the marker was set and
+which pid it named.
+
+### 13.8 Lesson
+
+A protection whose failure mode is worse than the thing it protects against is a
+bad trade, however rare the failure. The fix was not to make the grab less
+likely to strand, but to **move the release out of the process that can die** --
+tmux was already a long-lived, always-present state holder, so the marker and the
+watchdog belong there. The generic form: when a short-lived process mutates
+long-lived global state, the recovery must be owned by something at least as
+long-lived as the state.

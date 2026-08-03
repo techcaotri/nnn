@@ -307,7 +307,7 @@ ASCII Table 2.6: External interface contract (selected)
 | NNN_LIST / NNNLVL    | Listing root / nesting level for nested nnn            |
 | NNN_DND_OSC72        | Opt-in: enable kitty OSC-72 drag-and-drop (3.7)        |
 | NNN_DND_DEBUG        | DnD debug log path (or 1 = /tmp/nnn-dnd.log)           |
-| NNN_DND_MODE         | dragdrop plugin: select nnn-dnd helper vs fallback     |
+| NNN_DND_MODE         | dragdrop plugin: skip its prompt (drag or receive)     |
 | env_cfg[] (src:762)  | The full table of NNN_* names nnn reads/exports        |
 +----------------------+--------------------------------------------------------+
 ```
@@ -2802,17 +2802,32 @@ behaviour slots into a well-defined pipeline rather than ad-hoc input code.
 This subsystem lets nnn act as both a **drag source** (drag a file out to a GUI
 app) and a **drop target** (drop files in from a GUI app), entirely in-process,
 over a pty -- including over SSH and (for drag-out) inside tmux. It is an
-**opt-in** feature gated on `NNN_DND_OSC72=1` and built with `make O_DND=1`
-(which also builds the separate `nnn-dnd` libX11 helper, see 3.7.8). All of it
-lives in one contiguous block of `src/nnn.c` (functions prefixed `dnd_`) plus a
-few hooks in `nextsel()`, `browse()`, `spawn()`, and `cleanup()`.
+**opt-in** feature gated on `NNN_DND_OSC72=1`. It needs **no build flag**: the
+code is compiled in unconditionally and stays inert until the variable is set.
+All of it lives in one contiguous block of `src/nnn.c` (functions prefixed
+`dnd_`) plus a few hooks in `nextsel()`, `browse()`, `spawn()`, and `cleanup()`.
+
+> **Trigger, and how it is NOT reached.** OSC-72 drag-out is started **only** by
+> a mouse drag on the pane. The <kbd>D</kbd> key (`SEL_DRAGDROP`) does **not**
+> touch this subsystem at all -- it runs the `dragdrop` plugin, which opens a
+> `dragon` window (3.7.9). The two paths are chosen by *which action the user
+> performs*, not by runtime capability detection. Conflating them is the single
+> most common source of "OSC-72 does not work" reports; see
+> [nnn_Problems_And_Solutions.md](nnn_Problems_And_Solutions.md) Problem 12.
+
+> **`nnn-dnd` is retired (2026-08-03).** The bundled libX11 XDND helper
+> (`src/nnn-dnd.c`, 3.7.9) is no longer a supported path. `make O_DND=1` still
+> compiles it, but it is not installed on `$PATH`, so `getutil("nnn-dnd")` in
+> `SEL_DRAGDROP` and the `type nnn-dnd` probe in `plugins/dragdrop` both fail and
+> every <kbd>D</kbd> drag reaches `dragon`. `O_DND` is now optional.
 
 #### 3.7.1 Design constraint and the delegation model
 
 A GUI drag is an X11/Wayland (XDND) protocol between **windows**. nnn is
 pty-bound: no drawing surface the display server can address, no X connection.
 It therefore **delegates** the real drag to a protocol-aware terminal (kitty
->= 0.47.1) via the **OSC-72** escape protocol -- the terminal owns the window,
+>= 0.47.0, the release that introduced the protocol; verified here on 0.47.4)
+via the **OSC-72** escape protocol -- the terminal owns the window,
 so it can perform the OS-level drag/drop on nnn's behalf. The protocol is
 **mouse-gesture-driven and bidirectional**: nnn announces intent once, then the
 terminal sends events that nnn answers.
@@ -2979,7 +2994,10 @@ ASCII Table 3.7.3: protocol coverage in nnn
 | Remote drop (X=1, dir handles)| no       | local paths only                      |
 | Image / PNG thumbnails        | no       | text icon only                        |
 | Directory-traversal responses | no       | cp -R handles directories locally     |
-| Protocol query (t=q) + DA1    | no       | replaced by the NNN_DND_OSC72 opt-in  |
+| Protocol query (t=q) + DA1    | no       | replaced by the NNN_DND_OSC72 opt-in. |
+|                               |          | Still the best external DIAGNOSTIC:   |
+|                               |          | it tests the round trip with no mouse |
+|                               |          | gesture (Problem 12.5).               |
 | Multiplexer i key             | no       | tmux passthrough is used instead      |
 +-------------------------------+----------+---------------------------------------+
 ```
@@ -3001,6 +3019,8 @@ ASCII Table 3.7.2: DnD globals (implicit "DnD session" object, src/nnn.c:3589+)
 |                       | drag-OUT                                           |
 | g_dnd_count           | Number of files in the in-flight drag (for icon)   |
 | g_dnd_tmux_grabbed    | tmux mouse turned off for this drag (Problem 4)    |
+| g_dnd_mouse_token     | Per-grab generation counter, so a stale watchdog   |
+|                       | cannot cancel a newer grab (Problem 13)            |
 | g_dnd_drop_pending    | A paste/drop was captured; browse() must act       |
 | g_dnd_drop_buf/_len/  | Growable capture buffer for an incoming drop       |
 |   _cap                |                                                    |
@@ -3027,7 +3047,8 @@ ASCII Table 3.7.2b: DnD functions grouped by responsibility
 | Event routing    | dnd_osc72_event (parse one body), dnd_osc72_consume (read   |
 |                  | a sequence off the input stream)                           |
 | Lifecycle        | dnd_osc72_enable, dnd_osc72_disable, dnd_osc72_resync,      |
-|                  | dnd_clear_data, dnd_tmux_mouse, dnd_release_tmux_mouse,     |
+|                  | dnd_clear_data, dnd_grab_tmux_mouse,                        |
+|                  | dnd_release_tmux_mouse, dnd_repair_tmux_mouse,              |
 |                  | dnd_recent_drag                                            |
 +------------------+--------------------------------------------------------------+
 ```
@@ -3149,6 +3170,9 @@ ASCII Table 3.7.6: DnD lifecycle hooks and the invariants they protect
 |   g_dnd_resync             | EnableDrag; browse re-advertises next iteration|
 | dnd_clear_data() on every  | restores tmux mouse so a drag can never leave  |
 |   drag-end                 | it disabled (Problem 4)                        |
+| tmux @nnn_dnd_mouse marker | the tmux mouse grab survives nnn: a kill -9 or |
+|   + run-shell -b watchdog  | a drag that never ends cannot strand the       |
+|                            | server-wide mouse option (Problem 13)          |
 | dnd_recent_drag() (~600ms) | a drop onto our OWN window is a no-op: the      |
 |                            | release click does not open a file, and the    |
 |                            | spurious re-offer is ignored (Problem 7)       |
@@ -3160,6 +3184,33 @@ The self-drop case is the subtlest: dropping a drag back on nnn's own window
 must do nothing. `dnd_recent_drag()` suppresses the release click (so no
 `SEL_OPEN`) and the spurious follow-up offer, while the bare-`]` handling (3.7.7)
 stops the inbound events leaking into the `SEL_PROMPT` prompt.
+
+**The tmux mouse grab is externalised state.** `tmux set -g mouse off` mutates a
+**global server option**, so tracking the grab only in `g_dnd_tmux_grabbed` made
+the lock die with its owner: SIGKILL and SIGSEGV run no `atexit`, and a drag
+whose end the terminal never reports never reaches `dnd_clear_data()`. The grab
+is therefore recorded in tmux as `@nnn_dnd_mouse = "<pid>.<token>:<prev value>"`
+and a watchdog is armed with `run-shell -b`, which executes inside the **tmux
+server** and so outlives nnn:
+
+```
+ASCII Table 3.7.6b: Who restores the tmux mouse, and when
++---------------------------+------------------------------+-------------------+
+| Path                      | Trigger                      | Latency           |
++---------------------------+------------------------------+-------------------+
+| dnd_release_tmux_mouse()  | drag end / resync / cleanup  | immediate         |
+| watchdog, kill -0 poll    | owner process disappeared    | ~1s               |
+| watchdog, timeout         | DND_MOUSE_GRAB_MAX_SEC (60)  | 60s               |
+| dnd_repair_tmux_mouse()   | next nnn start, dead pid in  | next startup      |
+|                           | the marker                   |                   |
++---------------------------+------------------------------+-------------------+
+```
+
+Every path tests ownership (`<pid>.<token>`) before restoring, so exactly one
+wins, a second instance never releases a grab it does not hold, and a stale
+watchdog cannot cancel a newer drag. The value restored is the one that was
+actually in effect, so a user running `mouse off` is not silently switched on.
+Regression test: `misc/test/test-dnd-tmux-mouse.sh`.
 
 #### 3.7.9 Focus on drop -- a hard limitation
 
