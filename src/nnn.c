@@ -3876,27 +3876,114 @@ static bool dnd_in_tmux(void)
 
 /*
  * While an OSC-72 drag is in flight, tmux's own mouse handling treats a drag
- * across a pane border as a resize. Toggle tmux mouse off for the drag and
- * back on when it ends. F_NOWAIT keeps curses up (no endwin), so this is safe
- * mid-gesture. Restored on every drag-end path via dnd_clear_data() (and on the
- * next subprocess resync) so an abnormal end cannot leave the mouse disabled.
+ * across a pane border as a resize, so the mouse is turned off for the duration
+ * of the drag (see docs/nnn_Problems_And_Solutions.md Problem 4).
+ *
+ * tmux's `mouse` is a GLOBAL server option, so that toggle takes a lock only
+ * this process knows how to release. If nnn is killed mid-drag (SIGKILL and
+ * SIGSEGV run no atexit handler) or the terminal never reports the drag end,
+ * the mouse is left off for EVERY session, window and pane of that tmux server,
+ * indefinitely -- much worse than the pane resize the toggle exists to prevent.
+ *
+ * The grab is therefore recorded IN TMUX, not only in this process:
+ *
+ *	@nnn_dnd_mouse = "<pid>.<token>:<mouse value before the grab>"
+ *
+ * and a watchdog is armed with `run-shell -b`, which executes inside the tmux
+ * SERVER and so outlives nnn. It restores the saved value as soon as the owning
+ * process disappears (polled once a second with the shell's `kill -0` builtin)
+ * and unconditionally after DND_MOUSE_GRAB_MAX_SEC. <token> distinguishes
+ * successive grabs by the same pid, so a stale watchdog cannot cancel a newer
+ * grab. Every restore path checks ownership first, so exactly one wins and a
+ * second nnn instance never restores a grab it does not hold.
+ *
+ * The value saved is the one that was actually in effect, so a user running with
+ * `mouse off` no longer has it silently switched on by a drag.
+ *
+ * F_NOWAIT keeps curses up (no endwin), so all of this is safe mid-gesture.
  */
-static void dnd_tmux_mouse(bool on)
-{
-	char cmd[32];
+#define DND_MOUSE_GRAB_MAX_SEC 60
 
-	if (!dnd_in_tmux())
+static uint_t g_dnd_mouse_token; /* distinguishes successive grabs by this pid */
+
+static void dnd_grab_tmux_mouse(void)
+{
+	char script[1024];
+
+	if (g_dnd_tmux_grabbed || !dnd_in_tmux())
 		return;
-	snprintf(cmd, sizeof cmd, "tmux set -g mouse %s", on ? "on" : "off");
-	spawn(cmd, NULL, NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
+
+	++g_dnd_mouse_token;
+	snprintf(script, sizeof script,
+		/* Record the pre-drag value, but only if nobody holds the grab:
+		 * a second grabber must not save the already-off value as the
+		 * one to restore. */
+		"if [ -z \"$(tmux show -gv @nnn_dnd_mouse 2>/dev/null)\" ]; then "
+			"m=$(tmux show -gv mouse 2>/dev/null); [ -n \"$m\" ] || m=on; "
+			"tmux set -g @nnn_dnd_mouse \"%d.%u:$m\"; "
+		"fi; "
+		"tmux set -g mouse off; "
+		/* Watchdog: runs in the tmux server, so it survives nnn dying. */
+		"tmux run-shell -b '"
+			"i=0; "
+			"while [ $i -lt %d ]; do "
+				"sleep 1; "
+				"i=$((i+1)); "
+				"kill -0 %d 2>/dev/null || break; "
+			"done; "
+			"v=$(tmux show -gv @nnn_dnd_mouse 2>/dev/null); "
+			"[ \"${v%%%%:*}\" = %d.%u ] || exit 0; "
+			"tmux set -g mouse \"${v##*:}\"; "
+			"tmux set -gu @nnn_dnd_mouse'",
+		(int)getpid(), g_dnd_mouse_token,
+		DND_MOUSE_GRAB_MAX_SEC, (int)getpid(),
+		(int)getpid(), g_dnd_mouse_token);
+
+	spawn(utils[UTIL_SH_EXEC], script, NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
+	g_dnd_tmux_grabbed = TRUE;
 }
 
 static void dnd_release_tmux_mouse(void)
 {
-	if (g_dnd_tmux_grabbed) {
-		dnd_tmux_mouse(TRUE);
-		g_dnd_tmux_grabbed = FALSE;
-	}
+	char script[384];
+
+	if (!g_dnd_tmux_grabbed)
+		return;
+	g_dnd_tmux_grabbed = FALSE;
+	if (!dnd_in_tmux())
+		return;
+
+	/* Restore only what we still own: our watchdog may have restored it
+	 * already, or another instance may have taken the grab over since. */
+	snprintf(script, sizeof script,
+		"v=$(tmux show -gv @nnn_dnd_mouse 2>/dev/null); "
+		"[ \"${v%%%%:*}\" = %d.%u ] || exit 0; "
+		"tmux set -g mouse \"${v##*:}\"; "
+		"tmux set -gu @nnn_dnd_mouse",
+		(int)getpid(), g_dnd_mouse_token);
+
+	spawn(utils[UTIL_SH_EXEC], script, NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
+}
+
+/*
+ * Repair a grab stranded by an earlier crash: if the marker names a pid that is
+ * gone, restore the value it saved. Covers the case where the watchdog itself
+ * never ran or was killed. Runs once per process (dnd_osc72_enable() is also
+ * the resync path, and this must not spawn a shell on every file open).
+ */
+static void dnd_repair_tmux_mouse(void)
+{
+	static bool repaired;
+
+	if (repaired || !dnd_in_tmux())
+		return;
+	repaired = TRUE;
+
+	spawn(utils[UTIL_SH_EXEC],
+	      "v=$(tmux show -gv @nnn_dnd_mouse 2>/dev/null); [ -n \"$v\" ] || exit 0; "
+	      "p=${v%%:*}; kill -0 ${p%%.*} 2>/dev/null && exit 0; "
+	      "tmux set -g mouse \"${v##*:}\"; tmux set -gu @nnn_dnd_mouse",
+	      NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
 }
 
 /* TRUE within ~600ms of a drag ending: used to neutralise a drop onto our own
@@ -4213,10 +4300,7 @@ static void dnd_osc72_offer(void)
 	dnd_osc72_write(b);
 	free(b);
 	/* Drag is now in flight: stop tmux from resizing panes on border crossings. */
-	if (dnd_in_tmux() && !g_dnd_tmux_grabbed) {
-		dnd_tmux_mouse(FALSE);
-		g_dnd_tmux_grabbed = TRUE;
-	}
+	dnd_grab_tmux_mouse();
 	dnd_log("offer -> agree + present + start (batched)");
 }
 
@@ -4486,6 +4570,7 @@ static void dnd_osc72_enable(void)
 	 * instead of requesting the file contents via t=k -- which nnn does not
 	 * provide, so the drop would stall and the drag icon would never clear.
 	 */
+	dnd_repair_tmux_mouse(); /* undo a grab stranded by an earlier crash */
 	dnd_osc72_write("\x1b]72;t=o:x=1;\x1b\\");
 	/*
 	 * Structured drop reception (EnableDrop) only outside tmux: through tmux it
