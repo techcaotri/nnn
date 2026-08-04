@@ -960,6 +960,7 @@ A running log of real problems hit while using this nnn setup, with investigatio
 11. **Long filenames cut off in the narrow dual-pane column** (3-line bottom status, wrapped file-stat path)
 12. **"Drag-and-drop doesn't work" in the dual-pane setup** — no defect: `nnn-dnd` was never installed (so <kbd>D</kbd> always used `dragon`, correctly), and OSC-72 has **no key binding** at all, so pressing <kbd>D</kbd> can never exercise it. Includes the non-interactive `t=q` transport probe, a log-signature reference, and the measured facts that tmux forwards inbound OSC-72 to the pane and that `mouse on` does not suppress the gesture.
 13. **A drag that dies mid-flight can leave the whole tmux server without a mouse** (`set -g mouse off` is a global lock only nnn released; fixed with a tmux-side marker, a `run-shell -b` watchdog that outlives nnn, per-grab ownership tokens, and a startup repair)
+14. **"Too many open files" for the third time** — the `fs.inotify.max_user_instances` fix written down in Problem 8.5 had never been applied, and 110 idle Gradle daemons (67 wrapper versions, 15.5 GB RSS) had taken the cap to *zero* free instances. Includes why the usual `find /proc/*/fd -lname anon_inode:inotify | wc -l` recipe measures the wrong thing, and [misc/test/inotify-headroom.py](misc/test/inotify-headroom.py), which asks the kernel directly.
 
 ---
 

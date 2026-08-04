@@ -799,7 +799,17 @@ cat /proc/sys/fs/inotify/max_user_instances   # 128
 find /proc/*/fd -lname "anon_inode:inotify" 2>/dev/null | wc -l   # 178
 ```
 
-178 live instances against a cap of 128. Per-process breakdown (instances,
+> **Correction (added 2026-08-03, see Problem 14.4).** That second command counts
+> **descriptors, not instances**, and it does not filter by UID -- while the cap
+> is enforced **per UID** and charges a `fork()`ed or `dup()`ed descriptor
+> **once**. So "178" is an *upper bound* on this user's instance usage, not a
+> measurement of it, and comparing it directly against `128` is not sound (it is
+> also why a number larger than the cap can appear at all). The conclusion below
+> still holds -- the cap really was exhausted -- but the reliable way to
+> establish that is to ask the kernel for an instance and see whether it says
+> `EMFILE`; see 14.4 for the method and a ready-made script.
+
+178 descriptors against a cap of 128. Per-process breakdown (descriptors,
 processes) for every command holding more than one:
 
 ```
@@ -875,6 +885,11 @@ sysctl was not actually changed on the user's machine (a system-wide kernel
 tuning change, left for the user to apply and confirmed only by root cause
 and precedent from 8.2/8.3, not by re-running the failing command after the
 change).
+
+> **Follow-up (2026-08-03):** the sysctl was **never applied**. Problem 14
+> records the third recurrence, confirms `max_user_instances` was still at the
+> kernel default `128` with no `/etc/sysctl.d/40-inotify.conf` on disk, and
+> tracks the fix through to a measured result. See 14.10 for the process lesson.
 
 ---
 
@@ -2153,3 +2168,344 @@ tmux was already a long-lived, always-present state holder, so the marker and th
 watchdog belong there. The generic form: when a short-lived process mutates
 long-lived global state, the recovery must be owned by something at least as
 long-lived as the state.
+
+---
+
+## Problem 14 -- "Too many open files" again: the third recurrence, an unapplied fix, and 110 Gradle daemons
+
+### 14.1 Symptom (as reported)
+
+> I run the script `start_dual_nnn.sh` inside the current tmux session
+> `main_fish`. However, when running the `nnn_left` command, it reports the error
+> `12449: Too many open files`.
+
+### 14.2 TL;DR root cause
+
+This is the **third** occurrence of Problem 8, and it happened because **two
+separate things stacked**:
+
+```
+ASCII Table 14.2: The two stacked causes
++---+--------------------------------------+------------------------------------+
+| A | The fix recommended in 8.5 was NEVER  | max_user_instances was still the   |
+|   | APPLIED                              | kernel default 128, and            |
+|   |                                      | /etc/sysctl.d/40-inotify.conf did  |
+|   |                                      | not exist. The doc had recorded    |
+|   |                                      | "Not verified end-to-end" and that |
+|   |                                      | turned out to mean "not done".     |
++---+--------------------------------------+------------------------------------+
+| B | A new consumer, far larger than any   | 110 idle Gradle daemons across 67  |
+|   | seen before, had appeared             | distinct Gradle versions, holding  |
+|   |                                      | 47 inotify descriptors and 15.5 GB |
+|   |                                      | of RSS.                            |
++---+--------------------------------------+------------------------------------+
+```
+
+Net effect, measured directly: **zero** free inotify instances. Every
+`inotify_init()` on the machine returned `EMFILE`, so nnn could not start at all.
+
+### 14.3 Confirming the exact failure point
+
+The number in the message is a **source line, not a file-descriptor count**:
+
+```c
+#define xerror() perror(xitoa(__LINE__))       /* src/nnn.c:912 */
+```
+
+and [src/nnn.c:12449](../src/nnn.c#L12449) is the `xerror();` inside the
+`inotify_init1()` failure branch:
+
+```c
+#ifdef LINUX_INOTIFY
+	/* Initialize inotify */
+	inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	if (inotify_fd < 0) {
+		xerror();               /* <-- line 12449 */
+		return EXIT_FAILURE;
+	}
+```
+
+`Fact`: nnn treats this as **fatal**. There is no degraded no-watch mode, so an
+exhausted instance cap is a hard "cannot start".
+
+`Fact`: `EMFILE`'s canonical string is "Too many open files", which is why the
+message points the reader at `ulimit -n` -- a dead end here. `ulimit -Sn` and
+`-Hn` on this machine are both `100000`.
+
+### 14.4 How to measure this correctly (and a correction to 8.5)
+
+The recipe used in Problem 8.5, and repeated all over the internet, is:
+
+```sh
+find /proc/*/fd -lname 'anon_inode:inotify' 2>/dev/null | wc -l
+```
+
+**It does not measure what the cap limits.** Three distinct errors:
+
+```
+ASCII Table 14.4: Why the common recipe is wrong
++---+-------------------------------------+---------------------------------------+
+| 1 | It counts DESCRIPTORS, not instances| A descriptor inherited through fork()  |
+|   |                                     | or dup() refers to ONE instance the    |
+|   |                                     | kernel charges ONCE. The count is an   |
+|   |                                     | upper bound only.                      |
++---+-------------------------------------+---------------------------------------+
+| 2 | It does not filter by UID           | The cap is enforced PER UID. Root's    |
+|   |                                     | systemd/tracker/snapd instances are in |
+|   |                                     | the total but not in your budget.      |
++---+-------------------------------------+---------------------------------------+
+| 3 | Its result can EXCEED the cap, which| Measured here: 143 descriptors total,  |
+|   | silently signals it is not the      | 142 for uid 1000 -- against a cap of   |
+|   | quantity being capped               | 128. A real instance count can never   |
+|   |                                     | exceed the cap.                        |
++---+-------------------------------------+---------------------------------------+
+```
+
+**Deduplicating by inode does not rescue it either.** Every anonymous inode comes
+from the single `anon_inodefs` superblock, so they all share one inode:
+
+```sh
+# measured 2026-08-03: 142 descriptors ...
+stat -Lc '%i' <each fd> | sort -u | wc -l      # ... and exactly 1 distinct inode
+```
+
+And the kernel's per-user instance counter (`ucounts`) is **not exposed anywhere
+in /proc**.
+
+**So ask the kernel instead.** Open instances until it refuses, count them, close
+them. This is the only reliable measurement, and it answers the question that
+actually matters -- *is there headroom right now* -- rather than a proxy for it:
+
+```sh
+misc/test/inotify-headroom.py
+```
+
+Output at the moment of failure:
+
+```
+fs.inotify.max_user_instances : 128
+instances this UID could open : 0
+stopped with                  : EMFILE (Too many open files)
+
+VERDICT: cap is FULLY EXHAUSTED right now -- any program calling
+         inotify_init() fails with EMFILE ('Too many open files').
+```
+
+`Decision`: the descriptor count is still useful for **attribution** (which
+program is responsible), just not for **capacity**. Use the headroom script to
+decide *whether* there is a problem, and the `/proc` scan to decide *who caused
+it*.
+
+### 14.5 The consumer changed completely between recurrences
+
+Descriptor attribution, uid 1000, at the moment of failure, next to the figures
+recorded for the previous recurrence:
+
+```
+ASCII Table 14.5: Top inotify descriptor holders, by recurrence
++------------------+---------------------+---------------------+
+| Command          | 2026-07-31 (desc.)  | 2026-08-03 (desc.)  |
++------------------+---------------------+---------------------+
+| java (Gradle)    |          -- (none)  |   47 (47 processes) |
+| code-insiders    |   53 (37 processes) |   22 (15 processes) |
+| systemd          |                   5 |                   5 |
+| claude           |                  16 |                   2 |
+| Typora           |                   9 |                  -- |
+| others (1-3 ea.) |                 ~95 |                 ~66 |
++------------------+---------------------+---------------------+
+| TOTAL            |                 178 |                 142 |
++------------------+---------------------+---------------------+
+```
+
+`Fact`: the *total* was actually **lower** than at the previous recurrence (142
+vs 178 descriptors), yet the cap was fully exhausted this time and nnn had
+started fine on other days at 178. That is the clearest possible evidence that
+the descriptor count is not the quantity being capped (14.4), and that the real
+instance usage had crossed 128 for the first time.
+
+### 14.6 Why 110 Gradle daemons existed
+
+```
+ASCII Table 14.6: The daemon storm, measured
++----------------------------+---------------------------------------------------+
+| Processes                  | 110, ALL in state S (sleeping) -- none building    |
+| Distinct Gradle versions   | 67, from gradle-4.8.1 to gradle-9.2.0             |
+| Age                        | 3297-4325 s -- all spawned inside one ~17 min burst|
+| Resident memory            | 15 532 MB total                                    |
+| CPU consumed               | 2056 cpu-seconds total, then idle                 |
+| Launched by                | .vscode-insiders/extensions/redhat.java-1.55.0    |
+|                            | .../jre/21.0.11/bin/java ... GradleDaemon         |
++----------------------------+---------------------------------------------------+
+```
+
+**Mechanism.** A Gradle daemon is **per Gradle version** (plus per JVM args
+fingerprint). The Red Hat Java extension imports a workspace by running each
+project's own Gradle **wrapper**, and a tree of long-lived projects accumulates
+one wrapper version per project generation. Importing that workspace therefore
+starts one JVM **per distinct wrapper version** -- 67 of them here -- and each
+JVM opens its own file watchers.
+
+`Fact`: there is no `~/.gradle/gradle.properties` on this machine, so
+`org.gradle.daemon.idletimeout` is at its default of **3 hours**. The daemons had
+been idle for roughly an hour and would have held their instances for two more.
+
+`Assumption`: the burst was a workspace import or re-import in VS Code Insiders.
+Not verified directly -- the extension's own logs were not consulted -- but the
+17-minute spawn window, the single extension path shared by all 110 command
+lines, and the one-daemon-per-wrapper-version pattern all fit and nothing else
+does.
+
+### 14.7 Solution -- three layers
+
+```mermaid
+flowchart TD
+    S["nnn: 12449 Too many open files"] --> M{"misc/test/<br/>inotify-headroom.py"}
+    M -->|"0 free"| L1["Layer 1 -- RECLAIM<br/>stop idle inotify hogs<br/>(no root, instant)"]
+    L1 --> L2["Layer 2 -- RAISE THE CAP<br/>sysctl max_user_instances=1024<br/>(root, permanent)"]
+    L2 --> L3["Layer 3 -- PREVENT<br/>stop the daemon storm recurring<br/>(gradle.properties + VS Code)"]
+    M -->|"plenty free"| O["Not this problem --<br/>check the real errno"]
+```
+
+**Layer 1 -- reclaim now (no root needed).** All 110 daemons were idle, so
+`SIGTERM` interrupts nothing and Gradle restarts one on the next build:
+
+```sh
+pkill -TERM -f 'org.gradle.launcher.daemon.bootstrap.GradleDaemon'
+```
+
+> **Trap, hit while doing exactly this.** `pkill -f` matches against the **full
+> command line of every process, including the shell that is running the
+> `pkill`** -- whose command line contains the pattern as an argument. The shell
+> SIGTERMs itself and the command appears to fail (exit `144` = `128 + SIGTERM`)
+> even though the daemons were signalled correctly. Either verify the outcome
+> separately, or avoid the self-match by selecting on the executable instead:
+>
+> ```sh
+> ps -o pid,cmd -C java --no-headers | awk '/GradleDaemon/{print $1}' | xargs -r kill -TERM
+> ```
+
+**Layer 2 -- raise the cap (root; permanent).** This is the fix 8.5 prescribed
+and that was never applied:
+
+```sh
+# take effect now
+sudo sysctl -w fs.inotify.max_user_instances=1024
+
+# persist across reboots
+echo 'fs.inotify.max_user_instances=1024' | sudo tee /etc/sysctl.d/40-inotify.conf
+sudo sysctl --system
+```
+
+Confirm afterwards:
+
+```sh
+cat /proc/sys/fs/inotify/max_user_instances    # expect 1024
+misc/test/inotify-headroom.py                  # expect a large free count
+```
+
+`Fact`: `/etc/sysctl.conf` on this machine already sets `max_user_watches` and
+`max_queued_events`, but **not** `max_user_instances` -- which is why the other
+two limits are generous (524288 each) while the one that actually broke nnn sat
+at the 128 default. Do not assume "I raised my inotify limits" covers all three.
+
+**Layer 3 -- stop the storm recurring.** Reclaiming and raising the cap both
+treat the symptom; 110 JVMs holding 15.5 GB is worth preventing regardless:
+
+```sh
+# ~/.gradle/gradle.properties -- retire idle daemons after 30 min instead of 3 h
+org.gradle.daemon.idletimeout=1800000
+```
+
+And in VS Code Insiders settings, stop the per-wrapper-version fan-out by
+pinning one Gradle for import:
+
+```jsonc
+// use ONE Gradle for project import instead of each project's own wrapper
+"java.import.gradle.wrapper.enabled": false,
+"java.import.gradle.version": "8.14.1",
+
+// or, for workspaces that do not need Gradle import at all:
+"java.import.gradle.enabled": false
+```
+
+`Decision`: these are the user's own environment, outside this repo, so they are
+recorded as recommendations. Only Layer 1 was executed here.
+
+### 14.8 Verification
+
+Measured, in order, on 2026-08-03:
+
+```
+ASCII Table 14.8: Before and after
++--------------------------------------+-----------+-----------+
+| Measurement                           | Before    | After L1  |
++--------------------------------------+-----------+-----------+
+| GradleDaemon processes                |       110 |         0 |
+| inotify descriptors (uid 1000)        |       142 |        95 |
+| instances the UID could still open    |         0 |        47 |
+| max_user_instances                    |       128 |       128 |
++--------------------------------------+-----------+-----------+
+```
+
+Then the failing command itself, in an **isolated** tmux server so the live
+session was untouched:
+
+```sh
+tmux -L nnnstart -f /dev/null new-session -d -x 200 -y 50 \
+  "/home/tripham/bin/nnn -e -a -o -r -R -i -d -H -P a -P p -s probe -S -f ~/Downloads 2>err"
+```
+
+Result: the nnn process was **alive**, `err` was **empty** (no `xerror` output),
+and the pane rendered the context bar and directory listing:
+
+```
+1 2 3 4 5 6 7 8 ~/Downloads
+
+>2024-04-22 20:49  700       4K  .fr-6cD6aQ/
+ 2026-07-01 16:26  755       4K  .hist/
+```
+
+**PASS** -- nnn starts again. The probe server and its `probe` session file were
+removed afterwards.
+
+`Not verified`: Layer 2 and Layer 3. `sudo` on this machine requires a password
+that could not be supplied non-interactively, so the sysctl was **not** changed;
+the commands in 14.7 are for the user to run. Until Layer 2 is applied the
+machine is running on the 47 slots Layer 1 freed, and the next workspace import
+will consume them again.
+
+### 14.9 Quick triage for the next time
+
+```sh
+# 1. Is it really the instance cap?  (the ONLY reliable check)
+misc/test/inotify-headroom.py
+
+# 2. If exhausted: who is holding them?  (attribution, not capacity)
+find /proc/*/fd -lname 'anon_inode:inotify' 2>/dev/null | awk -F/ '{print $3}' \
+  | sort | uniq -c | while read -r c p; do echo "$c $(cat /proc/$p/comm 2>/dev/null)"; done \
+  | awk '{a[$2]+=$1} END {for (k in a) printf "%-22s %5d\n", k, a[k]}' | sort -k2 -rn | head
+
+# 3. Reclaim the biggest idle offender, then re-run step 1.
+```
+
+Candidate hogs seen on this machine so far, in order of appetite: Gradle daemons
+(one JVM per wrapper version), `code-insiders` (one per window plus extension
+hosts), language servers (`cpptools`, `jdtls`), `claude` sessions, note apps.
+
+### 14.10 Lesson
+
+**A documented fix that was never applied is not a fix.** Problem 8.5 diagnosed
+this correctly a second time, wrote the exact commands, and honestly labelled
+itself `Not verified end-to-end`. Three days later the same failure returned
+because that label meant "nobody ran it" and nothing in the workflow closed the
+loop. Entries that end in a system change the author cannot make should say so in
+the *status*, not only in a verification footnote -- which is why 8.5 now carries
+a forward pointer to this entry, and why 14.8 states plainly which layers are
+still outstanding.
+
+**Second lesson: measure the quantity that is actually capped.** The descriptor
+count had gone *down* between recurrences while the situation got *worse*. Every
+minute spent comparing 142 against 128 was wasted; the one command that settled
+it in a second was asking the kernel for an instance and reading the errno. When
+a proxy metric can exceed the limit it supposedly tracks, that is not a rounding
+error -- it is proof the proxy is measuring something else.
