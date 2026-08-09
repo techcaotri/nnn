@@ -46,7 +46,7 @@ if [ -d "$entry" ]; then
     echo "  5. Open in new tmux window"
     echo "  6. Follow folder link in nnn"
     echo "  7. rsync to my Desktop machine" 
-    echo "  8. Open with Cursor AI IDE"
+    echo "  8. Open with LunarVim-New"
     read -r -p "Action: " ans
     case $ans in
         1)
@@ -85,8 +85,7 @@ if [ -d "$entry" ]; then
         7)
             myrsync_local.sh "$entry";;
         8)
-            cursor "$entry" >/dev/null 2>&1 &
-            ;;
+            tmux new-window -n "lvim-new" -c "$entry" "lvim-new";;
         *)
             exit;;
     esac
