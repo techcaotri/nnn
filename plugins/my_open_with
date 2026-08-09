@@ -49,7 +49,7 @@ if [ -d "$entry" ]; then
 	echo "  5. Open in new tmux window"
 	echo "  6. Follow folder link in nnn"
 	echo "  7. rsync to my Desktop machine"
-  echo "  8. Open with Cursor AI IDE"
+  echo "  8. Open with LunarVim-New"
   echo "  9. Open with Zed IDE"
 	read -r -p "Action: " ans
 	case $ans in
@@ -97,9 +97,7 @@ if [ -d "$entry" ]; then
 		fi
 		;;
   8)
-    echo $(which cursor) >&2
-    echo cursor "$entry" >&2
-    cursor "$entry" >/dev/null 2>&1 &
+    tmux new-window -n "lvim-new" -c "$entry" "lvim-new"
     ;;
   9)
     echo zed "$entry" >&2
