@@ -3014,7 +3014,12 @@ ASCII Table 3.7.2: DnD globals (implicit "DnD session" object, src/nnn.c:3589+)
 +-----------------------+----------------------------------------------------+
 | Global                | Role                                               |
 +-----------------------+----------------------------------------------------+
-| g_dnd_on              | EnableDrag/EnableDrop announced to the terminal    |
+| g_dnd_on              | OSC-72 active in this process: inbound parser and  |
+|                       | bracketed paste on                                 |
+| g_dnd_armed           | tmux only: kitty's drag source armed for the       |
+|                       | current left-button gesture (Problem 15)           |
+| g_mousemask           | nnn's ncurses mask (+ BUTTON1_RELEASED inside      |
+|                       | tmux), re-applied after a drag                     |
 | g_dnd_b64 / _b64len   | Unpadded base64 text/uri-list for the in-flight    |
 |                       | drag-OUT                                           |
 | g_dnd_count           | Number of files in the in-flight drag (for icon)   |
@@ -3056,7 +3061,10 @@ ASCII Table 3.7.2b: DnD functions grouped by responsibility
 #### 3.7.5 Drag-OUT (nnn is the drag source)
 
 `dnd_osc72_enable()` announces EnableDrag once at `browse()` start with an
-**empty machine-id** (local drag). When the user mouse-drags, the terminal sends
+**empty machine-id** (local drag) in bare kitty. Inside tmux the same EnableDrag
+is sent by `dnd_osc72_arm()` on each left press on the list and withdrawn by
+`dnd_osc72_disarm()` when that gesture ends, because kitty's single per-window
+flag would otherwise cover every tmux window and pane (Problem 15). When the user mouse-drags, the terminal sends
 an inbound `t=o` offer; `dnd_osc72_event()` routes it to `dnd_osc72_offer()`,
 which builds the agree + present + icon + start response as **one atomic,
 unpadded** write (`dnd_osc72_write()` tmux-wraps it when needed).
@@ -3165,9 +3173,25 @@ ASCII Table 3.7.6: DnD lifecycle hooks and the invariants they protect
 +----------------------------+------------------------------------------------+
 | Hook                       | Invariant protected                            |
 +----------------------------+------------------------------------------------+
-| browse() start: enable     | drag/drop announced once per session           |
-| spawn() F_NORMAL: set      | a curses-suspending subprocess (opener) drops  |
-|   g_dnd_resync             | EnableDrag; browse re-advertises next iteration|
+| browse() start: enable     | bare kitty: drag/drop announced once per       |
+|                            | session; tmux: nothing is announced (the first |
+|                            | idle tick clears a leftover flag)              |
+| spawn() F_NORMAL: disarm,  | tmux: an armed gesture is withdrawn before the |
+| set g_dnd_resync           | child owns the pane; bare kitty: browse        |
+|                            | re-advertises next iteration                   |
+| SEL_CLICK press / release  | tmux (Problem 15): a left press on the list    |
+|                            | arms the drag source, its release or a key     |
+|                            | disarms it; a drag elsewhere never becomes an  |
+|                            | offer                                          |
+| nextsel() idle tick:       | tmux: an arm whose release never came ends     |
+| dnd_osc72_idle()           | after 2 s; once after startup a leftover flag  |
+|                            | is cleared; both skipped while any drag is in  |
+|                            | flight (Problem 15)                            |
+| dnd_osc72_release() on a   | a drag kitty never ended (no t=e:x=4) is       |
+| release                    | dropped, so nnn cannot stay wedged with the    |
+|                            | drag source on (Problem 15)                    |
+| dnd_grab_tmux_mouse()      | the detached release can never run before the  |
+| waits                      | grab and strand tmux mouse off (Problem 15)    |
 | dnd_clear_data() on every  | restores tmux mouse so a drag can never leave  |
 |   drag-end                 | it disabled (Problem 4)                        |
 | tmux @nnn_dnd_mouse marker | the tmux mouse grab survives nnn: a kill -9 or |
@@ -3176,7 +3200,14 @@ ASCII Table 3.7.6: DnD lifecycle hooks and the invariants they protect
 | dnd_recent_drag() (~600ms) | a drop onto our OWN window is a no-op: the      |
 |                            | release click does not open a file, and the    |
 |                            | spurious re-offer is ignored (Problem 7)       |
-| cleanup(): disable         | StopOfferingDrags + bracketed paste off on exit|
+| cleanup(): disable         | StopOfferingDrags (tmux: only an own arm) +    |
+|                            | bracketed paste off on exit                    |
+| dnd_osc72_offer(): not     | tmux: an offer for a gesture another pane      |
+| armed                      | armed is refused, never dragging the wrong     |
+|                            | file (Problem 15)                              |
+| t=e:x=4: mousemask reset   | ncurses forgets the release the native drag    |
+|                            | swallowed, so the next press is not lost       |
+|                            | (Problem 15)                                   |
 +----------------------------+------------------------------------------------+
 ```
 

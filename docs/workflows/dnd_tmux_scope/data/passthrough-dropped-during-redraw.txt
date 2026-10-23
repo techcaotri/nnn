@@ -1,0 +1,16 @@
+Purpose: evidence for Problem 15.8 'timing dependence' and 15.10 'related fact'.
+With tmux slowed by -vv, the pre-fix nnn's startup EnableDrag reached the tmux server
+(input_dcs_dispatch) but was never written to the client: the client received no OSC 72.
+Inference (not shown by the log itself): nnn was started with respawn-pane, whose window
+redraw was most likely still pending. tmux tty_client_ready() returns 0 while
+CLIENT_REDRAWWINDOW is set (tty.c:1618) unless allow-passthrough is 'all' (input.c:2657).
+
+nnn debug log (what nnn wrote):
+  out: \e]72;t=o:x=1;\e\
+  enable sent (drag offering on)
+  out: \e]72;t=o:x=2\e\
+
+tmux server log:
+  43105:1792723253.591035 input_dcs_dispatch: "tmux;\033]72;t=o:x=1;\033\\"
+
+  occurrences of "72;t=o" in the client output: 0

@@ -1,0 +1,100 @@
+Purpose: evidence for docs/nnn_Problems_And_Solutions.md Problem 15 (15.5, 15.6).
+Source: tmux 3.7b server log (-vv) from an isolated server (-L nnn-dnd-repro-*), driven by a
+pty 'fake kitty' that sent kitty 0.49.2's gesture offers; the drag-source flag was forced on, as
+the pre-fix nnn's startup registration leaves it. Window 2 ran '/bin/cat -v'. Trimmed to the
+keys tmux parsed and the commands they fired; timestamps are tmux's (seconds since the epoch).
+
+1792724749.146335 cmdq_fire_command </dev/pts/9>: (2941) show-options -gv @nnn_dnd_mouse
+1792724751.151808 /dev/pts/39: keys are 9 (\033[<0;3;6M)
+1792724751.151816 /dev/pts/39: complete key \033[<0;3;6M 0x200000031
+1792724751.151998 cmdq_fire_command </dev/pts/39>: (858) select-pane -t =
+1792724751.152024 cmdq_fire_command </dev/pts/39>: (858) send-keys -M
+1792724751.231981 /dev/pts/39: keys are 39 (\033[<32;4;6M\033]72;t=o:x=3:y=5:X=35:Y=110\033\\)
+1792724751.231991 /dev/pts/39: complete key \033[<32;4;6M 0x200000031
+1792724751.232026 /dev/pts/39: complete key \033] 0x10000000005d
+1792724751.232032 /dev/pts/39: complete key 7 0x37
+1792724751.232037 /dev/pts/39: complete key 2 0x32
+1792724751.232041 /dev/pts/39: complete key ; 0x3b
+1792724751.232046 /dev/pts/39: complete key t 0x74
+1792724751.232051 /dev/pts/39: complete key = 0x3d
+1792724751.232056 /dev/pts/39: complete key o 0x6f
+1792724751.232061 /dev/pts/39: complete key : 0x3a
+1792724751.232065 /dev/pts/39: complete key x 0x78
+1792724751.232069 /dev/pts/39: complete key = 0x3d
+1792724751.232074 /dev/pts/39: complete key 3 0x33
+1792724751.232080 /dev/pts/39: complete key : 0x3a
+1792724751.232084 /dev/pts/39: complete key y 0x79
+1792724751.232088 /dev/pts/39: complete key = 0x3d
+1792724751.232094 /dev/pts/39: complete key 5 0x35
+1792724751.232099 /dev/pts/39: complete key : 0x3a
+1792724751.232104 /dev/pts/39: complete key X 0x58
+1792724751.232108 /dev/pts/39: complete key = 0x3d
+1792724751.232113 /dev/pts/39: complete key 3 0x33
+1792724751.232118 /dev/pts/39: complete key 5 0x35
+1792724751.232122 /dev/pts/39: complete key : 0x3a
+1792724751.232127 /dev/pts/39: complete key Y 0x59
+1792724751.232131 /dev/pts/39: complete key = 0x3d
+1792724751.232136 /dev/pts/39: complete key 1 0x31
+1792724751.232140 /dev/pts/39: complete key 1 0x31
+1792724751.232144 /dev/pts/39: complete key 0 0x30
+1792724751.232150 /dev/pts/39: complete key \033\\ 0x10000000005c
+1792724751.232197 cmdq_fire_command </dev/pts/39>: (875) if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -M }
+1792724751.232247 cmdq_fire_command </dev/pts/39>: (881) copy-mode -M
+1792724751.235939 cmdq_fire_command </dev/pts/39>: (2343) command-prompt -N -I 7 -p (repeat) { send-keys -N "%%" }
+1792724751.272087 /dev/pts/39: keys are 10 (\033[<32;5;6M)
+1792724751.272093 /dev/pts/39: complete key \033[<32;5;6M 0x200000031
+1792724751.272143 cmdq_fire_command </dev/pts/39>: (2949) send-keys -N 7
+1792724751.272195 cmdq_fire_command </dev/pts/39>: (2283) command-prompt -N -I 2 -p (repeat) { send-keys -N "%%" }
+1792724751.312180 /dev/pts/39: keys are 10 (\033[<32;6;6M)
+1792724751.312190 /dev/pts/39: complete key \033[<32;6;6M 0x200000031
+1792724751.312222 cmdq_fire_command </dev/pts/39>: (2951) send-keys -N 2
+1792724751.312278 cmdq_fire_command </dev/pts/39>: (2391) send-keys -X jump-again
+1792724751.312509 cmdq_fire_command </dev/pts/39>: (2671) command-prompt -1 -p "(jump to forward)" { send-keys -X jump-to-forward -- "%%" }
+1792724751.352336 /dev/pts/39: keys are 10 (\033[<32;7;6M)
+1792724751.352343 /dev/pts/39: complete key \033[<32;7;6M 0x200000031
+1792724751.392467 /dev/pts/39: keys are 10 (\033[<32;8;6M)
+1792724751.392475 /dev/pts/39: complete key \033[<32;8;6M 0x200000031
+1792724751.432620 /dev/pts/39: keys are 10 (\033[<32;9;6M)
+1792724751.432792 /dev/pts/39: complete key \033[<32;9;6M 0x200000031
+1792724751.778237 /dev/pts/39: keys are 9 (\033[<0;9;6m)
+1792724751.778243 /dev/pts/39: complete key \033[<0;9;6m 0x200000031
+1792724752.178766 /dev/pts/39: keys are 10 (\033[<0;21;9M)
+1792724752.178771 /dev/pts/39: complete key \033[<0;21;9M 0x200000031
+1792724752.228882 /dev/pts/39: keys are 42 (\033[<32;22;9M\033]72;t=o:x=21:y=8:X=215:Y=170\033\\)
+1792724752.228886 /dev/pts/39: complete key \033[<32;22;9M 0x200000031
+1792724752.228895 /dev/pts/39: complete key \033] 0x10000000005d
+1792724752.228924 /dev/pts/39: complete key 7 0x37
+1792724752.228930 /dev/pts/39: complete key 2 0x32
+1792724752.228935 /dev/pts/39: complete key ; 0x3b
+1792724752.228940 /dev/pts/39: complete key t 0x74
+1792724752.228945 /dev/pts/39: complete key = 0x3d
+1792724752.228951 /dev/pts/39: complete key o 0x6f
+1792724752.228956 /dev/pts/39: complete key : 0x3a
+1792724752.228961 /dev/pts/39: complete key x 0x78
+1792724752.228966 /dev/pts/39: complete key = 0x3d
+1792724752.228972 /dev/pts/39: complete key 2 0x32
+1792724752.228977 /dev/pts/39: complete key 1 0x31
+1792724752.228982 /dev/pts/39: complete key : 0x3a
+1792724752.228988 /dev/pts/39: complete key y 0x79
+1792724752.228993 /dev/pts/39: complete key = 0x3d
+1792724752.228998 /dev/pts/39: complete key 8 0x38
+1792724752.229003 /dev/pts/39: complete key : 0x3a
+1792724752.229008 /dev/pts/39: complete key X 0x58
+1792724752.229013 /dev/pts/39: complete key = 0x3d
+1792724752.229017 /dev/pts/39: complete key 2 0x32
+1792724752.229022 /dev/pts/39: complete key 1 0x31
+1792724752.229026 /dev/pts/39: complete key 5 0x35
+1792724752.229030 /dev/pts/39: complete key : 0x3a
+1792724752.229035 /dev/pts/39: complete key Y 0x59
+1792724752.229039 /dev/pts/39: complete key = 0x3d
+1792724752.229043 /dev/pts/39: complete key 1 0x31
+1792724752.229047 /dev/pts/39: complete key 7 0x37
+1792724752.229051 /dev/pts/39: complete key 0 0x30
+1792724752.229057 /dev/pts/39: complete key \033\\ 0x10000000005c
+1792724752.229078 cmdq_fire_command </dev/pts/39>: (2957) send-keys -X jump-to-forward -- ]
+1792724752.229372 cmdq_fire_command </dev/pts/39>: (2917) send-keys -X copy-pipe-and-cancel "cat >> /tmp/claude-1000/-home-tripham-Dev-Playground-Terminal-nnn/77411640-6908-4bc0-b2ad-804bf7d152a4/scra
+1792724752.279055 /dev/pts/39: keys are 10 (\033[<0;22;9m)
+1792724752.279062 /dev/pts/39: complete key \033[<0;22;9m 0x200000031
+
+Resulting window 2 content (/bin/cat -v shows the ESC \ that fish swallows):
+:x=3:y=5:X=35:Y=110^[\72;t=o:x=21:y=8:X=215:Y=170^[\

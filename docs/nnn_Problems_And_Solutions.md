@@ -472,6 +472,12 @@ one atomic, unpadded, empty-machine-id batch plus a text icon. Opt-in via
 on` so the outbound escapes reach kitty. Confirmed working: the `N file(s)` icon
 appears and dropping on an external target delivers the file.
 
+> **Update (Problem 15):** inside tmux, that startup registration covered the
+> whole kitty window, so a mouse drag in ANY tmux window or pane became an offer
+> typed into the active pane. Inside tmux, nnn now arms the drag source only for
+> a gesture that starts on its own list. Bare kitty keeps the startup
+> registration described here.
+
 ---
 
 ## Problem 3 -- Drag stops working after opening a file (and never recovers)
@@ -510,6 +516,10 @@ right after the `F_NORMAL` `refresh()`. On its next iteration `browse()` (before
 reading input) calls `dnd_osc72_resync()` ([src/nnn.c:4272](../src/nnn.c#L4272)),
 which drops any half-built drag and re-sends EnableDrag. No-op unless
 `NNN_DND_OSC72` is enabled. Commit `f4d75e81`.
+
+> **Update (Problem 15):** inside tmux there is no lifetime registration any
+> more, so the resync only drops state and ends any armed gesture. The next press
+> on the list re-arms. Bare kitty still re-sends EnableDrag as described.
 
 ---
 
@@ -2509,3 +2519,697 @@ minute spent comparing 142 against 128 was wasted; the one command that settled
 it in a second was asking the kernel for an instance and reading the errno. When
 a proxy metric can exceed the limit it supposedly tracks, that is not a rounding
 error -- it is proof the proxy is measuring something else.
+
+---
+
+## Problem 15 -- With the dual nnn running, mouse text selection in other tmux windows freezes, then a click types `:x=..:y=..;t=o:..` into the shell
+
+### 15.1 Symptom (as reported)
+
+> 1. If I don't run `/home/tripham/bin/start_dual_nnn.sh` to start dual nnn with
+>    drag-and-drop support, then I can use the mouse to select text in other
+>    tmux windows successfully.
+> 2. If I run `start_dual_nnn.sh`, when using the mouse to select text in other
+>    tmux windows, after selecting 2 or 3 characters the mouse cursor seems stuck
+>    and doesn't change, then left-click again produces garbage text.
+
+The screenshot (`Screenshot from 2026-10-23 09-15-59.png`) shows a fish prompt in
+a `~/Downloads` window of the `main_fish` session, with this on the command line:
+
+```text
+:x=1:y=10:X=23:Y=38772;t=o:x=64:y=14:X=1152:Y=531
+```
+
+Every value below was read from the live system on 2026-10-23.
+
+| Component | Value |
+|---|---|
+| kitty | `0.49.2`; `~/.local/kitty.app` replaced at 09:03:24, the `main_fish` kitty (pid 358953) started 09:03:34 |
+| tmux | `3.7b` (`/usr/local/bin/tmux`, byte-identical to `~/Dev/Playground_Terminal/tmux/tmux`) |
+| tmux options | `mouse on`, `mode-keys vi`, `allow-passthrough on`, `escape-time 10`, `focus-events on`, `base-index 1` |
+| fish | `4.8.1` |
+| ncurses | `6.3` (`libncursesw.so.6.3`) |
+| nnn instances | pid 593707 (`-s right`, pane `%38`), pid 594434 (`-s left`, pane `%1`), started 09:14:37-38 |
+| nnn environment | `NNN_DND_OSC72=1`, `NNN_DND_DEBUG=/tmp/nnn-dnd.log` in both `/proc/<pid>/environ` |
+| Session | `main_fish`, 22 windows; window 1 holds the two nnn panes |
+
+### 15.2 TL;DR root cause
+
+nnn registered itself as a kitty OSC-72 **drag source for its whole lifetime**
+(`t=o:x=1` at startup). kitty keeps that registration as **one flag per kitty
+window**, and inside tmux the kitty window is the entire tmux client: every tmux
+window and pane. From then on:
+
+1. **kitty** turned every left-button drag anywhere in the window into a drag
+   offer (`ESC ] 72 ; t=o:x=..:y=..:X=..:Y=.. ESC \`), sent to its child, tmux.
+2. **tmux** has no OSC-72 parser. It split the offer into ordinary keystrokes
+   (`M-]`, `7`, `2`, `;`, `t`, `=`, `o`, ...) and gave them to the **active pane**.
+3. In the window where the user was selecting text, the active pane was in
+   **copy mode**, so the keystrokes ran copy-mode-vi commands. `t` opened the
+   `(jump to forward)` prompt, which **blocks tmux's command queue and freezes the
+   display**: the selection stops after 2-3 characters.
+4. The next click produced a second offer. Its first key answered the pending
+   prompt, the queue drained, `o` ran `copy-pipe-and-cancel` (in this setup that
+   pipes the selection to **`xdg-open`**) and left copy mode, and the remaining
+   bytes of both offers were typed into fish.
+
+nnn never saw any of these offers: they went to other panes.
+
+| Layer | What it did | Evidence |
+|---|---|---|
+| nnn | Registered for the whole kitty window, for the whole session | `t=o:x=1;` at startup in `/tmp/nnn-dnd.log` and in the harness (15.8) |
+| kitty 0.49.2 | Sends an offer on any left-drag past 5 px while the flag is set | `kitty/mouse.c:667-698`, `:918` (15.4) |
+| tmux 3.7b | Turns unknown `ESC ]` into `M-]` plus plain keys for the active pane | `tty-keys.c:910`; tmux `-vv` trace (15.5) |
+| copy-mode-vi | Runs the keys as commands; a prompt blocks the queue | `cmd-command-prompt.c:176`, `status.c:734` (15.6) |
+| fish | Receives what is left | screenshot; harness pane capture |
+
+**Fix (inside tmux only):** nnn no longer registers at startup. It **arms** the
+drag source when a left button press lands on one of its own entries, and
+**disarms** it as soon as that gesture ends, at the latest 2 s later if the
+release never reaches nnn. Bare kitty keeps the old lifetime registration,
+because there the kitty window belongs to nnn alone.
+
+### 15.3 Background: one drag-source flag per kitty window
+
+kitty's drag-source state lives in `w->drag_source` of a kitty `Window`
+(`ds.can_offer` in `kitty/dnd.c:1538-1546`): `t=o:x=1` sets it, `t=o:x=2` clears it.
+A kitty window has exactly one child process. In this setup that child is the
+tmux **client** started by `kitty /bin/bash -c tmux new-session -A -s main_fish
+fish`. Everything tmux draws, across all 22 windows and all their panes, is one
+kitty window.
+
+nnn reaches kitty through tmux's DCS passthrough (`ESC P tmux; ... ESC \`). tmux
+unwraps it and writes the raw OSC to the client terminal. So when nnn says "I am
+a drag source", kitty hears "this whole window is a drag source".
+
+```mermaid
+%% Where kitty's drag-source flag lives, and where its offers go
+flowchart TD
+    NNN["nnn L or nnn R<br/>(one tmux pane)"]
+    KW["kitty window<br/>ONE drag-source flag: can_offer"]
+    TC["tmux client<br/>(the kitty window's only child process)"]
+    TS["tmux server<br/>(no OSC-72 parser)"]
+    AP["ACTIVE pane of the current tmux window<br/>(fish, copy mode, vim, nnn ...)"]
+    NNN -->|"t=o:x=1 through passthrough<br/>sets the flag for the WHOLE kitty window"| KW
+    KW -->|"left drag anywhere: offer t=o:x=..:y=.."| TC
+    TC -->|"forwards the bytes"| TS
+    TS -->|"bytes become keys M-], 7, 2, ..."| AP
+```
+
+The registration is made by one pane but scoped to the whole kitty window, and
+the offers it causes are delivered to whichever pane is active.
+
+| Component | Role in the failure | Notes |
+|---|---|---|
+| nnn pane | Sends `t=o:x=1` once at startup | Through `allow-passthrough on` |
+| kitty window | Holds `can_offer` | One flag, no notion of tmux panes |
+| tmux client | kitty's child; receives every offer | A plain pty client |
+| tmux server | Parses the client's input into keys | No OSC-72 support at all |
+| Active pane | Receives the offer as keystrokes | Usually not nnn |
+
+**Fact:** kitty's spec has a key for multiplexers: if `t=o` carries `i=<id>`, kitty
+echoes `i=<id>` in every reply "to direct the response codes to the correct
+client" (`dnd-protocol.rst.txt`, section Multiplexers). tmux 3.7b does not
+implement it (`strings` and the source tree contain no OSC 72 handling), so
+there is no routing to rely on.
+
+### 15.4 Step 1 -- kitty turns any left drag into an offer
+
+From the kitty 0.49.2 source (tag `v0.49.2`, commit `b2cb871`):
+
+| Fact | Where |
+|---|---|
+| Every left press arms a potential drag, whatever the flag | `handle_button_event()`: `if (!is_release) arm_potential_drag(w, button);` (`kitty/mouse.c:918`) |
+| Every motion event, after it is forwarded to the child, calls `handle_potential_drag()` | `kitty/mouse.c:724` |
+| Once the pointer is more than `drag_threshold` from the press, kitty decides **once** for that gesture | `kitty/mouse.c:667-671` |
+| If `can_offer` is set at that moment, kitty sends `t=o:x=..:y=..:X=..:Y=..` to the child | `kitty/mouse.c:687-688`, `kitty/dnd.c:2586` |
+| `drag_threshold` defaults to 5 px; `~/.config/kitty/kitty.conf` does not change it | `kitty/options/definition.py:1193` |
+| Sending the offer changes no mouse state: motion keeps being forwarded | `drag_offer_start_to_child()` only queues bytes |
+
+So, with nnn running, any text selection gesture in any tmux window became an
+offer as soon as the pointer moved 5 px: about a quarter of a character cell on
+this screen (cells are 18 px wide: `X=1152` at `x=64`).
+
+### 15.5 Step 2 -- tmux turns the offer into keystrokes
+
+tmux's input parser (`tty_keys_next()`, `tty-keys.c`) recognises clipboard, colour,
+device-attribute and mouse replies, and nothing else that starts with `ESC ]`. An
+unknown `ESC x` falls through to the meta-key rule at `tty-keys.c:910`:
+
+```c
+key = (u_char)buf[1] | KEYC_META;   /* ESC ] becomes M-] */
+```
+
+Every following byte is a separate key, and keys go to the **active pane** of the
+client's current window.
+
+This is tmux's own `-vv` log from the isolated reproduction (15.8; full trimmed
+trace in
+[data/tmux-vv-offer-leak-trace.txt](workflows/dnd_tmux_scope/data/tmux-vv-offer-leak-trace.txt)).
+It shows the first offer arriving together with a motion event, and how it was
+parsed:
+
+```text
+keys are 39 (\033[<32;4;6M\033]72;t=o:x=3:y=5:X=35:Y=110\033\\)
+complete key \033[<32;4;6M 0x200000031      <- the drag motion
+complete key \033] 0x10000000005d           <- M-]
+complete key 7 0x37
+complete key 2 0x32
+complete key ; 0x3b
+complete key t 0x74
+complete key = 0x3d
+complete key o 0x6f
+complete key : 0x3a
+...
+complete key \033\\ 0x10000000005c          <- M-\ (the ST terminator)
+```
+
+### 15.6 Step 3 -- copy mode runs the keys as commands, then fish gets the rest
+
+The text selection had put the pane in copy mode (`MouseDrag1Pane` runs
+`copy-mode -M` for a pane that does not use the mouse itself). The keys hit this
+setup's `copy-mode-vi` table. The commands below are the ones tmux actually ran,
+in order, from the same `-vv` log:
+
+```text
+   +0 ms  select-pane -t =                         <- the press
+  +80 ms  copy-mode -M                             <- the drag: selection starts
+  +84 ms  command-prompt -N -I 7 -p (repeat) ...   <- key 7
+ +120 ms  send-keys -N 7
+ +120 ms  command-prompt -N -I 2 -p (repeat) ...   <- key 2
+ +160 ms  send-keys -N 2
+ +160 ms  send-keys -X jump-again                  <- key ;
+ +161 ms  command-prompt -1 -p "(jump to forward)" <- key t: queue now BLOCKED
+          (motion at +200, +240, +281 ms and the release at +626 ms run nothing)
++1077 ms  second gesture: motion + offer 2 arrive
++1077 ms  send-keys -X jump-to-forward -- ]        <- offer 2's M-] answers the prompt
++1077 ms  send-keys -X copy-pipe-and-cancel ...    <- offer 1's queued o
+```
+
+| Offer key | Binding in this setup | Effect |
+|---|---|---|
+| `M-]` | none in `copy-mode-vi` | ignored |
+| `7`, `2` | `command-prompt -N -I <n> -p (repeat)` | repeat-count prompts |
+| `;` | `send-keys -X jump-again` | moves the selection end |
+| `t` | `command-prompt -1 -p "(jump to forward)"` | **waits for one key, blocks the queue, freezes the display** |
+| `o` | `copy-pipe-and-cancel "... xargs ... xdg-open ..."` (tmux-open) | **runs `xdg-open` on the selection**, leaves copy mode |
+| `:x=1:y=10:X=23:Y=387` | copy mode has ended | typed into fish |
+| `M-\` | fish | consumed by fish without printing (not traced further) |
+
+Three tmux facts make this worse than a few stray characters:
+
+- **The prompt blocks the client's command queue.** `command-prompt` without `-b`
+  returns `CMD_RETURN_WAIT` (`cmd-command-prompt.c:176`). Keys and mouse events
+  queued behind it, including the rest of offer 1 and the user's further drag
+  motion, wait until the prompt completes.
+- **New keys bypass the queue while a prompt is open.**
+  `server_client_handle_key()` hands them straight to the prompt ("The queue
+  might be blocked so they need to be processed immediately",
+  `server-client.c:1466`). That is how offer 2's leading `M-]` answered the prompt
+  left open by offer 1.
+- **The prompt freezes the display.** `status_prompt_set()` sets `TTY_FREEZE`
+  unless the prompt was opened with `-C` (`status.c:734`). The screen stops
+  updating: "the mouse cursor seems stuck and doesn't change".
+
+```mermaid
+%% The reported failure: a text selection in a fish window becomes a drag offer
+sequenceDiagram
+    autonumber
+    participant U as User (mouse)
+    participant K as kitty 0.49.2
+    participant T as tmux 3.7b
+    participant C as copy mode (window 2)
+    participant F as fish (window 2)
+    Note over K: can_offer = 1 since nnn started
+    U->>K: left press on text in window 2
+    K->>T: press, then motion (forwarded)
+    T->>C: MouseDrag1Pane starts copy mode and a selection
+    Note over K: pointer moved past drag_threshold (5 px)
+    K->>T: offer ESC ] 72#59;t=o:x=1:y=10:X=23:Y=387 ESC \
+    T->>C: keys M-], 7, 2, #59;, t, =, o, ...
+    C->>C: 7 and 2 run (repeat) prompts, #59; runs jump-again
+    C->>C: t opens the (jump to forward) prompt: command queue blocked
+    Note over C: selection frozen, later motion and release wait in the queue
+    U->>K: second click, a few px of motion
+    K->>T: offer ESC ] 72#59;t=o:x=64:y=14:X=1152:Y=531 ESC \
+    T->>C: M-] answers the prompt as ]
+    C->>C: queued o runs copy-pipe-and-cancel (xdg-open), copy mode ends
+    T->>F: typed - :x=1:y=10:X=23:Y=387 then 72#59;t=o:x=64:y=14:X=1152:Y=531
+```
+
+Steps 1-7 are the "selection freezes after 2 or 3 characters" part of the
+report; steps 8-12 are the "left-click again produces garbage" part. Nothing
+reaches fish until the second click, because offer 1's tail is stuck behind the
+prompt.
+
+| Participant | Role |
+|---|---|
+| User | Selects text, then clicks again |
+| kitty | Sends one offer per gesture while `can_offer` is set |
+| tmux | Parses the offers into keys for the active pane |
+| copy mode | Runs the keys as `copy-mode-vi` commands |
+| fish | Receives the remainder as typed text |
+
+The screenshot text decodes exactly:
+
+| Fragment on the fish line | Origin |
+|---|---|
+| `:x=1:y=10:X=23:Y=387` | Offer 1 (cell 1,10; pixel 23,387) after `M-] 7 2 ; t = o` were eaten |
+| *(nothing)* | Offer 1's `ESC \`, taken by fish as Alt+\ |
+| `72;t=o:x=64:y=14:X=1152:Y=531` | Offer 2 after its `M-]` answered the prompt |
+
+**Side effect worth knowing:** each leaked offer ran this setup's copy-mode `o`
+binding, which passes the selected text to `xdg-open`. Here the selection was 2-3
+characters and nothing visible opened, but it is a real command execution
+triggered by a mouse drag.
+
+### 15.7 Why it works without the dual nnn
+
+With no nnn holding `NNN_DND_OSC72=1`, nobody sends `t=o:x=1`, so `can_offer` is
+false. `handle_potential_drag()` still runs on every drag, finds nothing to do
+(no kitty selection, no flag, no URL under the press), and sends nothing. tmux
+sees only mouse events, and copy mode selects text normally. The old nnn also
+sent `t=o:x=2` at exit, so quitting it restored normal selection.
+
+### 15.8 Reproduction without touching the live session
+
+The live session could not be used for experiments, and nothing here can move a
+real mouse. So the failure was reproduced at the byte level with a new
+regression test, [misc/test/test-dnd-osc72-scope.py](../misc/test/test-dnd-osc72-scope.py):
+
+- A private tmux server (`-L nnn-dnd-scope-<pid>`, its own `-f` config) with the
+  owner's relevant options and `copy-mode-vi` keys. `xdg-open` and `xsel` are
+  replaced by log files.
+- A Python "fake kitty" runs the tmux client in a pty. It tracks `can_offer` from
+  the OSC-72 that tmux passes through, and sends a `t=o` offer exactly when kitty
+  0.49.2 would: left button held, pointer more than 5 px from the press (which can
+  still be inside the pressed cell), flag set at that moment, once per gesture.
+  It reports motion only on a cell change, sends no mouse events while tmux has
+  mouse reporting off, and models a drag freed by `t=o:x=2` and a `t=E;EPERM`
+  refusal. Several of these were added after the independent review (15.16)
+  showed where the first version differed from real kitty.
+- nnn runs with `HOME`, its selection file and its debug log inside a scratch
+  directory, in the same window layout as `start_dual_nnn.sh` (nnn L | nnn R |
+  shell), plus a second window with a plain shell.
+
+With the **pre-fix binary**, a text-selection drag in the second window produced
+the same pattern as the screenshot (cell and pixel values differ):
+
+```text
+:x=3:y=5:X=35:Y=110^[\72;t=o:x=21:y=8:X=215:Y=170^[\
+```
+
+(`/bin/cat -v` shows the `ESC \` that fish swallowed.) The `o` stand-in log was
+written, which is where `xdg-open` would have run, and the normal copy at the
+end of the drag never happened.
+
+| Scenario (checks) | Pre-fix binary | Fixed binary |
+|---|---|---|
+| T0 startup leaves the flag off, tmux (1) | FAIL: `t=o:x=1;` from both panes | PASS |
+| T1 text drag in another window (4) | 4 FAIL: 2 offers, text typed, `o` fired, no normal copy | 4 PASS |
+| T2 text drag in the shell pane of the dual window (2) | 1 FAIL (offer sent), 1 PASS | 2 PASS |
+| T3, T3b drag out of nnn L, twice (8) | 4 FAIL: first offer lost (Assumption below), never disarms | 8 PASS |
+| T4a first drag from nnn R right after one from nnn L (3) | 3 FAIL: nnn L dragged **its own file `c.txt`** | 3 PASS: refused, no file dragged |
+| T4b retry from nnn R (4) | 2 FAIL: dragged `c.txt`, not `b.txt`; never disarms | 4 PASS |
+| tmux mouse grab restored after the drags (1) | PASS | PASS |
+| T5 click arms then disarms; T6 20 press/release cycles (2) | 2 FAIL | 2 PASS |
+| T7, T7b flick out of the pane: no offer, timeout, key (4) | 4 FAIL | 4 PASS |
+| T10 header and blank rows do not arm (2) | 1 FAIL (blank-row drag offered), 1 PASS | 2 PASS |
+| T11 `t=E;EPERM`: disarm, grab not stranded (2) | 1 FAIL, 1 PASS | 2 PASS |
+| T12 offer inside the self-drop guard (1) | FAIL | PASS |
+| T13 silent kitty: dead drag dropped, grab released, no leak (3) | 3 FAIL | 3 PASS |
+| T14, T15 a release does not answer the sort or filter prompt (2) | 2 FAIL | 2 PASS |
+| T16 off while a CLI opener runs (1) | FAIL | PASS |
+| T8, T8b startup clear, and its guard (2) | 1 FAIL (no clear at all), 1 PASS | 2 PASS |
+| T9 bare kitty keeps the lifetime registration (2) | 2 PASS | 2 PASS |
+| **Total (44)** | **PASS=13 FAIL=31** | **PASS=44 FAIL=0** |
+
+`Assumption:` in the pre-fix run, T3's offer most likely went into a tmux prompt
+left open by T2's leaked offer (15.6). nnn L's log shows its first received offer
+is T3b's, but the prompt itself was not captured.
+
+`Fact:` the T11 grab check is timing-dependent. It caught the race of 15.10d
+once, during the fix; the pre-fix run above happened not to hit it.
+
+**Fact (timing dependence):** in runs where tmux was slowed by `-vv` logging, the
+pre-fix binary's startup `t=o:x=1` reached the tmux server (`input_dcs_dispatch`)
+but never reached the client, and the T1 and T2 checks passed
+([data/passthrough-dropped-during-redraw.txt](workflows/dnd_tmux_scope/data/passthrough-dropped-during-redraw.txt)).
+`Assumption:` the cause is the window redraw left pending by `respawn-pane`, which
+the harness uses to start nnn; tmux drops a passthrough while one is pending
+(`tty_client_ready()`, `tty.c:1618`). Either way, the old bug depended on whether
+that single registration got through. In the live session it did: the garbage
+proves the flag was set.
+
+### 15.9 Solution -- arm the drag source per gesture inside tmux
+
+`Decision:` inside tmux, kitty's flag is on only while a left-button gesture that
+began on one of nnn's entries is in progress, or while the drag it started is in
+flight. Outside tmux nothing changes.
+
+The rule follows from where the offer goes. tmux delivers an offer to the active
+pane, and a left press in a pane makes it active (`MouseDown1Pane` runs
+`select-pane -t =`). So an offer is safe exactly when the press that started the
+gesture was in nnn, which is when nnn arms.
+
+```mermaid
+%% g_dnd_armed inside tmux: the life of one gesture
+stateDiagram-v2
+    [*] --> Disarmed: first idle tick clears a leftover flag, t=o x=2
+    Disarmed --> Armed: left press on an entry, sends t=o x=1
+    Armed --> Disarmed: release, key, subprocess, no-drag offer or 2 s timeout, sends t=o x=2
+    Armed --> Dragging: offer answered
+    Dragging --> Disarmed: t=e x=4, t=E error, or a release (dead drag), sends t=o x=2
+    Disarmed --> [*]: exit
+    Armed --> [*]: exit, sends t=o x=2
+```
+
+The flag is off at rest. Each gesture that starts on an entry switches it on,
+and every way a gesture can end switches it off again, including a release that
+never reaches nnn (2 s timeout). The one exception is a drag kitty is carrying:
+`t=o:x=2` would make kitty free that drag's data.
+
+| Event (inside tmux) | Action | Code |
+|---|---|---|
+| First idle tick after start | send `t=o:x=2` once, unless armed or any nnn's drag is in flight; never `t=o:x=1` | `dnd_osc72_idle()` |
+| Left press on an entry (row 2 to `ndents + 1`, above the status lines) | send `t=o:x=1`, `g_dnd_armed = TRUE`, note the time | `dnd_osc72_arm()`, from `SEL_CLICK` |
+| Left release | drop a drag still recorded (it is dead, 15.10f), then disarm | `dnd_osc72_release()`: `SEL_CLICK`, `filterentries()`, `get_input()` |
+| Offer, armed, file ready | answer as before (agree + data + icon + start) | `dnd_osc72_offer()` |
+| Offer, not armed | send `t=o:x=2`, do not drag (15.10a) | `dnd_osc72_offer()` |
+| Offer with nothing to drag, or inside the self-drop guard | disarm | `dnd_osc72_offer()` |
+| `t=e:x=4` drag finished | disarm, reset ncurses' button state (15.10b) | `dnd_osc72_event()` |
+| `t=E` not `OK` | disarm | `dnd_osc72_event()` |
+| Key read by `nextsel()` (not a mouse event, not a resize) | disarm, reset ncurses' button state | `nextsel()` |
+| Idle tick, arm older than 2 s, no drag in flight anywhere | disarm, reset ncurses' button state (15.10e) | `dnd_osc72_idle()` |
+| Foreground subprocess (`F_NORMAL`) | disarm before `exitcurses()` | `spawn()` |
+| Resync after a subprocess | drop state, disarm; nothing is re-advertised | `dnd_osc72_resync()` |
+| Exit | send `t=o:x=2` only if this instance armed | `dnd_osc72_disable()` |
+
+```mermaid
+%% The fix: kitty's flag is on only while a gesture that began on nnn's list runs
+sequenceDiagram
+    autonumber
+    participant U as User (mouse)
+    participant K as kitty
+    participant T as tmux
+    participant N as nnn (pressed pane)
+    Note over K: can_offer = 0 at rest
+    U->>K: left press on a file row
+    K->>T: press
+    T->>N: select-pane, press forwarded
+    N->>K: arm t=o:x=1 (passthrough, about 1 ms)
+    U->>K: move past 5 px
+    K->>T: offer t=o:x=..:y=..
+    T->>N: offer keys (nnn is the active pane)
+    N->>K: agree + present + icon + start, one write
+    K->>N: t=E OK, OS drag, then t=e:x=4
+    N->>K: disarm t=o:x=2
+    N->>N: mousemask re-applied (ncurses button state reset)
+```
+
+The arm has to reach kitty before the pointer moves 5 px, because kitty decides
+once per gesture (15.4). The harness measured the press-to-arm round trip
+through tmux and nnn at **0.29 to 1.73 ms** (median about 0.8 ms, 20 presses per
+run). On a real kitty the review measured the head start a drag needs: a drag
+whose first move came 4 ms or more after the press started 6 of 6 times, 2 ms
+gave 5 of 6, and 0 ms gave 0 of 6 (15.16). A deliberate drag takes longer than
+that to travel 5 px; a fast flick may not, which is what the 2 s timeout covers
+(15.10e).
+
+**Implementation** (`src/nnn.c`):
+
+| Item | Kind | What it does |
+|---|---|---|
+| `g_dnd_armed`, `g_dnd_arm_ts` | new state | the current gesture's arm, and when it was made |
+| `g_mousemask` | new state | nnn's own ncurses mask, kept so it can be re-applied |
+| `dnd_osc72_arm()` | new | sends `t=o:x=1;` (empty machine id = local drag); tmux only; `#ifndef NOMOUSE` |
+| `dnd_osc72_disarm(why)` | new | sends `t=o:x=2` if armed and no drag is in flight; logs `why` |
+| `dnd_osc72_release()` | new | a release reached nnn: drops a dead drag (15.10f), then disarms |
+| `dnd_osc72_idle()` | new | from the idle tick: the deferred startup clear and the 2 s arm timeout |
+| `dnd_tmux_drag_live()` | new | runs a shell: does Problem 13's `@nnn_dnd_mouse` marker name a live pid (a drag in flight)? |
+| `dnd_mouse_reset()` | new | re-applies `g_mousemask`, resetting ncurses' button state (15.10b) |
+| `dnd_ms_since()` | new | milliseconds since a `DND_CLOCK` reading, shared with `dnd_recent_drag()` |
+| `dnd_eat_release()` | new | for `get_input()`: consumes a release, a motion report, or a `KEY_MOUSE` without an event, so none can answer a prompt |
+| `dnd_grab_tmux_mouse()` | changed | waits for its script (about 13 ms) instead of detaching it (15.10d) |
+| `initcurses()` | changed | adds `BUTTON1_RELEASED` to the mask only when `NNN_DND_OSC72=1` and inside tmux |
+| `get_input()` | changed | one loop that skips such events and `KEY_RESIZE` |
+| `filterentries()` | changed | ignores releases and motion reports instead of leaving the prompt |
+| `browse()` `SEL_CLICK` | changed | release: `dnd_osc72_release()`; left press on an entry: arm |
+| `nextsel()` | changed | a key (not a resize) disarms; the idle tick calls `dnd_osc72_idle()` |
+| `spawn()` | changed | disarms before a curses-suspending child |
+| `dnd_osc72_enable()` / `_disable()` / `_resync()` | changed | tmux: nothing registered at startup; exit withdraws only an own arm; bare kitty unchanged |
+| `dnd_osc72_offer()` | changed | refuses an offer it did not arm; disarms on the no-drag paths |
+| `dnd_osc72_event()` | changed | disarms on drag end and on errors; resets ncurses' button state on drag end |
+| `dnd_log()` | changed | each line starts with `HH:MM:SS.mmm <pid>`, written in one `write()` |
+
+**New debug log lines** (`NNN_DND_DEBUG`):
+
+| Line | Meaning |
+|---|---|
+| `enable sent (tmux: drag source armed per gesture)` | Started inside tmux; the flag stays off until a press |
+| `cleared a leftover drag source` | First idle tick: a flag left on by an older or crashed nnn was switched off |
+| `armed (press on the list)` | A left press on an entry switched the flag on |
+| `disarm: release` / `key` / `subprocess` / `resync` | The gesture ended that way |
+| `disarm: no release (timeout)` | The release never reached nnn; the arm ended after 2 s (15.10e) |
+| `disarm: drag finished` / `drag refused` | After a real drag, or after kitty refused to start it |
+| `disarm: nothing to drag` / `offer ignored` | An offer arrived but no drag was started |
+| `offer refused (gesture not armed here)` | An offer reached this pane for a gesture another pane armed (15.10a) |
+| `drag never ended (release seen): dropped` | kitty never ended a drag; the next release cleared it (15.10f) |
+| `enable sent (tmux: no mouse support, no drag-out)` | An `O_NOMOUSE` build inside tmux |
+
+`Risk:` with `NNN_DND_DEBUG` set permanently, every click now adds about four log
+lines. Unset it when not diagnosing.
+
+### 15.10 Related defects found and fixed on the way
+
+The harness and the independent review (15.16) exposed more defects in the same
+code path. Most come from one kitty behaviour: **a drag dropped outside kitty
+swallows the button release** ("A native drag consumes the release event",
+`kitty/mouse.c:673`), so neither tmux nor ncurses learns that the button went up.
+For a drop onto kitty's own window, kitty delivers the release after
+`XdndFinished` (measured by the review).
+
+**(a) The wrong file could be dragged.** tmux still believes a drag is in progress
+(`mouse_drag_flag` stays set), so it turns the **next press** into the end of that
+drag (`type = KEYC_TYPE_MOUSEDRAGEND`, `server-client.c:991`). It forwards the
+press to the pane under the pointer, but never runs the `MouseDown1Pane` binding,
+so `select-pane` does not happen. After dragging from nnn L, a press-and-drag in
+nnn R therefore armed nnn R while nnn L stayed active. The offer went to nnn L,
+and the **pre-fix code answered it with nnn L's hovered file** (T4a: `c.txt` was
+dragged instead of `b.txt`; the review saw the same on a real kitty). Fix: inside
+tmux, an instance that receives an offer it did not arm refuses it and clears the
+flag. The drag does not start, and the retry works (T4b), because that first
+press has cleared tmux's stale drag state.
+
+**(b) The first click after a drag was lost.** ncurses decodes a press as
+**motion** while it believes the button is still down (`PRESS_POSITION`,
+`lib_mouse.c:932-935`), and only a release clears that belief
+(`lib_mouse.c:1016`). nnn's mask has no motion bit, so the first press after
+every external drop was silently dropped; under the new design that press is
+what arms the next drag. Fix: `dnd_mouse_reset()` re-applies nnn's own mask, and
+ncurses' `mouse_activate()` resets `_mouse_bstate` (`lib_mouse.c:1408`). It runs
+after `t=e:x=4`, and after the timeout and key disarms, because a flick released
+over another pane leaves the same stuck state (found by T7b). This also fixes the
+lost first click in bare kitty (confirmed by the review on a real kitty).
+
+One side effect had to be handled. If the button is still down when the reset
+happens (a key pressed while holding it), ncurses later decodes the real release
+as motion, filters it by the mask, and returns `KEY_MOUSE` with no event behind
+it. A pending prompt would read that as its answer: T14 showed `invalid key` in
+the sort prompt. `get_input()` (through `dnd_eat_release()`) and the filter
+prompt now ignore a motion report and a `KEY_MOUSE` without an event.
+
+**(c) The debug log could not be read across two instances.** Both dual-pane
+instances wrote untimed lines to the same file, so arm, disarm and offer events
+could not be attributed. Each line now starts with the time and the pid.
+
+**(d) The tmux mouse grab could leave the mouse off for 60 s** (Problem 13 code).
+nnn ran the grab (record `@nnn_dnd_mouse`, `set -g mouse off`, arm the watchdog)
+and, later, the release as two detached shells. When kitty refused a drag 1 ms
+after nnn answered (`t=E;EPERM`), the release shell ran first, found no marker
+and exited. The grab shell then turned the mouse off with only the 60 s watchdog
+left to restore it. The harness caught it as a stranded marker, which also made
+the next startup clear skip itself. Fix: nnn waits for the grab (10 to 15 ms,
+median 13 ms, measured; its watchdog is `run-shell -b` and returns at once); the
+release stays detached. Checked by T11.
+
+**(e) A fast flick could still leave the flag on** (review F1). kitty needs the
+arm 2 to 4 ms before the first pointer sample past 5 px (15.9). A flick loses that
+race: kitty decides "no drag", the pointer leaves the pane, and tmux gives the
+release to the pane under the pointer (`input-keys.c:807`), so nnn never sees it
+and the flag stays on. Every later text drag in another pane would leak again.
+Fix: the idle tick ends an arm older than `DND_ARM_MAX_MS` (2 s) and resets
+ncurses' button state. Checked by T7; T7b checks that a key in nnn ends it at
+once.
+
+**(f) A dead drag could wedge nnn with the flag on** (review F2). kitty frees a
+drag on any `t=o:x=2` and then never sends `t=e:x=4`, because `drag_notify()`
+returns early (`kitty/dnd.c:1862`). A second nnn starting mid-drag sent exactly
+that: the old startup clear. nnn then answered every offer with "drag already
+active" and skipped every disarm, so the flag stayed on. Fixes:
+
+- A release that reaches nnn proves no OS drag holds the pointer. It now drops a
+  drag still recorded before disarming (`dnd_osc72_release()`), and keeps the
+  self-drop guard's timestamp. Checked by T13.
+- The startup clear moved to the first idle tick, by which time tmux has finished
+  redrawing the new pane (startup writes were dropped, see below). Like the
+  timeout, it is skipped while this nnn is armed or while any nnn's drag is in
+  flight (`dnd_tmux_drag_live()` reads Problem 13's marker). Checked by T8 and
+  T8b.
+
+**Related fact, not changed:** with `allow-passthrough on`, tmux delivers a
+passthrough only when the pane is visible, the pane has no pending redraw
+(`screen_write_set_client_cb()`, `screen-write.c:149`), and the client is neither
+redrawing nor frozen by a prompt (`tty_client_ready()`, `tty.c:1612-1622`).
+`allow-passthrough all` lifts those conditions, but it also lets every invisible
+pane write raw escapes to the terminal. The design does not depend on it: arms
+and disarms are sent while the pressed pane is visible and in use, and the
+startup clear waits for the idle tick.
+
+### 15.11 Alternatives considered and rejected
+
+| Alternative | Why rejected |
+|---|---|
+| Keep the startup registration; disarm on focus-out (`CSI ? 1004 h`) | The disarm races kitty's 5 px decision. Losing that race is **harmful** (garbage, copy-mode commands), whereas losing the per-gesture race only means no drag. Also, a pane in a background window cannot reach kitty with `allow-passthrough on`. |
+| Arm on focus-in, disarm on focus-out, two instances | Two processes writing one flag: a late disarm from the old pane can land after the new pane's arm. |
+| A timer as the main end of a gesture | Breaks a press-hold-then-drag, and a timer firing in one instance can tear down another instance's in-flight drag (kitty frees it on `t=o:x=2`). Adopted only as a 2 s backstop for a release that never arrives, and skipped while any drag is in flight (15.10e). |
+| tmux hooks writing `t=o:x=2` to `#{client_tty}` | Bypasses tmux's output stream (can split one of tmux's own sequences), and changes the owner's tmux config. |
+| The spec's `i=<id>` multiplexer key | tmux 3.7b does not implement OSC-72 routing. |
+| `allow-passthrough all` | A security relaxation, and it does not change who receives the offers. |
+| Binding `MouseDragEnd1Pane` to `select-pane` in the root table | Would fix 15.10a's first press, but it changes global tmux behaviour for every pane. Left to the owner (15.14). |
+
+### 15.12 Verification
+
+| # | Command | Result | Status |
+|---|---|---|---|
+| 1 | `./build.sh` | clean; only the pre-existing `fuzzyentrycmp defined but not used` warning | PASS |
+| 2 | `make O_NOMOUSE=1 O_EMOJI=1 O_PCRE2=1` (scratch copy) | clean, no warnings | PASS |
+| 3 | `misc/test/test-dnd-osc72-scope.py` (fixed binary) | `PASS=44 FAIL=0`; arm latency min 0.29, median 0.80, max 1.73 ms | PASS |
+| 4 | `misc/test/test-dnd-osc72-scope.py --nnn nnn.bak-2026-10-23-pre-dnd-scope` | `PASS=13 FAIL=31`, reproduces the report (15.8) | expected FAIL |
+| 5 | `misc/test/test-dnd-tmux-mouse.sh` | `PASS=21 FAIL=0` (Problem 13's grab and watchdog scripts) | PASS |
+| 6 | Manual disarm command (15.14) from `bash` and from `fish`, through tmux | both delivered `t=o:x=2`; the stale flag went off | PASS |
+| 7 | Grab script timed against an isolated tmux server, 10 runs | 10 to 15 ms, median 13 ms | measured |
+| 8 | Independent review, round 1, on a real kitty 0.49.2 (15.16) | symptom fixed, drag-out to a GTK app works, bare kitty unchanged | PASS, with findings |
+
+```sh
+./build.sh
+misc/test/test-dnd-osc72-scope.py                 # tests ./nnn
+misc/test/test-dnd-osc72-scope.py --debug         # tmux -vv log + pane state dumps
+misc/test/test-dnd-tmux-mouse.sh
+```
+
+`Not verified:` the owner's own session and mouse. The review drove a real kitty
+with `xdotool` on a private X server, which settles kitty's side but not the
+owner's hardware. To verify on the live session after restarting nnn:
+
+1. `: > /tmp/nnn-dnd.log`, then in another tmux window select text with the
+   mouse. Expected: normal selection, no `(jump to forward)` prompt, nothing
+   typed, and no new lines in `/tmp/nnn-dnd.log`.
+2. Drag a file from each nnn pane into a GUI app. Expected log per drag:
+   `armed (press on the list)`, the offer, `offer -> agree + present + start`,
+   `t=E ... OK`, `t=e:x=4:y=0`, `disarm: drag finished`.
+3. Click a file without dragging. Expected: `armed ...` then `disarm: release`.
+
+### 15.13 Known limits and risks
+
+| Item | Label | Detail |
+|---|---|---|
+| Fast flick | `Risk` | If the pointer passes 5 px before the arm reaches kitty, the drag does not start (T7). If that gesture is released **outside** nnn's pane, the flag stays on for up to about 3 s (the 2 s timeout plus one idle tick). A text drag elsewhere in that window still leaks. Ending it sooner: press any key in nnn, or click in nnn. Raising kitty's `drag_threshold` widens the margin. |
+| A leak that opens a tmux prompt | `Risk` | Leaked keys can open a copy-mode prompt, which freezes the client. tmux then drops passthrough, so a disarm sent meanwhile is lost (review F1, second-order). Close the prompt with `Escape`, then click once in nnn. |
+| Press, hold, then drag | `Fact` | A drag that starts moving more than about 2 s after the press does not start (timeout). Drag again. |
+| First drag from the other pane right after a drag dropped outside kitty | `Fact` | Refused once (15.10a); the retry works. |
+| A lost passthrough | `Risk` | tmux can drop any single arm or disarm (15.10, related fact). A lost arm means no drag. A lost disarm leaves the flag on until the next gesture in nnn, because nnn believes it disarmed. |
+| `kill -9` of an armed nnn | `Fact` | The flag stays on until another nnn is clicked or started (review Q6). |
+| `O_NOMOUSE` builds | `Fact` | Without mouse events nnn cannot arm, so OSC-72 drag-out is unavailable inside tmux, and the log says so. Drop-in (bracketed paste) is unaffected. |
+| Old nnn binaries still running | `Risk` | They still register at startup and re-register after every subprocess. Every nnn started with `NNN_DND_OSC72=1` must be restarted. |
+| Blocking shells in the input loop | `Fact` | The grab (about 13 ms) runs when a drag starts; `dnd_tmux_drag_live()` runs once after startup and only for a stale arm. |
+| Mouse events during a prompt | `Fact` | Inside tmux with OSC-72 on, `get_input()` consumes a mouse event it reads, so a press during a prompt is no longer left in ncurses' queue. A press still answers the prompt as `KEY_MOUSE`, as before. |
+
+### 15.14 Applying the fix, and recovering a stuck session
+
+1. Rebuild with `./build.sh`; `~/bin/nnn` points at the repository binary.
+2. Quit **both** running nnn panes and run `start_dual_nnn.sh` again. The old
+   binary sends `t=o:x=2` on a clean quit, and the new one clears any leftover
+   flag about a second after it starts (its first idle tick).
+3. If text selection is broken right now and nnn cannot be restarted, run this
+   in any **visible** tmux pane (works in bash and in fish):
+
+   ```sh
+   printf '\033Ptmux;\033\033]72;t=o:x=2\033\033\134\033\134'
+   ```
+
+   `\134` is a backslash. Writing it as `\\` breaks under fish, which collapses
+   `\\` inside single quotes. This was verified: `od -c` showed fish produced
+   different bytes for the `\\` spelling.
+4. If a `(jump to forward)` or `(repeat)` prompt is left on the tmux status line,
+   press `Escape` to close it.
+5. Optional, outside nnn's control: to make the first click after any OSC-72 drag
+   select its pane, a root-table binding like
+   `bind -n MouseDragEnd1Pane select-pane -t = \; send-keys -M` can be added to
+   `tmux.conf`. `Not verified` in this setup, and it also changes which pane is
+   selected when any mouse drag ends over another pane.
+
+### 15.15 Lesson
+
+**A registration sent through a multiplexer takes the scope of the outer
+terminal, not of the pane that sent it.** nnn behaved correctly in bare kitty
+and was verified there and in a single tmux pane (Problems 2-13). What none of
+those tests did was use the mouse somewhere else in the same kitty window. When
+state lives in a layer that cannot see your boundaries, scope it to the
+interaction that needs it (one gesture) rather than to the life of the process.
+
+**Second lesson: read every layer's source, then reproduce at the byte level.**
+Each step of this chain is documented in a different codebase: kitty's gesture
+logic, tmux's key parser and prompt queue, the owner's tmux plugins, and
+ncurses' button bookkeeping. Without a real mouse, the fake-kitty harness plus
+tmux's own `-vv` log turned the reported text into a deterministic test that
+fails 31 of its 44 checks on the old binary. It also surfaced older defects
+(15.10a, 15.10b, 15.10d) that no manual test had noticed.
+
+**Third lesson: have the fix reviewed on the real thing.** The first version
+passed every check of its own harness, and the harness was built from kitty's
+source. An independent review that drove a real kitty found the two gaps that
+mattered (15.10e, 15.10f), and its mutation testing showed half the new code was
+untested. A test that models a layer is only as good as the model, so check the
+model against the layer at least once.
+
+### 15.16 Independent review
+
+The change was reviewed independently, from a written brief, on the real diff,
+built in a scratch copy. Briefs and reports are in the repository:
+
+| Round | Brief | Report |
+|---|---|---|
+| 1 | [agents/review-dnd-tmux-scope.md](workflows/dnd_tmux_scope/agents/review-dnd-tmux-scope.md) | [notes/review-dnd-tmux-scope.md](workflows/dnd_tmux_scope/notes/review-dnd-tmux-scope.md) |
+| 2 | [agents/review-dnd-tmux-scope-round2.md](workflows/dnd_tmux_scope/agents/review-dnd-tmux-scope-round2.md) | `notes/review-dnd-tmux-scope-round2.md` (in progress) |
+
+**Rigs.** A: this repository's fake-kitty harness. B: a real kitty 0.49.2 on a
+private `Xvfb`, a private tmux socket, real nnn, `xdotool` for the pointer, and
+`mousepad` (GTK3) as an external drop target. kitty's `--debug-input` log line
+`Sent drag start event to child` was the ground truth for offers.
+
+**Round 1 results.** The reported symptom is fixed on the real kitty, and the
+pre-fix binary reproduces it there. Drag-out to the GTK app works end to end, and
+bare kitty's outbound stream is identical to HEAD. 9 build variants compile
+clean, and an ASan/UBSan run is clean. A 150-cycle press/release stress lost no
+arm and no disarm.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| F1 a flick leaves the flag on | Medium | Fixed: 2 s timeout plus ncurses reset (15.10e, 15.10b) |
+| F2 a dead drag wedges nnn with the flag on | Medium | Fixed: release drops the dead drag; startup clear deferred and guarded (15.10f) |
+| F3 10 of 19 mutations survived the test | Medium | Tests added (T7, T7b, T8b, T10 to T16) and the fake kitty made more faithful; mutation run repeated in round 2 |
+| F4 first drag from the other pane refused once | Low | Kept as a documented limit (15.13); the pre-fix code dragged the wrong file |
+| F5 a resize let a release answer a prompt | Low | Fixed: one read loop in `get_input()` |
+| F6 arming on blank rows | Low | Fixed: arm only on entries |
+| F7 `O_NOMOUSE` log text | Low | Fixed |
+| F8 a resize disarmed a held gesture | Info | Fixed |
+| Q4 "swallowed release" was over-general | Question | Comments now say outside kitty |
+| Q5 the startup clear was dropped by tmux | Question | Moved to the first idle tick |
+| Q6 `kill -9` of an armed nnn | Question | Documented limit (15.13) |
+
+Found while fixing, not by the review: the grab race (15.10d), the lost press
+after a flick (15.10b), and the prompt answered by a release after the ncurses
+reset (caught by the new T14).
+
+**Round 2:** in progress at the time of writing.
