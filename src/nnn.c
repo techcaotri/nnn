@@ -939,6 +939,12 @@ static void notify_fifo(bool force);
 #endif
 static inline bool selforparent(const char *path);
 static void dirwalk(char *path, int entnum, bool mountpoint, bool no_aggregate);
+static bool dnd_in_tmux(void);
+static bool dnd_osc72_capable(void);
+static void dnd_osc72_disarm(const char *why);
+#ifndef NOMOUSE
+static bool dnd_eat_release(void);
+#endif
 
 /* Functions */
 
@@ -1677,19 +1683,27 @@ static int get_input(const char *prompt)
 		printmsg(prompt);
 	cleartimeout();
 
-	get_wch(ch);
+	for (;;) {
+#ifndef NOMOUSE
+		/* The release ending an OSC-72 gesture (tmux only) is not an answer */
+		if (get_wch(ch) == KEY_CODE_YES && *ch == KEY_MOUSE && dnd_eat_release())
+			continue;
+#else
+		get_wch(ch);
+#endif
 
 #ifdef KEY_RESIZE
-	while (*ch == KEY_RESIZE) {
-		if (prompt) {
-			clearoldprompt();
-			xlines = LINES;
-			printmsg(prompt);
+		if (*ch == KEY_RESIZE) {
+			if (prompt) {
+				clearoldprompt();
+				xlines = LINES;
+				printmsg(prompt);
+			}
+			continue;
 		}
-
-		get_wch(ch);
-	}
 #endif
+		break;
+	}
 	settimeout();
 	return (int)*ch;
 }
@@ -2653,6 +2667,10 @@ static bool init_fcolors(void)
 	return TRUE;
 }
 
+#ifndef NOMOUSE
+static mmask_t g_mousemask; /* nnn's own mask; the OSC-72 code re-applies it */
+#endif
+
 /* Initialize curses mode */
 static bool initcurses(void *oldmask)
 {
@@ -2677,13 +2695,20 @@ static bool initcurses(void *oldmask)
 	//intrflush(stdscr, FALSE);
 	keypad(stdscr, TRUE);
 #ifndef NOMOUSE
+	/*
+	 * OSC-72 inside tmux arms the drag source per left-button gesture, so
+	 * it needs to see the release that ends one (Problem 15).
+	 */
+	mmask_t dndrel = (dnd_osc72_capable() && dnd_in_tmux()) ? BUTTON1_RELEASED : 0;
+
 #if NCURSES_MOUSE_VERSION <= 1
-	mousemask(BUTTON1_PRESSED | BUTTON1_DOUBLE_CLICKED | BUTTON2_PRESSED | BUTTON3_PRESSED,
-		  (mmask_t *)oldmask);
+	g_mousemask = BUTTON1_PRESSED | BUTTON1_DOUBLE_CLICKED | BUTTON2_PRESSED | BUTTON3_PRESSED
+		      | dndrel;
 #else
-	mousemask(BUTTON1_PRESSED | BUTTON2_PRESSED | BUTTON3_PRESSED | BUTTON4_PRESSED
-		  | BUTTON5_PRESSED, (mmask_t *)oldmask);
+	g_mousemask = BUTTON1_PRESSED | BUTTON2_PRESSED | BUTTON3_PRESSED | BUTTON4_PRESSED
+		      | BUTTON5_PRESSED | dndrel;
 #endif
+	mousemask(g_mousemask, (mmask_t *)oldmask);
 	mouseinterval(0);
 #endif
 	curs_set(FALSE); /* Hide cursor */
@@ -2892,7 +2917,9 @@ static int join(pid_t p, uchar_t flag)
 /*
  * Set when a curses-suspending subprocess (opener/pager/editor) returns: it
  * tells browse() to re-advertise the OSC-72 drag source, because endwin()/
- * refresh() resets the terminal and kitty forgets nnn is draggable.
+ * refresh() resets the terminal and kitty forgets nnn is draggable. Inside
+ * tmux there is nothing to re-advertise (the source is armed per gesture);
+ * the resync only drops state the subprocess left behind.
  */
 static bool g_dnd_resync;
 
@@ -2922,8 +2949,11 @@ static int spawn(char *command, char *arg1, char *arg2, char *arg3, ushort_t fla
 	if (arg3)
 		argv[index] = arg3;
 
-	if (flag & F_NORMAL)
+	if (flag & F_NORMAL) {
+		/* The child owns the pane now: a drag offer must not reach it */
+		dnd_osc72_disarm("disarm: subprocess");
 		exitcurses();
+	}
 
 	pid = xfork(flag);
 	if (pid == 0) {
@@ -2956,7 +2986,7 @@ static int spawn(char *command, char *arg1, char *arg2, char *arg3, ushort_t fla
 
 		if (flag & F_NORMAL) {
 			refresh();
-			/* endwin()/refresh() drops kitty's OSC-72 drag registration; re-advertise on resume. */
+			/* endwin()/refresh() drops kitty's OSC-72 drag registration; resync on resume. */
 			g_dnd_resync = TRUE;
 		}
 
@@ -3828,16 +3858,26 @@ static inline int handle_event(void)
 /*
  * ===== kitty OSC-72 drag-and-drop (mouse-gesture-driven, bidirectional) =====
  *
- * nnn declares itself a drag source once at startup (EnableDrag). When the user
- * mouse-drags on a protocol-aware terminal (kitty >= 0.47.1), the terminal sends
- * an inbound "t=o" offer, which nnn answers with agree -> present -> start; the
- * terminal then performs the real OS drag. Inbound OSC-72 events are parsed out
- * of the input stream in nextsel(). Opt-in via $NNN_DND_OSC72=1 (it changes the
+ * nnn declares itself a drag source (EnableDrag). When the user mouse-drags on
+ * a protocol-aware terminal (kitty >= 0.47.0), the terminal sends an inbound
+ * "t=o" offer, which nnn answers with agree -> present -> start; the terminal
+ * then performs the real OS drag. Inbound OSC-72 events are parsed out of the
+ * input stream in nextsel(). Opt-in via $NNN_DND_OSC72=1 (it changes the
  * terminal's mouse-gesture handling). Works over SSH; inside tmux it needs
  * `set -g allow-passthrough on`. This mirrors Yazi's design; see the design doc
  * sections 5-6 and src/nnn-dnd.c (the libX11 helper used elsewhere).
+ *
+ * kitty keeps ONE drag-source flag per kitty window. In bare kitty that window
+ * is nnn's alone, so nnn registers once at startup. Inside tmux it is the whole
+ * tmux client: a registration made from this pane would turn a left-drag in
+ * ANY tmux window or pane into an offer, which tmux types into whatever pane is
+ * active as "72;t=o:x=..:y=.." garbage (and runs it as copy-mode commands). So
+ * inside tmux the source is armed only by a left press on nnn's own list and
+ * disarmed when that gesture ends. See docs/nnn_Problems_And_Solutions.md
+ * Problem 15.
  */
-static bool g_dnd_on;        /* drag offering enabled with the terminal */
+static bool g_dnd_on;        /* OSC-72 drag-and-drop active in this process */
+static bool g_dnd_armed;     /* tmux: drag source armed for the current gesture */
 static char *g_dnd_b64;      /* base64 text/uri-list for the in-flight drag */
 static size_t g_dnd_b64len;
 static int g_dnd_count;      /* number of files in the in-flight drag */
@@ -3900,7 +3940,10 @@ static bool dnd_in_tmux(void)
  * The value saved is the one that was actually in effect, so a user running with
  * `mouse off` no longer has it silently switched on by a drag.
  *
- * F_NOWAIT keeps curses up (no endwin), so all of this is safe mid-gesture.
+ * Neither spawn uses F_NORMAL, so curses stays up (no endwin) and all of this
+ * is safe mid-gesture. The grab is waited for: the release is detached, and if
+ * it ran first (kitty can refuse a drag 1 ms after the answer) it would find no
+ * marker, and the grab would then leave the mouse off until its watchdog.
  */
 #define DND_MOUSE_GRAB_MAX_SEC 60
 
@@ -3939,7 +3982,7 @@ static void dnd_grab_tmux_mouse(void)
 		DND_MOUSE_GRAB_MAX_SEC, (int)getpid(),
 		(int)getpid(), g_dnd_mouse_token);
 
-	spawn(utils[UTIL_SH_EXEC], script, NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
+	spawn(utils[UTIL_SH_EXEC], script, NULL, NULL, F_MULTI | F_NOTRACE);
 	g_dnd_tmux_grabbed = TRUE;
 }
 
@@ -3986,19 +4029,25 @@ static void dnd_repair_tmux_mouse(void)
 	      NULL, NULL, F_MULTI | F_NOWAIT | F_NOTRACE);
 }
 
+/* Milliseconds since t (a DND_CLOCK reading). */
+static long long dnd_ms_since(const struct timespec *t)
+{
+	struct timespec now;
+
+	clock_gettime(DND_CLOCK, &now);
+	return (long long)(now.tv_sec - t->tv_sec) * 1000 + (now.tv_nsec - t->tv_nsec) / 1000000;
+}
+
 /* TRUE within ~600ms of a drag ending: used to neutralise a drop onto our own
  * window (the release click that would otherwise open a file, and the spurious
  * re-offer the terminal sends right after). */
 static bool dnd_recent_drag(void)
 {
-	struct timespec now;
 	long long ms;
 
 	if (!g_dnd_end_ts.tv_sec && !g_dnd_end_ts.tv_nsec)
 		return FALSE;
-	clock_gettime(DND_CLOCK, &now);
-	ms = (long long)(now.tv_sec - g_dnd_end_ts.tv_sec) * 1000
-	   + (now.tv_nsec - g_dnd_end_ts.tv_nsec) / 1000000;
+	ms = dnd_ms_since(&g_dnd_end_ts);
 	return (ms >= 0 && ms < 600);
 }
 
@@ -4113,22 +4162,36 @@ static void dnd_osc72_write(const char *seq)
 }
 
 /* Append a line to $NNN_DND_DEBUG (a file path, or /tmp/nnn-dnd.log if "1").
- * File-based so it never corrupts the curses screen. No-op when unset. */
+ * File-based so it never corrupts the curses screen. No-op when unset. Lines
+ * carry the time and the pid (dual-pane instances share one log) and go out
+ * in one write, so two instances never interleave within a line. */
 static void dnd_log(const char *msg)
 {
-	char *path = getenv("NNN_DND_DEBUG");
-	int fd;
+	char *path = getenv("NNN_DND_DEBUG"), *line;
+	size_t len = strlen(msg);
+	struct timespec ts;
+	struct tm t;
+	int fd, n;
 
 	if (!path || !*path)
 		return;
 	if (path[0] == '1' && !path[1])
 		path = "/tmp/nnn-dnd.log";
-	fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
-	if (fd < 0)
+	line = malloc(len + 48);
+	if (!line)
 		return;
-	(void)!write(fd, msg, strlen(msg));
-	(void)!write(fd, "\n", 1);
-	close(fd);
+	clock_gettime(CLOCK_REALTIME, &ts);
+	localtime_r(&ts.tv_sec, &t);
+	n = snprintf(line, 48, "%02d:%02d:%02d.%03ld %d ", t.tm_hour, t.tm_min, t.tm_sec,
+		     ts.tv_nsec / 1000000, (int)getpid());
+	memcpy(line + n, msg, len);
+	line[n + len] = '\n';
+	fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+	if (fd >= 0) {
+		(void)!write(fd, line, n + len + 1);
+		close(fd);
+	}
+	free(line);
 }
 
 static void dnd_clear_data(void)
@@ -4138,6 +4201,144 @@ static void dnd_clear_data(void)
 	g_dnd_b64len = 0;
 	dnd_release_tmux_mouse(); /* every drag-end path runs through here */
 }
+
+/*
+ * ncurses keeps button 1 "down" until it decodes a release, and reports the
+ * next press as motion meanwhile: that press, and the arm it brings, would be
+ * lost. Re-applying the mask resets the state (mouse_activate() in ncurses),
+ * and is harmless otherwise. Used whenever a gesture ends without its release
+ * reaching nnn: a drag dropped outside kitty swallows it, and tmux gives a
+ * release outside our pane to the pane under the pointer.
+ */
+static void dnd_mouse_reset(void)
+{
+#ifndef NOMOUSE
+	mousemask(g_mousemask, NULL);
+#endif
+}
+
+/* An arm older than this lost its release (see dnd_osc72_idle()) */
+#define DND_ARM_MAX_MS 2000
+
+static struct timespec g_dnd_arm_ts; /* when the current gesture was armed */
+
+#ifndef NOMOUSE
+/*
+ * Inside tmux: arm the drag source for the gesture a left press on our list
+ * starts. kitty decides once, when the pointer first moves past its
+ * drag_threshold (5 px), so this must reach it before that. Re-sent on every
+ * press, as a peer instance may have disarmed it since. The empty machine id
+ * marks the drag as local (see dnd_osc72_enable()).
+ */
+static void dnd_osc72_arm(void)
+{
+	if (!g_dnd_on || !dnd_in_tmux())
+		return;
+	dnd_osc72_write("\x1b]72;t=o:x=1;\x1b\\");
+	g_dnd_armed = TRUE;
+	clock_gettime(DND_CLOCK, &g_dnd_arm_ts);
+	dnd_log("armed (press on the list)");
+}
+#endif
+
+/*
+ * End the gesture armed by dnd_osc72_arm(). Skipped while a drag is in flight:
+ * kitty frees the drag's data on t=o:x=2. The drag-end paths call it again.
+ */
+static void dnd_osc72_disarm(const char *why)
+{
+	if (!g_dnd_armed || g_dnd_b64)
+		return;
+	dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+	g_dnd_armed = FALSE;
+	dnd_log(why);
+}
+
+#ifndef NOMOUSE
+/*
+ * A left release reached nnn, ending the gesture. A drag still recorded here
+ * is dead: kitty swallows the release of a drag dropped outside its window,
+ * so this one never became an OS drag or ended without its t=e:x=4 (a peer's
+ * t=o:x=2 mid-drag makes kitty free it silently). Drop it so nnn cannot stay
+ * wedged with the drag source on; the timestamp keeps the self-drop guard.
+ */
+static void dnd_osc72_release(void)
+{
+	if (g_dnd_b64) {
+		clock_gettime(DND_CLOCK, &g_dnd_end_ts);
+		dnd_clear_data();
+		dnd_log("drag never ended (release seen): dropped");
+	}
+	dnd_osc72_disarm("disarm: release");
+}
+#endif
+
+/*
+ * TRUE while some nnn's drag is in flight: Problem 13's marker names a live
+ * pid. A t=o:x=2 now would make kitty free that drag and never report its end
+ * (drag_notify() in kitty/dnd.c), wedging the peer. Runs a shell and waits,
+ * so only for the rare unsolicited disarms in dnd_osc72_idle().
+ */
+static bool dnd_tmux_drag_live(void)
+{
+	return spawn(utils[UTIL_SH_EXEC],
+		     "v=$(tmux show -gv @nnn_dnd_mouse 2>/dev/null); [ -n \"$v\" ] || exit 1; "
+		     "p=${v%%:*}; kill -0 ${p%%.*} 2>/dev/null",
+		     NULL, NULL, F_MULTI | F_NOTRACE) == 0;
+}
+
+/*
+ * From nextsel()'s idle tick, inside tmux. Both unsolicited t=o:x=2 writes
+ * live here, and both are skipped while any nnn's drag is in flight:
+ * - once, clear a drag source a crashed or older nnn left on. Not at startup:
+ *   tmux drops passthrough while the new pane is still being redrawn.
+ * - end an arm whose release never came. A fast flick can leave the pane
+ *   before kitty sees the arm: kitty decides against a drag, and tmux gives
+ *   the release to the pane under the pointer, not to us (Problem 15).
+ */
+static void dnd_osc72_idle(void)
+{
+	static bool cleared;
+
+	if (!g_dnd_on || !dnd_in_tmux())
+		return;
+	if (!cleared) {
+		cleared = TRUE;
+		if (!g_dnd_armed && !dnd_tmux_drag_live()) {
+			dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+			dnd_log("cleared a leftover drag source");
+		}
+	}
+	if (g_dnd_armed && !g_dnd_b64 && dnd_ms_since(&g_dnd_arm_ts) >= DND_ARM_MAX_MS
+	    && !dnd_tmux_drag_live()) {
+		dnd_osc72_disarm("disarm: no release (timeout)");
+		dnd_mouse_reset();
+	}
+}
+
+#ifndef NOMOUSE
+/*
+ * Button releases are only reported inside tmux with OSC-72 on (initcurses()).
+ * Consume one that reached a raw key reader, ending the gesture, so it never
+ * answers a prompt. After dnd_mouse_reset() ncurses decodes a release as a
+ * motion report, which nnn's mask filters out, so KEY_MOUSE then comes with no
+ * event at all: consume that too. TRUE if consumed.
+ */
+static bool dnd_eat_release(void)
+{
+	MEVENT event;
+
+	if (!dnd_osc72_capable() || !dnd_in_tmux())
+		return FALSE;
+	if (getmouse(&event) != OK)
+		return TRUE;
+	if (event.bstate & BUTTON1_RELEASED)
+		dnd_osc72_release();
+	else if (!(event.bstate & REPORT_MOUSE_POSITION))
+		return FALSE;
+	return TRUE;
+}
+#endif
 
 /* Build a file:// text/uri-list (selection, or the hovered file when none) and
  * base64 it into g_dnd_b64. Returns FALSE if there is nothing to drag. */
@@ -4244,16 +4445,32 @@ static void dnd_osc72_offer(void)
 	size_t chunks, cap, len = 0, off = 0;
 	char *b;
 
+	/*
+	 * Inside tmux the offer goes to the ACTIVE pane, which need not be the
+	 * one that armed: the first press after a drag dropped outside kitty
+	 * does not select its pane (kitty swallows that drag's release, so tmux
+	 * still sees a drag and turns the press into its end). The gesture began
+	 * elsewhere, and our hovered file would be the wrong one: refuse, ending
+	 * the gesture.
+	 */
+	if (dnd_in_tmux() && !g_dnd_armed) {
+		dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+		dnd_log("offer refused (gesture not armed here)");
+		return;
+	}
 	if (g_dnd_b64) { /* a drag is already being built/in flight */
 		dnd_log("offer ignored (drag already active)");
 		return;
 	}
+	/* kitty sends one offer per gesture: a refused one ends the gesture */
 	if (dnd_recent_drag()) { /* spurious re-offer right after a drop onto our own window */
 		dnd_log("offer ignored (just ended)");
+		dnd_osc72_disarm("disarm: offer ignored");
 		return;
 	}
 	if (!dnd_prepare_data()) {
 		dnd_log("offer -> nothing to drag");
+		dnd_osc72_disarm("disarm: nothing to drag");
 		return;
 	}
 
@@ -4488,14 +4705,19 @@ static void dnd_osc72_event(const char *body)
 			clock_gettime(DND_CLOCK, &g_dnd_end_ts);
 			dnd_clear_data();
 			dnd_log("drag finished");
+			dnd_osc72_disarm("disarm: drag finished");
+			dnd_mouse_reset(); /* a drop outside kitty swallowed the release */
 		}
 		break;
 	case 'E': { /* OK (drag started) or an error such as EPERM */
 		const char *pl = strchr(body, ';');
+		bool ok = (pl && pl[1] == 'O' && pl[2] == 'K');
 
-		if (!(pl && pl[1] == 'O' && pl[2] == 'K'))
+		if (!ok)
 			dnd_clear_data();
 		dnd_log("status t=E (OK or error)");
+		if (!ok)
+			dnd_osc72_disarm("disarm: drag refused");
 		break;
 	}
 	case 'm': /* structured drop hovering over the window */
@@ -4564,32 +4786,50 @@ static void dnd_osc72_enable(void)
 {
 	if (g_dnd_on || !dnd_osc72_capable())
 		return;
-	/*
-	 * Empty machine id (like Yazi's EnableDrag("")): the terminal then treats
-	 * the drag as local and hands the drop target the file:// path directly,
-	 * instead of requesting the file contents via t=k -- which nnn does not
-	 * provide, so the drop would stall and the drag icon would never clear.
-	 */
 	dnd_repair_tmux_mouse(); /* undo a grab stranded by an earlier crash */
-	dnd_osc72_write("\x1b]72;t=o:x=1;\x1b\\");
 	/*
-	 * Structured drop reception (EnableDrop) only outside tmux: through tmux it
-	 * would make kitty stop pasting dropped paths (suppressing the fallback) yet
-	 * the structured events are not routed back to the pane, so drops would
-	 * silently vanish. Inside tmux the bracketed-paste fallback handles drops.
+	 * Inside tmux nothing is registered for the life of the process: every
+	 * left-drag in every tmux window and pane would become an offer typed
+	 * into the active pane (Problem 15). browse() arms it per gesture
+	 * instead, and dnd_osc72_idle() clears a leftover registration.
 	 */
-	if (!dnd_in_tmux())
+	if (!dnd_in_tmux()) {
+		/*
+		 * Empty machine id (like Yazi's EnableDrag("")): the terminal then
+		 * treats the drag as local and hands the drop target the file:// path
+		 * directly, instead of requesting the file contents via t=k -- which
+		 * nnn does not provide, so the drop would stall and the drag icon
+		 * would never clear.
+		 */
+		dnd_osc72_write("\x1b]72;t=o:x=1;\x1b\\");
+		/*
+		 * Structured drop reception (EnableDrop) only outside tmux: through
+		 * tmux it would make kitty stop pasting dropped paths (suppressing
+		 * the fallback) yet the structured events are not routed back to the
+		 * pane, so drops would silently vanish. Inside tmux the
+		 * bracketed-paste fallback handles drops.
+		 */
 		dnd_osc72_write("\x1b]72;t=a;text/uri-list\x1b\\");
+	}
 	dnd_drop_enable(); /* also accept GUI file drops (bracketed-paste fallback) */
 	g_dnd_on = TRUE;
-	dnd_log("enable sent (drag offering on)");
+#ifndef NOMOUSE
+	dnd_log(dnd_in_tmux() ? "enable sent (tmux: drag source armed per gesture)"
+			      : "enable sent (drag offering on)");
+#else
+	dnd_log(dnd_in_tmux() ? "enable sent (tmux: no mouse support, no drag-out)"
+			      : "enable sent (drag offering on)");
+#endif
 }
 
 static void dnd_osc72_disable(void)
 {
 	if (!g_dnd_on)
 		return;
-	dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+	/* Inside tmux, withdraw only our own arm: a peer may be mid-drag */
+	if (!dnd_in_tmux() || g_dnd_armed)
+		dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+	g_dnd_armed = FALSE;
 	if (!dnd_in_tmux())
 		dnd_osc72_write("\x1b]72;t=A\x1b\\"); /* stop accepting drops */
 	dnd_full_write("\x1b[?2004l", 8); /* bracketed paste off */
@@ -4603,13 +4843,15 @@ static void dnd_osc72_disable(void)
  * subprocess (opener/pager/editor). endwin()/refresh() resets the terminal
  * so kitty forgets nnn is a drag source, and any drag that was in flight when
  * the subprocess started is now dead -- drop its buffered data too. Without
- * this the "N file(s)" icon never reappears after opening a file.
+ * this the "N file(s)" icon never reappears after opening a file. Inside tmux
+ * only the cleanup applies: the next press on the list re-arms.
  */
 static void dnd_osc72_resync(void)
 {
 	if (!dnd_osc72_capable())
 		return;
 	dnd_clear_data();	/* abandon any drag interrupted by the subprocess */
+	dnd_osc72_disarm("disarm: resync");
 	g_dnd_drop_collecting = FALSE;
 	g_dnd_on = FALSE;	/* force dnd_osc72_enable() to re-send the offer */
 	dnd_osc72_enable();
@@ -5092,6 +5334,18 @@ try_quit:
 			}
 		}
 
+		/* A key also ends a gesture whose release never reached us */
+		if (g_dnd_armed && i != ERR) {
+			bool notkey = (i == KEY_CODE_YES && c == KEY_MOUSE);
+#ifdef KEY_RESIZE
+			notkey = notkey || (i == KEY_CODE_YES && c == KEY_RESIZE);
+#endif
+			if (!notkey) {
+				dnd_osc72_disarm("disarm: key");
+				dnd_mouse_reset();
+			}
+		}
+
 		if (i == ERR && presel == MSGWAIT)
 			c = (cfg.filtermode || filterset()) ? FILTER : CONTROL('L');
 		else if (c == FILTER || c == CONTROL('L'))
@@ -5101,6 +5355,7 @@ try_quit:
 
 	if (i == ERR) {
 		++idle;
+		dnd_osc72_idle();
 
 		/*
 		 * Do not check for directory changes in du mode.
@@ -5377,6 +5632,14 @@ static int filterentries(char *path, char *lastname)
 			MEVENT event = {0};
 			getmouse(&event);
 			if (event.bstate == 0)
+				continue;
+			/* The release ending an OSC-72 gesture (tmux only) is not a click */
+			if (event.bstate & BUTTON1_RELEASED) {
+				dnd_osc72_release();
+				continue;
+			}
+			/* Nor is a motion report: nnn asks for none (see dnd_eat_release()) */
+			if (event.bstate & REPORT_MOUSE_POSITION)
 				continue;
 			ungetmouse(&event);
 			goto end;
@@ -10339,6 +10602,19 @@ nochange:
 		case SEL_CLICK:
 			if (getmouse(&event) != OK)
 				goto nochange;
+
+			/*
+			 * OSC-72 inside tmux: a left press on the list arms the drag
+			 * source for this gesture only, and its release (reported only
+			 * in that mode) disarms it. See Problem 15.
+			 */
+			if (event.bstate & BUTTON1_RELEASED) {
+				dnd_osc72_release();
+				goto nochange;
+			}
+			if (event.bstate == BUTTON1_PRESSED && event.y >= 2 && event.y < xlines - 3
+			    && event.y <= ndents + 1)
+				dnd_osc72_arm();
 
 			/* Handle clicking on a context at the top */
 			if (event.bstate == BUTTON1_PRESSED && event.y == 0) {
