@@ -2851,6 +2851,11 @@ is T3b's, but the prompt itself was not captured.
 `Fact:` the T11 grab check is timing-dependent. It caught the race of 15.10d
 once, during the fix; the pre-fix run above happened not to hit it.
 
+`Note:` the numbers above are from the 44-check version of the test. Round 2 of
+the review (15.16) prompted 14 more checks (and removed one that turned out
+vacuous), for 57. With the final test the pre-fix binary scores `PASS=15
+FAIL=42` and the fixed binary `PASS=57 FAIL=0`.
+
 **Fact (timing dependence):** in runs where tmux was slowed by `-vv` logging, the
 pre-fix binary's startup `t=o:x=1` reached the tmux server (`input_dcs_dispatch`)
 but never reached the client, and the T1 and T2 checks passed
@@ -2875,9 +2880,9 @@ gesture was in nnn, which is when nnn arms.
 ```mermaid
 %% g_dnd_armed inside tmux: the life of one gesture
 stateDiagram-v2
-    [*] --> Disarmed: first idle tick clears a leftover flag, t=o x=2
+    [*] --> Disarmed: first idle tick after input clears a leftover flag, t=o x=2
     Disarmed --> Armed: left press on an entry, sends t=o x=1
-    Armed --> Disarmed: release, key, subprocess, no-drag offer or 2 s timeout, sends t=o x=2
+    Armed --> Disarmed: release, key, subprocess, no-drag offer,<br/>a resize or a 2 s timeout, sends t=o x=2
     Armed --> Dragging: offer answered
     Dragging --> Disarmed: t=e x=4, t=E error, or a release (dead drag), sends t=o x=2
     Disarmed --> [*]: exit
@@ -2891,7 +2896,7 @@ never reaches nnn (2 s timeout). The one exception is a drag kitty is carrying:
 
 | Event (inside tmux) | Action | Code |
 |---|---|---|
-| First idle tick after start | send `t=o:x=2` once, unless armed or any nnn's drag is in flight; never `t=o:x=1` | `dnd_osc72_idle()` |
+| First idle tick after this pane's first input | send `t=o:x=2` once, unless armed or any nnn's drag is in flight; never `t=o:x=1` (15.10f) | `dnd_osc72_idle()` |
 | Left press on an entry (row 2 to `ndents + 1`, above the status lines) | send `t=o:x=1`, `g_dnd_armed = TRUE`, note the time | `dnd_osc72_arm()`, from `SEL_CLICK` |
 | Left release | drop a drag still recorded (it is dead, 15.10f), then disarm | `dnd_osc72_release()`: `SEL_CLICK`, `filterentries()`, `get_input()` |
 | Offer, armed, file ready | answer as before (agree + data + icon + start) | `dnd_osc72_offer()` |
@@ -2899,7 +2904,8 @@ never reaches nnn (2 s timeout). The one exception is a drag kitty is carrying:
 | Offer with nothing to drag, or inside the self-drop guard | disarm | `dnd_osc72_offer()` |
 | `t=e:x=4` drag finished | disarm, reset ncurses' button state (15.10b) | `dnd_osc72_event()` |
 | `t=E` not `OK` | disarm | `dnd_osc72_event()` |
-| Key read by `nextsel()` (not a mouse event, not a resize) | disarm, reset ncurses' button state | `nextsel()` |
+| Key read by `nextsel()` (not a mouse event) | disarm, reset ncurses' button state | `nextsel()` |
+| Window resize while armed | ncurses forgets the press; the arm is aged so the next idle tick ends it (15.10g) | `nextsel()` |
 | Idle tick, arm older than 2 s, no drag in flight anywhere | disarm, reset ncurses' button state (15.10e) | `dnd_osc72_idle()` |
 | Foreground subprocess (`F_NORMAL`) | disarm before `exitcurses()` | `spawn()` |
 | Resync after a subprocess | drop state, disarm; nothing is re-advertised | `dnd_osc72_resync()` |
@@ -2946,7 +2952,9 @@ that to travel 5 px; a fast flick may not, which is what the 2 s timeout covers
 | `dnd_osc72_disarm(why)` | new | sends `t=o:x=2` if armed and no drag is in flight; logs `why` |
 | `dnd_osc72_release()` | new | a release reached nnn: drops a dead drag (15.10f), then disarms |
 | `dnd_osc72_idle()` | new | from the idle tick: the deferred startup clear and the 2 s arm timeout |
-| `dnd_tmux_drag_live()` | new | runs a shell: does Problem 13's `@nnn_dnd_mouse` marker name a live pid (a drag in flight)? |
+| `dnd_tmux_drag_live()` | new | runs a shell (bounded by `timeout(1)` where available): does Problem 13's `@nnn_dnd_mouse` marker name a live pid (a drag in flight)? |
+| `g_dnd_seen_input` | new state | set by any key or mouse read; the leftover clear waits for it (15.10f) |
+| `dnd_check_resize()` | new | re-applies a window resize lost while nnn waited for tmux (15.10h) |
 | `dnd_mouse_reset()` | new | re-applies `g_mousemask`, resetting ncurses' button state (15.10b) |
 | `dnd_ms_since()` | new | milliseconds since a `DND_CLOCK` reading, shared with `dnd_recent_drag()` |
 | `dnd_eat_release()` | new | for `get_input()`: consumes a release, a motion report, or a `KEY_MOUSE` without an event, so none can answer a prompt |
@@ -2967,10 +2975,10 @@ that to travel 5 px; a fast flick may not, which is what the 2 s timeout covers
 | Line | Meaning |
 |---|---|
 | `enable sent (tmux: drag source armed per gesture)` | Started inside tmux; the flag stays off until a press |
-| `cleared a leftover drag source` | First idle tick: a flag left on by an older or crashed nnn was switched off |
+| `sent a clear of a leftover drag source` | First idle tick after this pane's first input: a `t=o:x=2` was sent to switch off a flag an older or crashed nnn left on (delivery itself is not knowable) |
 | `armed (press on the list)` | A left press on an entry switched the flag on |
 | `disarm: release` / `key` / `subprocess` / `resync` | The gesture ended that way |
-| `disarm: no release (timeout)` | The release never reached nnn; the arm ended after 2 s (15.10e) |
+| `disarm: no release (timeout)` | The release never reached nnn (a flick, or a resize that made ncurses forget the press); the arm ended after 2 s (15.10e, 15.10g) |
 | `disarm: drag finished` / `drag refused` | After a real drag, or after kitty refused to start it |
 | `disarm: nothing to drag` / `offer ignored` | An offer arrived but no drag was started |
 | `offer refused (gesture not armed here)` | An offer reached this pane for a gesture another pane armed (15.10a) |
@@ -3051,11 +3059,37 @@ active" and skipped every disarm, so the flag stayed on. Fixes:
 - A release that reaches nnn proves no OS drag holds the pointer. It now drops a
   drag still recorded before disarming (`dnd_osc72_release()`), and keeps the
   self-drop guard's timestamp. Checked by T13.
-- The startup clear moved to the first idle tick, by which time tmux has finished
-  redrawing the new pane (startup writes were dropped, see below). Like the
-  timeout, it is skipped while this nnn is armed or while any nnn's drag is in
-  flight (`dnd_tmux_drag_live()` reads Problem 13's marker). Checked by T8 and
-  T8b.
+- The leftover clear waits for this pane's **first input** and then runs on the
+  first idle tick (review N2). Input proves the pane is on show, so tmux can
+  actually deliver the clear (a pane in a hidden window never can), and the user
+  is provably not holding a gesture in another pane that the clear would wipe.
+  Like the timeout, it is skipped while this nnn is armed or while any nnn's
+  drag is in flight, and retried on a later tick. Checked by T8, T8b and T8c.
+
+**(g) A resize during a held gesture killed the release, and the obvious fix was
+unreliable** (review N1). After a window resize, ncurses forgets that button 1
+is down, so the release of a held gesture can only ever arrive as a filtered
+motion report: the arm would leak until the 2 s timeout. Disarming at the
+resize does not work: the resize forces a full pane redraw, and tmux drops
+passthrough for a pane with a redraw pending. The harness watched nnn log the
+disarm and its `t=o:x=2` never arrive at the client, leaving kitty's flag on
+while nnn believed it had withdrawn it. Fix: the resize **ages** the arm
+(`g_dnd_arm_ts` moved 3 s back), so the next idle tick's timeout path ends it a
+second later, once the redraw has flushed; a drag that starts moving in that
+second still proceeds, because its offer sets `g_dnd_b64`, which the timeout
+skips. Checked by T17.
+
+**(h) A resize that arrived while nnn waited for tmux was lost entirely**
+(review N3). Waited spawns run with SIGWINCH ignored (`xfork()`), so a resize
+during the grab (10 to 16 ms) or the drag-live probe was never seen by ncurses,
+and browse()'s own check (`xlines != LINES`) cannot fire either. The reviewer
+demonstrated it with a tmux shim that sleeps 1.5 s: the pane kept a stale
+screen with no status bar until the next key. Fix: `dnd_check_resize()` runs on
+each idle tick, compares `ioctl(TIOCGWINSZ)` with `LINES`/`COLS` and re-applies
+a difference (`resizeterm()` + `handle_key_resize()`); browse() then redraws
+through its normal size check. The drag-live probe is also bounded by
+`timeout(1)` where available, so a hung tmux server reads as "live" (the safe
+answer). Checked by T23.
 
 **Related fact, not changed:** with `allow-passthrough on`, tmux delivers a
 passthrough only when the pane is visible, the pane has no pending redraw
@@ -3064,7 +3098,9 @@ redrawing nor frozen by a prompt (`tty_client_ready()`, `tty.c:1612-1622`).
 `allow-passthrough all` lifts those conditions, but it also lets every invisible
 pane write raw escapes to the terminal. The design does not depend on it: arms
 and disarms are sent while the pressed pane is visible and in use, and the
-startup clear waits for the idle tick.
+leftover clear waits for the first input. The redraw condition is not
+theoretical: it ate the disarm written right after a resize (15.10g), and a
+dying pane's final passthrough never arrives at all (15.16, M12).
 
 ### 15.11 Alternatives considered and rejected
 
@@ -3084,12 +3120,15 @@ startup clear waits for the idle tick.
 |---|---|---|---|
 | 1 | `./build.sh` | clean; only the pre-existing `fuzzyentrycmp defined but not used` warning | PASS |
 | 2 | `make O_NOMOUSE=1 O_EMOJI=1 O_PCRE2=1` (scratch copy) | clean, no warnings | PASS |
-| 3 | `misc/test/test-dnd-osc72-scope.py` (fixed binary) | `PASS=44 FAIL=0`; arm latency min 0.29, median 0.80, max 1.73 ms | PASS |
-| 4 | `misc/test/test-dnd-osc72-scope.py --nnn nnn.bak-2026-10-23-pre-dnd-scope` | `PASS=13 FAIL=31`, reproduces the report (15.8) | expected FAIL |
+| 3 | `misc/test/test-dnd-osc72-scope.py` (fixed binary) | `PASS=57 FAIL=0`; arm latency min 0.28, median 0.62, max 1.29 ms | PASS |
+| 4 | `misc/test/test-dnd-osc72-scope.py --nnn nnn.bak-2026-10-23-pre-dnd-scope` | `PASS=15 FAIL=42`, reproduces the report (15.8) | expected FAIL |
 | 5 | `misc/test/test-dnd-tmux-mouse.sh` | `PASS=21 FAIL=0` (Problem 13's grab and watchdog scripts) | PASS |
 | 6 | Manual disarm command (15.14) from `bash` and from `fish`, through tmux | both delivered `t=o:x=2`; the stale flag went off | PASS |
 | 7 | Grab script timed against an isolated tmux server, 10 runs | 10 to 15 ms, median 13 ms | measured |
 | 8 | Independent review, round 1, on a real kitty 0.49.2 (15.16) | symptom fixed, drag-out to a GTK app works, bare kitty unchanged | PASS, with findings |
+| 9 | Independent review, round 2, on a real kitty (15.16) | round 1 fixes verified; grab race 0 of 35 (old design 7 of 35); bare kitty stream identical; default mode silent | PASS, with findings |
+| 10 | Mutant spot-checks with the final test (scratch builds) | no drop-time disarm: killed by 5 checks; filter prompt does not eat releases: killed by T15 | PASS |
+| 11 | Exit-time passthrough probe (a mutant that always sends `t=o:x=2` at exit) | the byte never reaches the client through tmux; the check for it was vacuous and removed | fact |
 
 ```sh
 ./build.sh
@@ -3118,11 +3157,12 @@ owner's hardware. To verify on the live session after restarting nnn:
 | A leak that opens a tmux prompt | `Risk` | Leaked keys can open a copy-mode prompt, which freezes the client. tmux then drops passthrough, so a disarm sent meanwhile is lost (review F1, second-order). Close the prompt with `Escape`, then click once in nnn. |
 | Press, hold, then drag | `Fact` | A drag that starts moving more than about 2 s after the press does not start (timeout). Drag again. |
 | First drag from the other pane right after a drag dropped outside kitty | `Fact` | Refused once (15.10a); the retry works. |
-| A lost passthrough | `Risk` | tmux can drop any single arm or disarm (15.10, related fact). A lost arm means no drag. A lost disarm leaves the flag on until the next gesture in nnn, because nnn believes it disarmed. |
+| A lost passthrough | `Risk` | tmux can drop any single arm or disarm (15.10, related fact). A lost arm means no drag. A lost disarm leaves the flag on until the next gesture in nnn, because nnn believes it disarmed. Observed: the disarm written right after a resize (15.10g) and every dying pane's final write (15.16, M12). |
 | `kill -9` of an armed nnn | `Fact` | The flag stays on until another nnn is clicked or started (review Q6). |
 | `O_NOMOUSE` builds | `Fact` | Without mouse events nnn cannot arm, so OSC-72 drag-out is unavailable inside tmux, and the log says so. Drop-in (bracketed paste) is unaffected. |
 | Old nnn binaries still running | `Risk` | They still register at startup and re-register after every subprocess. Every nnn started with `NNN_DND_OSC72=1` must be restarted. |
-| Blocking shells in the input loop | `Fact` | The grab (about 13 ms) runs when a drag starts; `dnd_tmux_drag_live()` runs once after startup and only for a stale arm. |
+| Blocking shells in the input loop | `Fact` | The grab (about 13 ms) runs when a drag starts; `dnd_tmux_drag_live()` runs once after the first input and then only for a stale arm past 2 s. Both are bounded, and a resize lost during them is re-applied (15.10h). |
+| A resize during a held gesture | `Fact` | ncurses forgets the press, so the release cannot end the arm; it ends at the next idle tick, within about 1-2 s (15.10g). A drag that starts moving in that second still works. |
 | Mouse events during a prompt | `Fact` | Inside tmux with OSC-72 on, `get_input()` consumes a mouse event it reads, so a press during a prompt is no longer left in ncurses' queue. A press still answers the prompt as `KEY_MOUSE`, as before. |
 
 ### 15.14 Applying the fix, and recovering a stuck session
@@ -3181,7 +3221,7 @@ built in a scratch copy. Briefs and reports are in the repository:
 | Round | Brief | Report |
 |---|---|---|
 | 1 | [agents/review-dnd-tmux-scope.md](workflows/dnd_tmux_scope/agents/review-dnd-tmux-scope.md) | [notes/review-dnd-tmux-scope.md](workflows/dnd_tmux_scope/notes/review-dnd-tmux-scope.md) |
-| 2 | [agents/review-dnd-tmux-scope-round2.md](workflows/dnd_tmux_scope/agents/review-dnd-tmux-scope-round2.md) | `notes/review-dnd-tmux-scope-round2.md` (in progress) |
+| 2 | [agents/review-dnd-tmux-scope-round2.md](workflows/dnd_tmux_scope/agents/review-dnd-tmux-scope-round2.md) | [notes/review-dnd-tmux-scope-round2.md](workflows/dnd_tmux_scope/notes/review-dnd-tmux-scope-round2.md) |
 
 **Rigs.** A: this repository's fake-kitty harness. B: a real kitty 0.49.2 on a
 private `Xvfb`, a private tmux socket, real nnn, `xdotool` for the pointer, and
@@ -3212,4 +3252,32 @@ Found while fixing, not by the review: the grab race (15.10d), the lost press
 after a flick (15.10b), and the prompt answered by a release after the ncurses
 reset (caught by the new T14).
 
-**Round 2:** in progress at the time of writing.
+**Round 2 results.** The reviewer re-checked the revised code on the same rigs
+(real kitty 0.49.2 on a private Xvfb, fake kitty, 40-mutant runs, 8 build
+variants, ASan/UBSan). Verdict: both round 1 gaps fixed on real kitty (the
+stale arm ends about 2 s after a lost release; a peer started mid-drag no
+longer kills the drag), the grab-race fix confirmed on real kitty (the old
+detached grab stranded tmux's mouse in 7 of 35 quick drags, the waited grab in
+0 of 35), bare kitty's outbound stream byte-identical to HEAD apart from the
+intended `mousemask()` reset, the default mode (no `NNN_DND_OSC72`) completely
+silent, and **no Medium code defect**. Findings and dispositions:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| N1 a resize during a held gesture leaks until the timeout | Low | Fixed with a twist: the obvious immediate disarm is unreliable, because tmux drops the passthrough written right after a resize (pane redraw pending). The arm is aged and the next idle tick ends it (15.10g, T17) |
+| N2 the deferred clear: lost in a hidden pane, could wipe a peer's arm, "cleared" logged even when skipped | Low | Fixed: the clear waits for this pane's first input, retries while skipped, and the log says "sent" (15.10f, T8/T8b/T8c) |
+| N3 blocking spawns: a resize during the wait is lost (SIGWINCH ignored); a hung tmux blocks nnn | Low | Fixed: `dnd_check_resize()` re-applies it each idle tick; the probe is bounded by `timeout(1)` (15.10h, T23) |
+| N4 costs of the 2 s arm, measured: a hold past 2 s gives no drag; a click within ~2 s after a lost release is swallowed | Info | Documented (15.13). A key in between resets it at once |
+| N5 the `REPORT_MOUSE_POSITION` branches are dead code on ncurses 6.3 | Info | Kept: they are defensive for other ncurses versions and cost nothing |
+| N6 13 of 40 mutants survived the test; T15 did not test what it claimed; the drop-time disarm was masked by the timeout | Medium (test) | 14 checks added or reworked (T7b, T15, T17, T20, T21, T22, T23, T8b, T8c, T9, drop-time log assertions); T15 now opens the filter prompt the way a user does |
+| M12 (round 1 remnant) the exit-time `x=2` guard in `dnd_osc72_disable()` | - | Untestable: a dying pane's final passthrough never reaches the client through tmux (verified with a mutant that always sends it). The guard is kept as defense; the vacuous check was removed |
+
+Spot-checks after the fixes: the drop-time-disarm mutant is killed by 5 checks,
+the filter-prompt mutant by T15, both with the final test. Two behaviours were
+discovered while fixing, not by the review: the resize passthrough drop
+(15.10g) and the undeliverable exit write (M12 above).
+
+**Round 2 process note:** the reviewer finished its report at the cost of
+hitting the account's model weekly limit mid-run (it wrote the report, cleaned
+its rigs, and the session could not run further agents until the limit reset).
+Everything above was therefore verified and finished inline.
