@@ -43,6 +43,7 @@
 #include <sys/types.h>
 #endif
 #endif
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -3878,6 +3879,7 @@ static inline int handle_event(void)
  */
 static bool g_dnd_on;        /* OSC-72 drag-and-drop active in this process */
 static bool g_dnd_armed;     /* tmux: drag source armed for the current gesture */
+static bool g_dnd_seen_input; /* tmux: a key or mouse event reached this pane */
 static char *g_dnd_b64;      /* base64 text/uri-list for the in-flight drag */
 static size_t g_dnd_b64len;
 static int g_dnd_count;      /* number of files in the in-flight drag */
@@ -4277,21 +4279,50 @@ static void dnd_osc72_release(void)
  * TRUE while some nnn's drag is in flight: Problem 13's marker names a live
  * pid. A t=o:x=2 now would make kitty free that drag and never report its end
  * (drag_notify() in kitty/dnd.c), wedging the peer. Runs a shell and waits,
- * so only for the rare unsolicited disarms in dnd_osc72_idle().
+ * bounded by timeout(1) where available (a hung tmux server then reads as
+ * "live", the safe answer), so only for the rare unsolicited disarms in
+ * dnd_osc72_idle().
  */
 static bool dnd_tmux_drag_live(void)
 {
 	return spawn(utils[UTIL_SH_EXEC],
-		     "v=$(tmux show -gv @nnn_dnd_mouse 2>/dev/null); [ -n \"$v\" ] || exit 1; "
+		     "c=tmux; command -v timeout >/dev/null 2>&1 && c=\"timeout 2 tmux\"; "
+		     "v=$($c show -gv @nnn_dnd_mouse 2>/dev/null); [ -n \"$v\" ] || exit 1; "
 		     "p=${v%%:*}; kill -0 ${p%%.*} 2>/dev/null",
 		     NULL, NULL, F_MULTI | F_NOTRACE) == 0;
 }
 
+#ifdef KEY_RESIZE
+/*
+ * A waited spawn runs with SIGWINCH ignored (xfork), so a window resize that
+ * arrives while nnn waits for tmux is lost: ncurses never sees it, and
+ * browse() cannot notice either (its check compares LINES with the last
+ * redraw). Re-apply it by hand: resizeterm() updates LINES/COLS, the
+ * endwin/refresh repaints, and browse() redraws on the next idle tick
+ * (nextsel returns 0 and the size check in its default case fires). Called
+ * after the blocking spawns (Problem 15.16, N3).
+ */
+static void dnd_check_resize(void)
+{
+	struct winsize ws;
+
+	if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row && ws.ws_col
+	    && (ws.ws_row != LINES || ws.ws_col != COLS)) {
+		resizeterm(ws.ws_row, ws.ws_col);
+		handle_key_resize();
+	}
+}
+#endif
+
 /*
  * From nextsel()'s idle tick, inside tmux. Both unsolicited t=o:x=2 writes
  * live here, and both are skipped while any nnn's drag is in flight:
- * - once, clear a drag source a crashed or older nnn left on. Not at startup:
- *   tmux drops passthrough while the new pane is still being redrawn.
+ * - once, clear a drag source a crashed or older nnn left on. Not at startup
+ *   (tmux drops passthrough while the new pane is still being redrawn) and
+ *   not before this pane has seen input: input proves the pane is on show, so
+ *   the clear can actually be delivered, and the user is provably not holding
+ *   a gesture elsewhere that it would wipe. Skipped while armed or a drag is
+ *   in flight; retried on a later tick.
  * - end an arm whose release never came. A fast flick can leave the pane
  *   before kitty sees the arm: kitty decides against a drag, and tmux gives
  *   the release to the pane under the pointer, not to us (Problem 15).
@@ -4302,18 +4333,19 @@ static void dnd_osc72_idle(void)
 
 	if (!g_dnd_on || !dnd_in_tmux())
 		return;
-	if (!cleared) {
+	if (!cleared && g_dnd_seen_input && !g_dnd_armed && !dnd_tmux_drag_live()) {
 		cleared = TRUE;
-		if (!g_dnd_armed && !dnd_tmux_drag_live()) {
-			dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
-			dnd_log("cleared a leftover drag source");
-		}
+		dnd_osc72_write("\x1b]72;t=o:x=2\x1b\\");
+		dnd_log("sent a clear of a leftover drag source");
 	}
 	if (g_dnd_armed && !g_dnd_b64 && dnd_ms_since(&g_dnd_arm_ts) >= DND_ARM_MAX_MS
 	    && !dnd_tmux_drag_live()) {
 		dnd_osc72_disarm("disarm: no release (timeout)");
 		dnd_mouse_reset();
 	}
+#ifdef KEY_RESIZE
+	dnd_check_resize(); /* a resize during the blocking spawn above was lost */
+#endif
 }
 
 #ifndef NOMOUSE
@@ -5256,6 +5288,10 @@ try_quit:
 		//DPRINTF_D(c);
 		//DPRINTF_S(keyname(c));
 
+		/* Any input proves this pane is on show (dnd_osc72_idle()) */
+		if (i != ERR)
+			g_dnd_seen_input = TRUE;
+
 		/* GUI file drop delivered as a bracketed paste -> capture and hand to browse() */
 		if (i == KEY_CODE_YES && c == KEY_DND_PASTE_START) {
 			dnd_consume_paste();
@@ -5334,13 +5370,27 @@ try_quit:
 			}
 		}
 
-		/* A key also ends a gesture whose release never reached us */
-		if (g_dnd_armed && i != ERR) {
-			bool notkey = (i == KEY_CODE_YES && c == KEY_MOUSE);
+		/*
+		 * A key also ends a gesture whose release never reached us. A
+		 * resize kills the gesture too (endwin/refresh makes ncurses
+		 * forget the press, so the release could only ever arrive as a
+		 * filtered motion report), but its t=o:x=2 must NOT be written
+		 * at once: the redraw the resize forces leaves the pane flagged
+		 * for redrawing, and tmux drops passthrough for such a pane, so
+		 * the disarm would be lost and kitty's flag would stay on
+		 * forever (seen live in the harness). Age the arm instead: the
+		 * idle tick's timeout path ends it a second later, once the
+		 * redraw has flushed, and still lets a drag that starts moving
+		 * in that second proceed (its offer sets g_dnd_b64, which the
+		 * timeout skips).
+		 */
+		if (g_dnd_armed && i != ERR && !(i == KEY_CODE_YES && c == KEY_MOUSE)) {
 #ifdef KEY_RESIZE
-			notkey = notkey || (i == KEY_CODE_YES && c == KEY_RESIZE);
+			if (i == KEY_CODE_YES && c == KEY_RESIZE)
+				g_dnd_arm_ts.tv_sec -= (DND_ARM_MAX_MS / 1000 + 1);
+			else
 #endif
-			if (!notkey) {
+			{
 				dnd_osc72_disarm("disarm: key");
 				dnd_mouse_reset();
 			}

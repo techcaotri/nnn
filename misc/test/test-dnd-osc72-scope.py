@@ -266,11 +266,12 @@ class Run:
             self.failed += 1
             print('  FAIL  %-60s %s' % (label, detail))
 
-    def nnn_cmd(self, flags='', env=''):
-        return ("exec env -i HOME=%s/home PATH=/usr/local/bin:/usr/bin:/bin LANG=en_US.UTF-8 "
+    def nnn_cmd(self, flags='', env='', path=None):
+        return ("exec env -i HOME=%s/home PATH=%s LANG=en_US.UTF-8 "
                 "TERM=\"$TERM\" TMUX=\"$TMUX\" TMUX_PANE=\"$TMUX_PANE\" NNN_DND_OSC72=1 "
                 "NNN_DND_DEBUG=%s/dnd.log %s %s %s %s/files"
-                % (self.S, self.S, env, self.nnn, flags, self.S))
+                % (self.S, path or '/usr/local/bin:/usr/bin:/bin', self.S, env, self.nnn,
+                   flags, self.S))
 
     def setup(self):
         S = self.S
@@ -304,10 +305,11 @@ class Run:
                            S + '/client.raw')
         self.k.pump(1.0)
 
-    def start_nnn(self, pane, flags='', env=''):
-        """Start nnn in a pane of the window on show, and wait for its list."""
+    def start_nnn(self, pane, flags='', env='', path=None):
+        """Start nnn in a pane (selected), and wait for its list."""
         self.tmux('select-window', '-t', pane.rsplit('.', 1)[0])
-        self.tmux('respawn-pane', '-k', '-t', pane, "sh -c '%s'" % self.nnn_cmd(flags, env))
+        self.tmux('select-pane', '-t', pane)
+        self.tmux('respawn-pane', '-k', '-t', pane, "sh -c '%s'" % self.nnn_cmd(flags, env, path))
         self.k.pump_until(lambda: 'a.txt' in self.tmux('capture-pane', '-p', '-t', pane), 5)
         self.k.pump(0.5)
 
@@ -446,6 +448,7 @@ def scenarios(r):
             r.chk('T4a kitty\'s drag source is off afterwards', not k.can_offer,
                   'can_offer=%s' % k.can_offer)
             what = 'retry the drag from nnn R'
+        dmark = len(r.log())
         started, uri, seq, offers = drag_out(label, pane, name, what)
         r.chk('%s armed by the press, one offer sent' % label, offers == 1, 'osc=%s' % seq[:3])
         r.chk('%s nnn answered and the drag started' % label, started, 'drag_state=%s' % k.drag_state)
@@ -453,6 +456,8 @@ def scenarios(r):
               repr(uri))
         r.chk('%s disarmed after the drop (t=o:x=2)' % label, not k.can_offer and 't=o:x=2' in seq,
               'can_offer=%s' % k.can_offer)
+        r.chk('%s the drop disarms at once, not by the timeout' % label,
+              r.logged(dmark, 'disarm: drag finished'), 'log says timeout instead')
     mouse = r.tmux('show', '-gv', 'mouse').strip()
     marker = r.tmux('show', '-gv', '@nnn_dnd_mouse').strip()
     r.chk('T3/T4 tmux mouse grab restored after the drags', mouse == 'on' and not marker,
@@ -524,6 +529,64 @@ def scenarios(r):
     k.pump_until(lambda: not k.can_offer, 1)
     r.chk('T7b a key in nnn ends the stale arm at once', stale and not k.can_offer
           and r.logged(mark, 'disarm: key'), 'stale=%s can_offer=%s' % (stale, k.can_offer))
+    mark = len(r.log())
+    col, row = r.row_of('t:1.1', 'c.txt')
+    k.press(col, row)
+    armed = k.pump_until(lambda: k.can_offer, 1)
+    k.release(col, row)
+    k.pump_until(lambda: not k.can_offer, 1)
+    r.chk('T7b the first click after the key registers (ncurses reset)', armed
+          and r.logged(mark, 'armed (press on the list)'), 'armed=%s' % armed)
+
+    note('T17: a window resize during a held gesture ends the arm')
+    k.pump_until(lambda: k.reporting, 2)
+    mark = len(r.log())
+    col, row = r.row_of('t:1.1', 'b.txt')
+    k.press(col, row)
+    armed = k.pump_until(lambda: k.can_offer, 1)
+    r.tmux('resize-window', '-t', 't:1', '-x', '150', '-y', '40')
+    # The disarm cannot be written at once: the resize forces a pane redraw,
+    # and tmux drops passthrough for a pane with a redraw pending. The arm is
+    # aged instead, and the next idle tick's timeout ends it (~1 s).
+    off = k.pump_until(lambda: not k.can_offer, 3.5)
+    col, row = r.row_of('t:1.1', 'b.txt')   # the rows moved with the resize
+    k.release(col, row)
+    k.pump(0.4)
+    r.chk('T17 a resize ends the arm within a second or two (ncurses forgot the press)',
+          armed and off and r.logged(mark, 'disarm: no release (timeout)'),
+          'armed=%s off=%s' % (armed, off))
+    offers = r.probe('t:1.3')
+    r.chk('T17 a text drag afterwards is not an offer', offers == 0, 'offers=%d' % offers)
+    r.tmux('resize-window', '-t', 't:1', '-x', '160', '-y', '40')
+    k.pump(0.4)
+
+    note('T20: no timeout while the drag itself is in flight (a long drop)')
+    k.pump_until(lambda: k.reporting, 2)
+    mark = len(r.log())
+    col, row = r.row_of('t:1.1', 'a.txt')
+    k.uri_b64 = ''
+    k.drag(col, row, range(col + 1, col + 4))
+    k.pump_until(lambda: k.drag_state == 'started', 1)
+    n0 = len(k.app_osc)
+    k.pump(3.2)                     # hold the drag over the target, past the 2 s timeout
+    held = k.drag_state == 'started' and not any(b.startswith('t=o:x=2')
+                                                 for _, b in k.app_osc[n0:])
+    k.release(col + 3, row)
+    k.pump_until(lambda: not k.can_offer, 2)
+    r.chk('T20 a drag held past 2 s is not torn down mid-flight', held
+          and r.logged(mark, 'disarm: drag finished'), 'held=%s state=%s' % (held, k.drag_state))
+    k.pump(0.7)
+
+    note('T21: a stale arm outlives the 2 s timeout while a peer drag is live')
+    r.tmux('set', '-g', '@nnn_dnd_mouse', '%d.1:on' % os.getpid())   # a live peer drag
+    mark = len(r.log())
+    flick()
+    k.pump(3.6)                     # past the 2 s timeout
+    held = k.can_offer and not r.logged(mark, 'disarm: no release')
+    r.tmux('set', '-gu', '@nnn_dnd_mouse')
+    fired = k.pump_until(lambda: not k.can_offer, 2.5)
+    r.chk('T21 the timeout waits for the peer drag, then fires', held and fired
+          and r.logged(mark, 'disarm: no release (timeout)'), 'held=%s fired=%s' % (held, fired))
 
     note('T10: presses outside the list do not arm')
     x, y, _, _ = r.geom('t:1.1')
@@ -600,23 +663,57 @@ def scenarios(r):
     offers = r.probe('t:1.3')
     r.chk('T13 a later text drag in the shell pane is not an offer', offers == 0, 'offers=%d' % offers)
 
-    for label, key, what in (('T14', 't', 'the sort prompt (get_input)'),
-                             ('T15', '/', 'the filter prompt (filterentries)')):
-        note('%s: a release that arrives while %s waits' % (label, what))
-        col, row = r.row_of('t:1.1', 'b.txt')
-        k.press(col, row)
-        k.pump(0.1)
-        k.write(key)
-        k.pump(0.4)
-        before = r.bottom('t:1.1')
-        k.release(col, row)
-        k.pump(0.4)
-        after = r.bottom('t:1.1')
-        k.write(ESC)
-        k.pump(0.5)
-        r.chk('%s the prompt is still open after the release' % label,
-              before.strip() != '' and before == after and not k.can_offer,
-              'changed=%s can_offer=%s' % (before != after, k.can_offer))
+    note('T14: a release that arrives while the sort prompt (get_input) waits')
+    col, row = r.row_of('t:1.1', 'b.txt')
+    k.press(col, row)
+    k.pump(0.1)
+    k.write('t')
+    k.pump(0.4)
+    before = r.bottom('t:1.1')
+    k.release(col, row)
+    k.pump(0.4)
+    r.chk('T14 the sort prompt is still open after the release',
+          before.strip() != '' and before == r.bottom('t:1.1') and not k.can_offer,
+          'changed=%s can_offer=%s' % (before != r.bottom('t:1.1'), k.can_offer))
+    k.write(ESC)
+    k.pump(0.5)
+
+    note('T15: the filter prompt opened by a click on the bottom rows (its own release)')
+    x, y, w, h = r.geom('t:1.1')
+    k.press(x + 3, y + h - 2)       # opens the filter prompt, no key in between
+    k.pump(0.3)
+    before = r.bottom('t:1.1')
+    k.release(x + 3, y + h - 2)     # reaches filterentries as BUTTON1_RELEASED
+    k.pump(0.5)
+    r.chk('T15 the filter prompt survives its own release',
+          before.strip() != '' and before == r.bottom('t:1.1'),
+          'changed=%s' % (before != r.bottom('t:1.1')))
+    k.write(ESC)
+    k.pump(0.5)
+
+    note('T22: a resize and a release that arrive while the sort prompt waits')
+    col, row = r.row_of('t:1.1', 'b.txt')
+    k.press(col, row)
+    k.pump(0.1)
+    k.write('t')
+    k.pump(0.4)
+    before = [l.strip() for l in r.bottom('t:1.1').split('\n')]
+    r.tmux('resize-window', '-t', 't:1', '-x', '150', '-y', '38')
+    k.pump(0.4)
+    col, row = r.row_of('t:1.1', 'b.txt')
+    k.release(col, row)
+    k.pump(0.4)
+    after = [l.strip() for l in r.bottom('t:1.1').split('\n')]
+    # The resize legitimately clears the neighbouring status line (the prompt
+    # redraw only repaints itself); the prompt line itself must survive.
+    pb = next((l for l in before if "a'u" in l), '')
+    pa = next((l for l in after if "a'u" in l), '')
+    r.chk('T22 the sort prompt survives a resize and the release',
+          pb != '' and pa == pb, 'before=%r after=%r' % (pb[:40], pa[:40]))
+    k.write(ESC)
+    k.pump(0.5)
+    r.tmux('resize-window', '-t', 't:1', '-x', '160', '-y', '40')
+    k.pump(0.4)
 
     note('T16: a subprocess started by a double-click runs with the drag source off')
     r.start_nnn('t:2.1', flags='-c', env='NNN_OPENER=%s/opener.sh' % r.S)
@@ -636,29 +733,66 @@ def scenarios(r):
           and r.logged(mark, 'disarm: subprocess'),
           'during=%s after=%s' % (during, k.can_offer))
 
+    note('T23: a resize that arrives while nnn waits for tmux is not lost')
+    shim = os.path.join(r.S, 'shimbin')
+    os.makedirs(shim, exist_ok=True)
+    with open(os.path.join(shim, 'tmux'), 'w') as f:      # slows every nnn->tmux call
+        f.write('#!/bin/sh\nsleep 1.5\nexec %s "$@"\n' % r.tmuxbin)
+    os.chmod(os.path.join(shim, 'tmux'), 0o755)
+    r.start_nnn('t:2.1', path=shim + ':/usr/local/bin:/usr/bin:/bin')
+    k.write('j')                    # input: the next idle tick probes tmux (blocked 1.5 s)
+    k.pump(1.5)                     # the probe is inside its blocking wait now
+    r.tmux('resize-window', '-t', 't:2', '-x', '150', '-y', '24')   # SIGWINCH is ignored
+    k.pump(4.0)                     # the block ends; the idle tick repairs and redraws
+    lines = [l for l in r.tmux('capture-pane', '-p', '-t', 't:2.1').splitlines() if l.strip()]
+    r.chk('T23 the screen is redrawn at the new size after the block',
+          bool(lines) and re.search(r'\d+/3', lines[-1]) is not None,
+          'last line=%r' % (lines[-1][:50] if lines else ''))
+    r.tmux('resize-window', '-t', 't:2', '-x', '160', '-y', '40')
+    k.pump(0.5)
+
+    # T19 was here: "quitting an unarmed nnn sends no t=o:x=2" (the M12 guard
+    # in dnd_osc72_disable()). Removed: a dying pane's final passthrough never
+    # reaches the client (verified with a mutant that always sends it), so the
+    # guard is untestable through the transport and the check was vacuous.
+
     note('T8: a new nnn clears a drag source left on by an older or crashed nnn')
     r.tmux('select-window', '-t', 't:1')
     k.pump(0.3)
     mark = len(r.log())
     k.can_offer = True              # what an old binary's startup EnableDrag leaves set
     r.start_nnn('t:1.2')
-    cleared = k.pump_until(lambda: not k.can_offer, 3)
-    r.chk('T8 a new nnn turns a leftover drag source off', cleared
-          and r.logged(mark, 'cleared a leftover drag source'), 'can_offer=%s' % k.can_offer)
+    k.write('j')                    # input proves the pane is on show
+    cleared = k.pump_until(lambda: not k.can_offer, 4)
+    r.chk('T8 a new nnn clears a leftover drag source after its first input', cleared
+          and r.logged(mark, 'sent a clear of a leftover drag source'), 'can_offer=%s' % k.can_offer)
 
     note('T8b: but not while another nnn has a drag in flight')
     r.tmux('set', '-g', '@nnn_dnd_mouse', '%d.1:on' % os.getpid())   # a live owner
     k.can_offer = True
+    mark = len(r.log())
     r.start_nnn('t:1.2')
+    k.write('j')
     k.pump(2.5)
-    kept = k.can_offer
+    kept = k.can_offer and not r.logged(mark, 'sent a clear')
     r.tmux('set', '-gu', '@nnn_dnd_mouse')
-    r.chk('T8b the clear is skipped while a drag is in flight', kept, 'can_offer=%s' % kept)
-    col, row = r.row_of('t:1.1', 'a.txt')
-    k.press(col, row)               # a click in nnn ends any leftover
-    k.pump(0.08)
+    cleared = k.pump_until(lambda: not k.can_offer, 3)
+    r.chk('T8b the clear waits for the peer drag', kept, 'can_offer=%s' % k.can_offer)
+    r.chk('T8b and is sent once the peer drag ends', cleared
+          and r.logged(mark, 'sent a clear of a leftover drag source'), 'can_offer=%s' % k.can_offer)
+
+    note("T8c: the clear also waits for this nnn's own gesture")
+    mark = len(r.log())
+    r.start_nnn('t:1.2')
+    col, row = r.row_of('t:1.2', 'a.txt')
+    k.press(col, row)               # input that also arms: the tick must not clear under it
+    k.pump(1.2)                     # one idle tick fires while armed
+    held = k.can_offer and not r.logged(mark, 'sent a clear')
     k.release(col, row)
-    k.pump_until(lambda: not k.can_offer, 1)
+    sent = k.pump_until(lambda: r.logged(mark, 'sent a clear'), 3)
+    r.chk("T8c the clear waits for this nnn's own gesture, then is sent", held and sent,
+          'held=%s sent=%s' % (held, sent))
+    k.pump(0.5)
 
 
 def bare_kitty(r):
@@ -674,6 +808,12 @@ def bare_kitty(r):
         seq = [b.split(';')[0] for _, b in k.app_osc]
         r.chk('T9 bare kitty: EnableDrag + EnableDrop at startup',
               k.can_offer and 't=a' in seq, 'osc=%s' % seq)
+        k.write('j')
+        t = time.monotonic()
+        k.pump(3.0)                 # idle seconds: the tmux-only idle logic must stay out
+        quiet = not any(ts >= t and b.startswith('t=o:x=2') for ts, b in k.app_osc)
+        r.chk('T9 bare kitty: idle seconds after input withdraw nothing', k.can_offer and quiet,
+              'can_offer=%s' % k.can_offer)
         k.write('q')
         k.pump_until(lambda: not k.can_offer, 3)
         r.chk('T9 bare kitty: quitting withdraws the drag source', not k.can_offer,
