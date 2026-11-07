@@ -28,7 +28,11 @@ S=$(mktemp -d "${TMPDIR:-/tmp}/nnn-cpmv-e2e.XXXXXX") || exit 2
 SOCK="cpmve2e-$$"
 START=$SECONDS
 tm() { tmux -L "$SOCK" "$@"; }
-cleanup() { tm kill-server 2>/dev/null; chmod -R u+rwX "$S" 2>/dev/null; rm -rf "$S"; }
+cleanup() {
+    tm kill-server 2>/dev/null
+    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCK"          # kill-server leaves the socket file behind
+    chmod -R u+rwX "$S" 2>/dev/null; rm -rf "$S"
+}
 trap cleanup EXIT
 
 mkdir -p "$S/cfg/nnn/plugins" "$S/home"
@@ -51,6 +55,24 @@ waitfor() {
     return 1
 }
 keys() { tm send-keys -t t "$@"; }
+# wait_content <file> <expected> [seconds]: poll until the file holds the text (ceiling 15 s by default)
+wait_content() {
+    local f="$1" want="$2" max=${3:-15} t0=$SECONDS
+    while [ $((SECONDS - t0)) -lt "$max" ] && [ $((SECONDS - START)) -lt 240 ]; do
+        [ "$(cat -- "$f" 2>/dev/null)" = "$want" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+# wait_gone <path> [seconds]: poll until the path no longer exists
+wait_gone() {
+    local f="$1" max=${2:-15} t0=$SECONDS
+    while [ $((SECONDS - t0)) -lt "$max" ] && [ $((SECONDS - START)) -lt 240 ]; do
+        [ -e "$f" ] || return 0
+        sleep 0.2
+    done
+    return 1
+}
 put()  { mkdir -p "$(dirname -- "$1")"; printf '%s' "$2" > "$1"; touch -d "@$3" "$1"; }
 cat_or() { if [ -e "$1" ]; then cat -- "$1"; else printf '<missing>'; fi; }
 sel_set() { printf '%s' "$1" > "$SEL"; }                  # nnn truncates the last NUL
@@ -64,7 +86,7 @@ start_nnn() {   # start_nnn <dir> [nnn options]
         "env -i HOME='$S/home' PATH='$PATH' TERM=xterm-256color LANG=C.UTF-8 XDG_CONFIG_HOME='$S/cfg' NNN_SEL='$SEL' bash --norc --noprofile"
     sleep 0.5
     keys "cd '$dir' && '$NNN' $* ." Enter
-    waitfor 'proj|dst' 10 || bad "nnn started in $dir" "pane: $(pane | head -5 | tr '\n' '|')"
+    waitfor '^1 2 3 4 5 6 7 8 ' 10 || bad "nnn started in $dir" "pane: $(pane | head -5 | tr '\n' '|')"
 }
 stop_nnn() { keys q; sleep 0.3; tm kill-server 2>/dev/null; }
 
@@ -84,7 +106,8 @@ keys p
 waitfor 'choose \[1-7\]' || bad "menu shown after pressing p" "pane: $(pane | tail -12 | tr '\n' '|')"
 pane | grep -q 'CONFLICT: proj' && ok "CONFLICT menu is shown for the directory" || bad "CONFLICT menu is shown" "no CONFLICT line"
 keys 4 Enter
-sleep 1.5
+wait_content "$C/dst/proj/dn_diff.txt" "AAAAA" || true
+wait_content "$SEL" "" || true                         # nnn clears the selection when the plugin has returned
 check "dest newer + size differs is overwritten"     "AAAAA"  "$(cat_or "$C/dst/proj/dn_diff.txt")"
 check "source newer + same size is overwritten"      "SNEWER" "$(cat_or "$C/dst/proj/sn_same.txt")"
 check "dest newer + same size is kept"               "DNEWER" "$(cat_or "$C/dst/proj/dn_same.txt")"
@@ -103,7 +126,7 @@ keys 4 Enter
 waitfor "Done\. Press enter" || bad "move that kept a file pauses for review" "pane: $(pane | tail -8 | tr '\n' '|')"
 pane | grep -q 'kept in the source' && ok "the pause names the kept file" || bad "kept notice" "not on screen"
 keys Enter
-sleep 0.8
+wait_content "$SEL" "" || true
 check "moved over: dest newer + size differs" "AAAAA" "$(cat_or "$C/dst/proj/dn_diff.txt")"
 check "kept target of the same size"          "DNEWER" "$(cat_or "$C/dst/proj/dn_same.txt")"
 check "kept file is still in the SOURCE"      "SOLD!!" "$(cat_or "$C/src/proj/dn_same.txt")"
@@ -129,7 +152,8 @@ chmod 644 "$C/src/proj/sub/deep.txt"
 keys p
 waitfor 'choose \[1-7\]' || bad "retry shows the menu again" "pane: $(pane | tail -8 | tr '\n' '|')"
 keys 4 Enter
-sleep 1.5
+wait_content "$C/dst/proj/sub/deep.txt" "deep-src" || true
+wait_content "$SEL" "" || true
 check "retry copies the file that failed" "deep-src" "$(cat_or "$C/dst/proj/sub/deep.txt")"
 check "selection is cleared after the retry succeeds" "0" "$(sel_len)"
 stop_nnn
@@ -142,7 +166,8 @@ if command -v cpg >/dev/null 2>&1; then
     keys p
     waitfor 'choose \[1-7\]' || bad "menu shown with -r" "pane: $(pane | tail -8 | tr '\n' '|')"
     keys 4 Enter
-    sleep 1.5
+    wait_content "$C/dst/proj/dn_diff.txt" "AAAAA" || true
+    wait_content "$SEL" "" || true
     check "advcpmv build: dest newer + size differs overwritten" "AAAAA" "$(cat_or "$C/dst/proj/dn_diff.txt")"
     stop_nnn
 fi
