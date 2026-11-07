@@ -3281,3 +3281,377 @@ discovered while fixing, not by the review: the resize passthrough drop
 hitting the account's model weekly limit mid-run (it wrote the report, cleaned
 its rigs, and the session could not run further agents until the limit reset).
 Everything above was therefore verified and finished inline.
+
+---
+
+## Problem 16 -- Copy/move CONFLICT menu: `4) different size or newer` sometimes keeps files it should overwrite
+
+### 16.1 Symptom (as reported)
+
+> When copying and replacing a directory with the same name, at the CONFLICT options I
+> choose `4) different size or newer` and yes for overwriting. However, sometimes it still
+> does not overwrite the files that are newer or have a different size.
+
+The paste runs through `plugins/cpmv`, which nnn calls for `p` (copy here) and `v` (move
+here) in a `FZ_CPMV` build (`O_FZ_CPMV=1`, set by `build.sh`). `~/.config/nnn/plugins/cpmv`
+is a symlink to the file in this repository, so the repository file is the live file and no
+rebuild is needed.
+
+| Component | Value (read on 2026-11-07) |
+|---|---|
+| plugin | `plugins/cpmv` (before the fix: commit `d7b8f252`) |
+| rsync | `3.2.7`, protocol 31 |
+| cp, mv | GNU coreutils `8.32`; advcpmv `cpg` and `mvg` in `/usr/local/bin` |
+| find | `bfs 4.1.1` |
+| bash | `5.2.37` |
+| filesystems | `/` is `ext4`; the data volumes under `/media/tripham` are NTFS (`fuseblk`, ntfs-3g 2022.10.3) |
+
+### 16.2 TL;DR root cause
+
+Mode 4 ran `rsync -a --update`. `--update` skips every target file that is **newer** than
+the source, whatever its size. The menu promises "different size OR newer", so a file whose
+size differs but whose target copy is newer was kept. A target is often the newer one: it
+was copied earlier by a tool that does not keep modification times, or it was edited after
+the copy.
+
+Reproducing that led to more defects in the same script. Each one can look like "it did not
+overwrite", and some lose data.
+
+| # | Fact | Where (before the fix) | Effect |
+|---|---|---|---|
+| 1 | Mode 4 used `rsync --update`. | `do_one`, mode 4 | A newer target with a different size was kept. This is the reported bug. |
+| 2 | Mode 3 used `rsync --size-only`. `-a` still copies the source mtime onto same-size files without copying their data. | `do_one`, mode 3 | A same-size file whose source is newer got the new mtime and kept the old content. A later mode 4 run saw "same size, same time" and never fixed it. |
+| 3 | The plugin always exited 0 and, for one item, returned to nnn at once. | end of script | Errors from `cp`, `mv` or `rsync` vanished when nnn redrew. nnn cleared the selection, so a failed paste looked like "it did not overwrite". |
+| 4 | Moving a directory onto an existing one in mode 1 or 2 ran `mv -f` or `mv -u`, which cannot merge directories. | `do_one`, modes 1 and 2 | `Directory not empty`. Nothing moved, and nothing said so. |
+| 5 | Moves in modes 3, 4 and 5 ran `rsync ... && rm -rf <source>`. | `rm_src` | Source files that the mode had skipped were deleted with the rest. Data loss. |
+| 6 | A directory conflict showed `4096 bytes` for both sides. | `show_conflict` | Misleading: the menu decides for a whole tree. |
+| 7 | A directory (or a link) in the source over a regular FILE of the target, inside the merged tree. | rsync default | rsync deletes the target file and creates the directory, silently. Found while testing. |
+
+The independent review (16.12) found more defects in the first version of the fix. All are fixed.
+
+| # | Fact | Effect |
+|---|---|---|
+| 8 | A move deleted a source file that rsync's quick check called identical (same size, same time in whole seconds), without comparing the bytes. | Two different files written in the same second, or files with fixed build timestamps, lost the source bytes. Modes 2 to 5. The original plugin did it too. |
+| 9 | Mode 2 on a directory move used `rsync --update`. That replaces a target of equal time but another size, and lets an older link replace a newer file. | "Newer only" was not newer only, and move and copy disagreed. |
+| 10 | A folder pasted into itself (the destination inside the source) was refused by `cp` and `mv` but not by the rsync paths. | The tree was copied into itself, and `v` in mode 5 could leave a file with mixed content. |
+| 11 | Ctrl-C stopped only the running rsync. rsync exits with status 20 and handles the signal itself, so the plugin went on with the next selected item. | A cancel did not cancel; after "apply to ALL" the next item was moved without a question. No data lost. |
+| 12 | The rsync paths do not keep sparse files sparse, `cp` does. | A sparse 40 MB test file became 40 MB on disk. VM images are the realistic case. |
+| 13 | A move changed the permissions of an identical target file that the mode keeps. | A private file (600) became 644. |
+| 14 | A selected folder plus a file inside it, then a move: the file was reported "not found" after the folder left. | Everything moved, but the plugin exited 1. |
+| 15 | A name that ends in a newline lost its newline in `$(basename ...)`. | The conflict was not seen and the target was overwritten without a menu. |
+
+### 16.3 What each mode does now
+
+| Mode | Replace a target file when | Copy | Move |
+|---|---|---|---|
+| 1 overwrite | always | `cp -f` | file: `mv -f`; directory: `rsync -I --remove-source-files` |
+| 2 newer only | the source is newer, in whole seconds (size ignored) | plan, then `rsync --files-from` | same, with `--remove-source-files` |
+| 3 different size only | the sizes differ (time ignored) | plan, then `rsync --files-from` | same, with `--remove-source-files` |
+| 4 different size or newer | the sizes differ OR the source is newer | plan, then `rsync --files-from` | same, with `--remove-source-files` |
+| 5 resume | an interrupted copy is completed | `rsync --partial --append-verify` | same, with `--remove-source-files` |
+| 6 rename | never; both are kept as `name (1)` | `cp` | `mv` |
+| 7 skip | never | nothing | nothing |
+
+Rules that hold for every mode:
+
+- A directory is merged file by file. A file that exists on one side only is never deleted.
+- "Newer" means a larger modification time in whole seconds, which is rsync's default.
+- A file that modes 2, 3 or 4 keep is not touched, not even its modification time or its
+  permissions. Mode 5 also brings the metadata of complete files up to date.
+- A move removes from the source only: a file rsync transferred (rsync checks it); a file
+  that looked identical (same size, same time) and whose **checksum** proves equal bytes; a
+  link or special file that rsync found unchanged. Everything else stays in the source, is
+  reported, and makes the plugin pause with `Done. Press enter.`
+- Any failure makes the plugin exit 1. nnn then shows its own `'Enter' to continue`, prints
+  `failed!`, and keeps the selection, so the paste can be retried.
+- A file and a directory with the same name only offer rename and skip. "Apply to all" never
+  forces a mode on them.
+- If an item inside the merged tree would replace a regular or special FILE of the target with
+  a directory, a link or a special file, the whole item is refused ("nothing was copied") and
+  listed as a problem (defect 7). A directory or a link in the way is replaced, because that
+  loses no file data. A symlink to a directory in the target is merged into by every rsync
+  path; mode 1 copy (`cp -R`) refuses it with a visible error, as `cp` always did.
+- A folder cannot be copied or moved into itself or below itself.
+- Ctrl-C ends the whole run with exit status 130. Nothing is lost: rsync removes a source file
+  only after it was transferred, and on a retry the files that exist on both sides are
+  identical.
+- The rsync paths keep sparse files sparse (`-S`). They do not keep extended attributes, ACLs
+  or hard links (see 16.8).
+
+### 16.4 Background: what rsync does with each flag
+
+Every row is a file that exists on both sides.
+
+| Source versus target | Old mode 4 (`--update`) | New mode 4 | Old mode 3 (`--size-only`) | New mode 3 |
+|---|---|---|---|---|
+| target newer, size differs | kept (the bug) | replaced | replaced | replaced |
+| target older, size differs | replaced | replaced | replaced | replaced |
+| source newer, same size | replaced | replaced | data kept, target mtime set to the source's | untouched |
+| target newer, same size | kept | kept, untouched | data kept, target mtime set to the older source time | untouched |
+| identical | untouched | untouched | untouched | untouched |
+
+Facts about rsync 3.2.7 that shaped the design:
+
+- `--update` is tested before the size. A newer target is skipped whatever its size, and an
+  equal time with a different size is replaced.
+- With `--size-only`, `-a` still updates the target's mtime for same-size files
+  (`.f..t......` in `-i` output). That is defect 2, and it also makes a stale file look
+  current to every later run.
+- `--files-from` with `--from0` transfers only the listed items. Unlisted files keep their
+  content and mtime. `-a` does not recurse with it.
+- `--remove-source-files` removes files that were transferred and files that were already
+  identical. It keeps files that `--update` skipped.
+- A dry run (`-n -ii --out-format='%i %n'`) prints one line per item. The flags are
+  `YXcstpoguax`: `>f` means data would be sent, `.f` unchanged, `s` size differs, `t` time
+  differs, `+++++++++` missing. rsync prints control characters, and a backslash before `#`,
+  as `\#ooo`, so names can be decoded without ambiguity.
+- A directory that rsync will create is listed as `cd+++++++++` even when the target holds a
+  file of that name (defect 7).
+
+### 16.5 Reproduction before the fix
+
+```bash
+git show d7b8f252:plugins/cpmv > /tmp/cpmv.orig && chmod +x /tmp/cpmv.orig
+CPMV=/tmp/cpmv.orig misc/test/test-cpmv.sh            # shows the failures
+```
+
+Minimal case: source `proj/a.txt` has 5 bytes and an old time; target `proj/a.txt` has 7
+bytes and a newer time. Choose `4`. The target keeps its 7 bytes. The same run with nnn
+itself is in `misc/test/test-cpmv-e2e.sh`.
+
+**The typical trigger** (`Fact`, measured 2026-11-07 in a scratch directory): a newer release
+is extracted from an archive and pasted over a directory that was deployed or copied later.
+An archive keeps the build-time dates of its files, so every source file is **older** than the
+target, which was written today without `-p`. Every file also has a new size.
+
+| Setup | Mode 4 with the old plugin | Mode 4 with the new plugin |
+|---|---|---|
+| 120 files, release 2 from `tar` (mtime 2026-09-01), over release 1 written today | 120 of 120 files still different from release 2 | 0 of 120 |
+
+This is why the symptom looked random: it depended on how the target directory got its
+dates, not on anything visible in the menu.
+
+The result of the final suite against the unfixed plugin is saved in
+[baseline-original-cpmv.txt](workflows/cpmv_overwrite/data/baseline-original-cpmv.txt)
+(1034 checks passed, 766 failed; the first suite of the fix, with 578 checks, showed 254 failures).
+
+### 16.6 Solution
+
+Modes 2, 3 and 4 no longer ask rsync to decide and copy in one step. The plugin first **plans**
+with rsync dry runs, then **copies exactly the plan** with one `rsync --files-from` run. A file
+the plan leaves out is never opened for writing. A move adds one more rule: it deletes a source
+file only when it can prove that the bytes are at the target.
+
+Diagram 16.6a: how modes 2, 3 and 4 decide, then copy or move (rendered with Mermaid CLI
+11.12.0 without errors).
+
+```mermaid
+flowchart TD
+    choose["User picks mode 2, 3 or 4<br/>for a conflicting item"] --> d1["Dry run 1<br/>rsync -n -ii<br/>compares size and time"]
+    d1 --> clash{"Would an item replace a<br/>regular file with another type?"}
+    clash -->|yes| refuse["Refuse the item<br/>nothing copied, exit 1"]
+    clash -->|no| classify["Classify each file"]
+    classify -->|missing, or size differs in modes 3 and 4| list["Transfer list"]
+    classify -->|time differs, modes 2 and 4| d2["Dry run 2<br/>rsync -n --update"]
+    d2 -->|source is strictly newer| list
+    d2 -->|target is newer or equal| keep["Kept<br/>never touched"]
+    classify -->|only the time differs, mode 3| keep
+    classify -->|same size and same time| same["Identical by the quick check"]
+    list --> run["One real run<br/>rsync --files-from<br/>move adds --remove-source-files"]
+    same -->|copy| nothing["Nothing to do"]
+    same -->|move| sum["Dry run 3<br/>rsync -n -c<br/>checksums these files"]
+    sum -->|bytes are equal| rm["rm the source file"]
+    sum -->|bytes differ| stay["Stays in the source<br/>and is reported"]
+    run --> done["Move: remove empty source dirs<br/>and report what was kept"]
+    rm --> done
+    stay --> done
+```
+
+The diagram shows one item. Dry run 1 sees every file once. Dry run 2 runs only when some file
+differs in time (mode 4) or in time or size (mode 2), because there the direction of the time
+decides. Dry run 3 runs only for a move, over the files that the quick check called identical.
+Two different files written in the same second look identical to the quick check, and a move
+must not delete the source of one of them.
+
+| Step | Component | What it does |
+|---|---|---|
+| Dry run 1 | `dry_run`, `plan_xfer` | `rsync -a -K -8 -n -ii --out-format='%i %n'`; sorts every line into copy, keep or identical |
+| Dry run 2 | `plan_xfer` | `rsync ... -n -i --update`; the `>f` lines with the `t` flag are the files whose source is strictly newer; `grep -Fxf` intersects them with the candidates |
+| Clash guard | `check_clashes`, `preflight` | an item that rsync lists as new, where a regular or special file sits at the target, is refused; `preflight` runs the same dry run for mode 5 and for the merge-move of mode 1 |
+| Copy | `xfer_policy` | `rsync -a -S --no-r -d --from0 --files-from=<list>`; `--remove-source-files` for a move |
+| Proof for a move | `collect_identical`, `remove_verified` | dry run 3 (`rsync -n -c`) over the identical regular files; `rm` removes only the proven ones, so a kept target is not touched at all |
+| Move cleanup | `finish_move` | `rmdir` of source directories that became empty; counts and names the first five files left behind |
+| Names | `rs_unescape`, `to_nul`, `base_of` | decode `\#ooo`; NUL lists for `--files-from`; base names byte for byte |
+| Ctrl-C | `trap ... INT` | prints `interrupted: the remaining items were not processed.` and exits 130 |
+
+Other changes in `plugins/cpmv`:
+
+| Change | Why |
+|---|---|
+| `try` and `note_err` count every failed command; the script exits 1 and lists the problems | defect 3; nnn pauses and keeps the selection |
+| Directory move in mode 1 goes through `move_merge` (`rsync -I --remove-source-files`) | defect 4 |
+| Move removes only what rsync transferred or what a checksum proved identical | defects 5 and 8 |
+| Mode 2 uses the plan for copy and move; `cp -u` and `mv -u` are gone | defect 9, and no more tty prompts from `mv -u` |
+| A folder cannot go into itself (physical paths compared) | defect 10 |
+| `-S` on planned transfers and on the merge-move | defect 12 |
+| `is_realdir` and the clash menu (`6` rename, `7` skip only) | a file and a directory cannot be merged |
+| A selected child of a folder that already moved is skipped with a note | defect 14 |
+| `describe` prints `(directory)` instead of `4096 bytes` | defect 6 |
+| `read -r choice \|\| choice=7` | end of input no longer loops forever |
+| `rename_one` does not split a directory name at its last dot; a failed rename names its target | `proj.v2` becomes `proj.v2 (1)`; `proj -> 'proj (1)': 'cpg' failed` |
+| A path that is not found counts as a problem | a stale selection no longer looks like success |
+| Plan and kept lines are short (`proj: 5 to copy, 1 kept, 0 identical`) | they fit a 60 column pane |
+
+Files changed:
+
+| File | Change |
+|---|---|
+| `plugins/cpmv` | the logic above |
+| `misc/test/test-cpmv.sh` | new, regression suite for the plugin |
+| `misc/test/test-cpmv-e2e.sh` | new, drives the real nnn in an isolated tmux server |
+| `README.md`, `docs/Brainstorm_nnn_Update.md`, `docs/nnn_Software_Design.md` | one sentence, one correction note, section 3.5.8 brought up to date |
+| `docs/workflows/cpmv_overwrite/` | investigation, briefs, three review reports, run log, baseline run |
+
+### 16.7 Decisions
+
+| Decision | Reason |
+|---|---|
+| `Decision` Keep `cp -f` for copy mode 1 and `mv -f` for a file move in mode 1 | They already do what the label says, and `cpg` keeps its progress bar. |
+| `Decision` Mode 2 uses the same plan as modes 3 and 4, for copy and move | One rule everywhere: strictly newer in whole seconds. `cp -u` compares nanoseconds, `mv -u` asks on the tty, and `rsync --update` replaces an equal time with another size. |
+| `Decision` "Identical" for a COPY means same size and same time in seconds | It is rsync's own quick check. Policy: a same-size, same-time target is the same file. |
+| `Decision` A MOVE proves identity with a checksum before it deletes a source | A deleted source cannot be recovered; reading both copies once is cheap by comparison (1.8 s for 30,000 small files). |
+| `Decision` A move keeps what the mode skipped, and says so | Deleting a skipped source file is data loss; a leftover is only an inconvenience. |
+| `Decision` Refuse an item only when a regular or special FILE would be lost | A directory or a link in the way loses no file data, so it is replaced. This keeps merges working when a stale link sits in the target. |
+| `Decision` Compare time in whole seconds, not nanoseconds | NTFS keeps 100 ns and FAT 2 s; a finer comparison would copy again and again. |
+| `Decision` No `--delete` anywhere | The menu merges. It never removes a file that exists only in the target. |
+| `Decision` No `-X` or `-A` | `Assumption`: on a file system without extended attributes (FAT, some network mounts) they make rsync report errors, which would turn good copies into reported failures. They worked on this machine's NTFS volumes (exit 0, tested). The cost is that a directory merge-move through rsync loses extended attributes (16.8). `Open question`: switch `-X` on when the target supports it. |
+| `Decision` No pause after a single-directory copy | The owner chose that earlier (commit `f5b8611e`); the summary is on screen for about a second. |
+| `Decision` The menu layout is unchanged | It is 70 columns wide and wraps in a narrower pane. That is old behaviour and was not reported. |
+
+### 16.8 Known limits and risks
+
+| Item | Label | Detail |
+|---|---|---|
+| Drag and drop does not use the menu | `Fact` | A file dropped on nnn is copied by upstream `cp -iRp --` or `mv -i --` (`src/nnn.c:5078`). The comment there says "exactly like opstr()", but `opstr()` calls `cpmv` in a `FZ_CPMV` build. Not changed: it is a C change and needs a rebuild and a restart of both panes. |
+| Same size and same time is "the same" for a copy | `Risk` | Two different files with the same size written in the same second, or with fixed build timestamps, count as identical in modes 2, 3 and 4. The target is kept. A move no longer loses the source (defect 8): it stays and is reported. |
+| Existing links | `Fact` | Modes 3 and 4 bring a differing link up to date; mode 2 only creates missing links. No size or time policy applies to a link. |
+| `cp` follows a target symlink | `Fact` | Copy mode 1 writes THROUGH a symlink in the target (it changes the file the link points to). A dangling link makes `cp -f` fail with `not writing through dangling symlink`, so the `y` of the single-file prompt cannot succeed there. The failure is reported and nothing is lost. `cp -R` also refuses a symlink to a directory in the target. |
+| Metadata the rsync paths do not keep | `Fact` | Extended attributes, ACLs and hard links. `mv` keeps extended attributes, so a directory merge-move through rsync loses them. Mode 5 also syncs the permissions of files it finds complete. |
+| A failed rename leaves a partial copy | `Fact` | `cp -R` fails that way. The problem line names `name (N)`; delete it before you retry. |
+| Narrow panes | `Fact` | The menu is 70 columns wide and rsync's progress line 64. They wrap in a pane narrower than about 72 columns. rsync can end its percentage below 100% when the tree holds a symlink (plain rsync does that too). |
+| `kill -9` | `Fact` | The temp directory `/tmp/cpmv.XXXXXX` stays; SIGINT, SIGTERM and SIGHUP clean it up. |
+| A file that changes during a move | `Fact` | rsync prints `Skipping sender remove for changed file` and the source stays. The review could not make a source lose data this way. |
+| FAT and exFAT targets | `Not verified` | FAT stores even seconds, so mode 4 may copy again a file whose time differs by one second. NTFS was tested. |
+| Other platforms and shells | `Not verified` | bash 3.2 (macOS), BSD tools, rsync older than 3.1 (no `--info=progress2`). The script needs GNU `find` and `stat -c` or BSD `stat -f`. |
+| kitty OSC-72 drag and drop with the new plugin | `Not verified` | The integration review used tmux only. |
+| A full disk in the middle of a copy | `Not verified` | |
+
+### 16.9 Verification
+
+All commands ran on 2026-11-07 on the machine in 16.1.
+
+| # | Command | Result | Status |
+|---|---|---|---|
+| 1 | `misc/test/test-cpmv.sh` | 1794 passed, 0 failed (plain ops, then advcpmv ops), 55 s | PASS |
+| 2 | `CPMV=<plugin before the fix> misc/test/test-cpmv.sh` | 1034 passed, 766 failed (85 s) | expected FAIL, reproduces the report |
+| 3 | `misc/test/test-cpmv-e2e.sh` | 20 passed, 0 failed (6 s); real nnn, private tmux server | PASS |
+| 4 | `CPMV=<plugin before the fix> misc/test/test-cpmv-e2e.sh` | 9 passed, 13 failed (84 s); includes the source file lost by a move | expected FAIL |
+| 5 | `shellcheck -x -S warning` on the plugin and both test scripts | clean | PASS |
+| 6 | The suite groups on an NTFS (`fuseblk`) volume, in a private hidden directory | 16 groups, 0 failed; the checks that need `chmod` skip there and say so | PASS |
+| 7 | 30,000 files, 6,126 differing: mode 4 copy | 1.16 s | measured |
+| 8 | The same tree, mode 4 move over a fully identical target: 30,000 files checksum-verified, then removed | 1.83 s, 0 sources left, 30,000 files at the target | measured |
+| 9 | Archive with 120 older-dated files over a newer deployment, mode 4 | before the fix 120 of 120 files still different; after, 0 | PASS |
+| 10 | Ctrl-C (SIGINT to the process group) while rsync copies a large file (3 GB before the fix, 2 GB of non-zero data after), three selected items, "apply to ALL" | before the fix the next item was moved (exit 1); after, `interrupted`, exit 130, next item untouched, no temp directory, no hidden rsync file | PASS |
+| 11 | Targeted mutants of the new logic (checksum removed, clash guard off, into-itself guard off, `-S` dropped, `-I` dropped, `--append-verify` dropped, INT trap removed, candidate match without `-x`, and 8 more) | 16 of 16 killed by the groups written for them | PASS |
+| 12 | Real nnn in two tmux panes with a shared selection file (integration review, 7 scenarios) | disk results correct in all; one finding (Ctrl-C), fixed | PASS |
+
+Mutant note (`Fact`): the first mutation run reported every mutant as killed. The runner passed a
+relative path, the suite `cd`s into each case directory, so every plugin call failed. A control
+run against the unmutated plugin showed it. The numbers in line 11 are from the corrected run,
+where two mutants first survived and led to one new test (`g_link_policy`) and a better group
+choice. A result that is uniformly "killed" needs a control run.
+
+```sh
+misc/test/test-cpmv.sh                  # the plugin, 2 passes (plain and advcpmv ops)
+ONLY=move_verify misc/test/test-cpmv.sh # one group, matched by name
+misc/test/test-cpmv-e2e.sh              # the real nnn; needs tmux and a FZ_CPMV build
+```
+
+### 16.10 Applying the fix, and rolling back
+
+1. Nothing to build. `~/.config/nnn/plugins/cpmv` is a symlink to `plugins/cpmv`, and nnn runs
+   the plugin afresh at every `p` and `v`. A running nnn picks the new code up at its next paste.
+2. To go back: `git show d7b8f252:plugins/cpmv > plugins/cpmv`, or revert the fix commits.
+
+### 16.11 Lesson
+
+**A flag that "approximates" a label is a latent bug.** The first design table said mode 4 was
+`rsync --update` and added "approximates FZ". Write each menu entry as a one-line rule first
+("replace when the size differs or the source is newer"), then build exactly that rule, and test
+the full table of cases (older, equal, newer, times smaller, same, bigger) instead of the
+happy path.
+
+**A move must prove what it deletes.** The first version of the fix still deleted a source
+file after a quick check. Two different files written in the same second look identical, and
+build systems with fixed timestamps make that common. A quick check is a reason to skip a
+copy, not proof for a delete.
+
+**Test first, then review with mutants.** The first suite (578 checks) passed and still hid
+three HIGH defects and 35 survivors out of 73 mutants. They sat in cases nobody had written
+down: an equal time with another size, a type change inside a tree, equal size and time with
+other content. An independent reviewer with a written brief, who runs the real thing, found
+what the author's tests could not.
+
+**Check your own instruments.** A signal sent to a process found with `pgrep -f` hit the
+author's own shell, and a mutation runner with a relative path "killed" every mutant. Both were
+caught because the result looked too clean or the shell died. Run a control first.
+
+### 16.12 Independent review
+
+Three reviewers ran from written briefs, on the real commit `e2fcb93d`, in scratch directories.
+They all used Sonnet. Briefs and reports are in the repository:
+
+| Lens | Brief | Report |
+|---|---|---|
+| Adversarial correctness | [agents/review-correctness.md](workflows/cpmv_overwrite/agents/review-correctness.md) | [notes/review-correctness.md](workflows/cpmv_overwrite/notes/review-correctness.md) |
+| Test strength (mutation analysis) | [agents/review-test-strength.md](workflows/cpmv_overwrite/agents/review-test-strength.md) | [notes/review-test-strength.md](workflows/cpmv_overwrite/notes/review-test-strength.md) |
+| Integration with the real nnn | [agents/review-integration.md](workflows/cpmv_overwrite/agents/review-integration.md) | [notes/review-integration.md](workflows/cpmv_overwrite/notes/review-integration.md) |
+
+The author reproduced C1 to C5, C7 to C9, C12, F1 and F3, by hand or with a test that fails on the
+reviewed commit, before changing code. C6, C10 and C11 rest on the reviewer's reproducers.
+Dispositions:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| C1 nested directory over a file destroys it | HIGH | Fixed: the guard refuses an item that would lose a regular or special file; `g_type_change_guard` |
+| C2 mode 2 on a directory move is not "newer only" | HIGH | Fixed: mode 2 uses the plan for copy and move; `g_mode2_newer_only` |
+| C3 a move deletes a source whose bytes differ | HIGH | Fixed: checksum before removal; `g_move_verify` |
+| C4 a folder into itself | MEDIUM | Fixed; `g_into_itself` |
+| C5 a move changes the permissions of a kept identical target | MEDIUM | Fixed for modes 2 to 4 (sources removed with `rm`); mode 5 documented (16.8) |
+| C6 "merged like cp does" is false for `cp` modes 1 and 2 | LOW | Mode 2 now merges (plan); mode 1 copy documented (16.8); the comment corrected |
+| C7 sparse files inflate, xattrs lost on rsync paths | LOW | Sparse fixed (`-S`; `g_sparse`); xattrs and ACLs documented |
+| C8 a name ending in a newline skips the menu | LOW | Fixed (`base_of`); `g_newline_end_name` |
+| C9 a folder and a child selected together | LOW | Fixed; `g_dir_and_child` |
+| C10 mode 2 on plain files: tty prompt, no kept notice, `cp -u` cannot replace a 444 target | LOW | Fixed by the plan engine; `g_mode2_newer_only`, `g_move_kept_file` |
+| C11 `cp` modes 1 and 2 write through a target symlink | LOW | Mode 2 fixed; mode 1 documented (16.8) |
+| C12 a source newer by under one second | LOW | One rule, whole seconds, in every path; tested |
+| N1 to N7 (races, plan parser, `finish_move`, EOF, temp directory, special files, read-only targets) | - | Not reproduced by the reviewer; no change |
+| F1 Ctrl-C does not cancel | MEDIUM | Fixed: INT trap, exit 130; `g_interrupt` (fake rsync that exits 20 on SIGINT) and the real-rsync reproduction |
+| F2 narrow panes | LOW | Own lines shortened; the old menu width is documented |
+| F3 progress line wraps, ends below 100% | LOW | rsync's own format and accounting; documented |
+| F4 a failed rename leaves a partial copy | LOW | The problem line names the target; documented |
+| T1 to T21 (35 surviving mutants out of 73) | MEDIUM | The 24 proposed groups are in the suite, adapted to the new wording; the new logic got its own groups |
+| W1 vacuous kept notice, W2 vacuous nnn start wait, W4 stale tmux socket, W5 fixed sleeps, W9 root, W10 hidden skip | LOW | Fixed |
+| W3 oracle checks the target only, W6 duplicate assertion, W7 English text of `mv`, W11 loose error pattern | LOW | Not changed. The groups added in this round check the exit status and the source side. W8 is covered for the end-of-input groups (`run_capped`) |
+| O2 a dangling link at the target and `y` | LOW | Documented (16.8) |
+
+Process facts:
+
+- The integration reviewer saw about 95 `/tmp/cpmv.*` directories. They came from the
+  mutation reviewer's runs with a mutant that has no cleanup trap. The real plugin leaves none
+  after a normal exit, an exit 1, or SIGINT, SIGTERM and SIGHUP (checked with a private `TMPDIR`).
+- The reviewers' fix directions were not trusted: each was rebuilt and measured. Two of them
+  changed shape (the checksum proof removes sources with `rm`, which also fixes C5; mode 2 moved
+  to the plan instead of getting its own special case).
+- `Not verified:` the 73 mutants of the first review were not rerun against the reworked plugin,
+  because most of them edit lines that no longer exist. The 24 groups they led to all pass on it.

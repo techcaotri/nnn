@@ -44,18 +44,25 @@ size (`dest_newer_diff_size.txt`, 7 bytes vs 5 bytes) was left unchanged.
 
 ## Design of the fix
 
-1. Mode 3 and 4 become plan then execute. Dry runs (`rsync -n -ii --out-format='%i %n'`)
-   decide per file. The real run is one `rsync --files-from` transfer, so files that the
-   policy keeps are never touched (no mtime rewrite).
-   - mode 3: copy when missing or size differs.
-   - mode 4: copy when missing, or size differs, or the source is newer.
-2. Move uses `--remove-source-files`, then removes empty source directories. Skipped files
-   stay in the source and are reported.
-3. Move of a directory in modes 1 and 2 goes through rsync (merge) instead of `mv`.
-4. Errors are counted. Any failure prints a summary and exits non-zero, so nnn pauses and
-   keeps the selection.
-5. File versus directory name clashes only offer rename or skip.
+1. Modes 2, 3 and 4 plan, then copy. Dry runs (`rsync -n -ii --out-format='%i %n'`) decide per
+   file. The real run is one `rsync --files-from` transfer, so files that the policy keeps are
+   never touched (no mtime rewrite).
+   - mode 2: copy when missing, or the source is strictly newer (whole seconds).
+   - mode 3: copy when missing or the size differs.
+   - mode 4: copy when missing, or the size differs, or the source is newer.
+2. A move uses `--remove-source-files` for what rsync transfers. A file that the quick check
+   called identical leaves the source only after a checksum dry run proves equal bytes. Skipped
+   files stay in the source and are reported.
+3. A directory move in mode 1 goes through rsync (`-I`, merge) instead of `mv`.
+4. Errors are counted. Any failure prints a summary and exits non-zero, so nnn pauses and keeps
+   the selection. Ctrl-C ends the whole run with status 130.
+5. A file and a directory with the same name only offer rename or skip. Inside a tree, an item
+   that would replace a regular or special FILE of the target with another type is refused.
+6. A folder cannot be copied or moved into itself.
 
 ## Status
 
-- IN-PROGRESS: tests in `misc/test/test-cpmv.sh`, fix in `plugins/cpmv`.
+- DONE: fix in `plugins/cpmv`, regression suite `misc/test/test-cpmv.sh`, end-to-end test
+  `misc/test/test-cpmv-e2e.sh`, three independent reviews (see `run-log.md`), documentation in
+  Problem 16.
+- Known limits and what was not verified: Problem 16, section 16.8.

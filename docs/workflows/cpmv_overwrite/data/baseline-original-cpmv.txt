@@ -1,523 +1,169 @@
-cpmv under test: /tmp/claude-1000/-home-tripham-Dev-Playground-Terminal-nnn/41d6ce50-b19a-45bd-a8a3-534793fd97b3/scratchpad/cpmv.orig
---- ops: cp -iRp -- / mv -i --
-  FAIL  [copy-mode4] copy-mode4: dest newer + size differs (the reported bug) content
-        expected=[AAAAA] actual=[xxxxxxx]
-  FAIL  [copy-mode4] copy-mode4: dest newer + size differs (the reported bug) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [copy-mode4] copy-mode4: nested dest newer + size differs content
-        expected=[nested-src] actual=[nested-dst-longer]
-  FAIL  [copy-mode4] copy-mode4: nested dest newer + size differs mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [copy-mode3] copy-mode3: same size, source newer is NOT touched (content and mtime) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [copy-mode3] copy-mode3: same size, dest newer is NOT touched mtime
-        expected=[1800000000] actual=[1700000000]
-  FAIL  [copy-mode3] copy-mode3: mode 4 after mode 3 still refreshes the source-newer file content
-        expected=[SNEWER] actual=[sold!!]
-  FAIL  [move-mode4] move-mode4: dest newer + size differs is moved over content
-        expected=[AAAAA] actual=[xxxxxxx]
-  FAIL  [move-mode4] move-mode4: dest newer + size differs is moved over mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode4] move-mode4: nested file is moved over content
-        expected=[nested-src] actual=[nested-dst-longer]
-  FAIL  [move-mode4] move-mode4: nested file is moved over mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode4] move-mode4: skipped file stays in the SOURCE (no data loss) content
-        expected=[SOLD!!] actual=[<missing>]
-  FAIL  [move-mode4] move-mode4: skipped file stays in the SOURCE (no data loss) mtime
-        expected=[1700000000] actual=[missing]
-  FAIL  [move-mode4] move-mode4: tells the user a file was kept
-        pattern [kept|left in the source] not in output:              21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=4/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=2/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=2/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=1/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|
-  FAIL  [move-mode3] move-mode3: same size, source newer: target untouched mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode3] move-mode3: same size, source newer stays in the SOURCE content
-        expected=[SNEWER] actual=[<missing>]
-  FAIL  [move-mode3] move-mode3: same size, source newer stays in the SOURCE mtime
-        expected=[1800000000] actual=[missing]
-  FAIL  [move-mode3] move-mode3: same size, dest newer stays in the SOURCE content
-        expected=[SOLD!!] actual=[<missing>]
-  FAIL  [move-mode3] move-mode3: same size, dest newer stays in the SOURCE mtime
-        expected=[1700000000] actual=[missing]
-  FAIL  [move-mode2] move-mode2: source newer is moved content
-        expected=[SNEWER] actual=[sold!!]
-  FAIL  [move-mode2] move-mode2: source newer is moved mtime
-        expected=[1800000000] actual=[1700000000]
-  FAIL  [move-mode2] move-mode2: dest older is moved content
-        expected=[DDDDDDDD] actual=[zzz]
-  FAIL  [move-mode2] move-mode2: dest older is moved mtime
-        expected=[1750000000] actual=[1700000000]
-  FAIL  [move-mode2] move-mode2: moved source sn_same is gone
-        expected=[<missing>] actual=[SNEWER]
-  FAIL  [move-mode2] move-mode2: no mv error
-        unexpected pattern [cannot move] in output
-  FAIL  [move-mode1] move-mode1: dest newer + same size overwritten content
-        expected=[SOLD!!] actual=[DNEWER]
-  FAIL  [move-mode1] move-mode1: dest newer + same size overwritten mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode1] move-mode1: dest newer + size differs overwritten content
-        expected=[AAAAA] actual=[xxxxxxx]
-  FAIL  [move-mode1] move-mode1: dest newer + size differs overwritten mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode1] move-mode1: nested overwritten content
-        expected=[nested-src] actual=[nested-dst-longer]
-  FAIL  [move-mode1] move-mode1: nested overwritten mtime
-        expected=[1700000000] actual=[1800000000]
-cat: /tmp/nnn-cpmv-test.qCh8TK/move-mode1/src/proj: Is a directory
-  FAIL  [move-mode1] move-mode1: whole source tree is gone
-        expected=[<missing>] actual=[]
-  FAIL  [move-mode1] move-mode1: no mv error
-        unexpected pattern [cannot move] in output
-  FAIL  [apply-all] apply-all: first item uses mode 4 content
-        expected=[A-src] actual=[A-dst-longer]
-  FAIL  [apply-all] apply-all: first item uses mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all] apply-all: second item reuses mode 4 (apply to all) content
-        expected=[B-src] actual=[B-dst-longer]
-  FAIL  [apply-all] apply-all: second item reuses mode 4 (apply to all) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all] apply-all: plain file reuses mode 4 (apply to all) content
-        expected=[C-src] actual=[C-dst-longer]
-  FAIL  [apply-all] apply-all: plain file reuses mode 4 (apply to all) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-no] apply-no: first item uses mode 4 content
-        expected=[A-src] actual=[A-dst-longer]
-  FAIL  [apply-no] apply-no: first item uses mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all-move] apply-all-move: move: first item mode 4 content
-        expected=[A-src] actual=[A-dst-longer]
-  FAIL  [apply-all-move] apply-all-move: move: first item mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all-move] apply-all-move: move: second item mode 4 content
-        expected=[B-src] actual=[B-dst-longer]
-  FAIL  [apply-all-move] apply-all-move: move: second item mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all-move] apply-all-move: move: plain file mode 4 content
-        expected=[C-src] actual=[C-dst-longer]
-  FAIL  [apply-all-move] apply-all-move: move: plain file mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [err-copy] err-copy: other files are still copied (best effort) content
-        expected=[AAAAA] actual=[xxxxxxx]
-  FAIL  [err-copy] err-copy: other files are still copied (best effort) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [err-copy] err-copy: non-zero exit so nnn pauses and keeps the selection
-        expected=[1] actual=[0]
-  FAIL  [err-copy] err-copy: the error is printed
-        pattern [Permission denied|failed|error] not in output:              21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=4/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|
-  FAIL  [err-move] err-move: blocked file is NOT lost: it stays in the source content
-        expected=[nested-src] actual=[<missing>]
-  FAIL  [err-move] err-move: blocked file is NOT lost: it stays in the source mtime
-        expected=[1700000000] actual=[missing]
-  FAIL  [err-move] err-move: non-zero exit
-        expected=[1] actual=[0]
-  FAIL  [err-vanished] missing source gives a non-zero exit
-        expected=[1] actual=[0]
-  FAIL  [mismatch] file onto directory: modes that cannot work are rejected
-        pattern [invalid] not in output: cp -> /tmp/nnn-cpmv-test.qCh8TK/mismatch/dst   (1 item[s])|overwrite 'thing'? [y/N]:   - skipped thing|
-  FAIL  [mismatch-rename] mismatch-rename: rename keeps both content
-        expected=[i am a file] actual=[<missing>]
-  FAIL  [mismatch-allmode] mismatch-allmode: apply-to-all does not force a mode on a type clash content
-        expected=[A-src] actual=[A-dst-longer]
-  FAIL  [mismatch-allmode] mismatch-allmode: apply-to-all does not force a mode on a type clash mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [mismatch-allmode] type clash still a directory
-        expected=[yes] actual=[no]
-  FAIL  [names-copy-4] names-copy-4: with space.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: with space.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: -dash.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: -dash.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: quo'te.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: quo'te.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: dq"uote.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: dq"uote.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: glob*[x]?.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: glob*[x]?.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: back\slash.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: back\slash.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: back\#012x.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: back\#012x.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: new
-line.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: new
-line.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: tab	here.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: tab	here.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4:  leading.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4:  leading.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: ünï.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: ünï.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: ~tilde.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: ~tilde.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: $dollar.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: $dollar.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: --help content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: --help mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: with space.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: with space.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: -dash.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: -dash.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: quo'te.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: quo'te.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: dq"uote.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: dq"uote.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: glob*[x]?.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: glob*[x]?.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: back\slash.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: back\slash.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: back\#012x.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: back\#012x.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: new
-line.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: new
-line.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: tab	here.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: tab	here.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move:  leading.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move:  leading.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: ünï.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: ünï.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: ~tilde.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: ~tilde.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: $dollar.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: $dollar.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: --help content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: --help mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [dirlink] dirlink: a symlinked target directory is merged INTO (like cp does) content
-        expected=[SRC] actual=[dest-longer]
-  FAIL  [dirlink] dirlink: a symlinked target directory is merged INTO (like cp does) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [dirlink] dirlink: the target symlink is kept
-        expected=[yes] actual=[no]
-  FAIL  [oracle-copy-4] oracle copy mode 4: proj/d3/f157.txt
-        expected=[s157] actual=[d157-longer]
-  FAIL  [oracle-copy-4] oracle copy mode 4: proj/d0/f43.txt
-        expected=[s43] actual=[d43-longer]
-  FAIL  [oracle-copy-4] oracle copy mode 4: proj/d1/f130.txt
-        expected=[s130] actual=[d130-longer]
-  FAIL  [oracle-copy-4] oracle copy mode 4: all 160 files match the policy
-        expected=[0] actual=[22]
-  FAIL  [oracle-move-4] oracle move mode 4: proj/d3/f157.txt
-        expected=[s157] actual=[d157-longer]
-  FAIL  [oracle-move-4] oracle move mode 4: proj/d0/f43.txt
-        expected=[s43] actual=[d43-longer]
-  FAIL  [oracle-move-4] oracle move mode 4: proj/d1/f130.txt
-        expected=[s130] actual=[d130-longer]
-  FAIL  [oracle-move-4] oracle move mode 4: all 160 files match the policy
-        expected=[0] actual=[22]
---- ops: cpg -giRp -- / mvg -gi --
-  FAIL  [copy-mode4] copy-mode4: dest newer + size differs (the reported bug) content
-        expected=[AAAAA] actual=[xxxxxxx]
-  FAIL  [copy-mode4] copy-mode4: dest newer + size differs (the reported bug) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [copy-mode4] copy-mode4: nested dest newer + size differs content
-        expected=[nested-src] actual=[nested-dst-longer]
-  FAIL  [copy-mode4] copy-mode4: nested dest newer + size differs mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [copy-mode3] copy-mode3: same size, source newer is NOT touched (content and mtime) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [copy-mode3] copy-mode3: same size, dest newer is NOT touched mtime
-        expected=[1800000000] actual=[1700000000]
-  FAIL  [copy-mode3] copy-mode3: mode 4 after mode 3 still refreshes the source-newer file content
-        expected=[SNEWER] actual=[sold!!]
-  FAIL  [move-mode4] move-mode4: dest newer + size differs is moved over content
-        expected=[AAAAA] actual=[xxxxxxx]
-  FAIL  [move-mode4] move-mode4: dest newer + size differs is moved over mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode4] move-mode4: nested file is moved over content
-        expected=[nested-src] actual=[nested-dst-longer]
-  FAIL  [move-mode4] move-mode4: nested file is moved over mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode4] move-mode4: skipped file stays in the SOURCE (no data loss) content
-        expected=[SOLD!!] actual=[<missing>]
-  FAIL  [move-mode4] move-mode4: skipped file stays in the SOURCE (no data loss) mtime
-        expected=[1700000000] actual=[missing]
-  FAIL  [move-mode4] move-mode4: tells the user a file was kept
-        pattern [kept|left in the source] not in output:              21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=4/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=2/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=2/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=1/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|
-  FAIL  [move-mode3] move-mode3: same size, source newer: target untouched mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode3] move-mode3: same size, source newer stays in the SOURCE content
-        expected=[SNEWER] actual=[<missing>]
-  FAIL  [move-mode3] move-mode3: same size, source newer stays in the SOURCE mtime
-        expected=[1800000000] actual=[missing]
-  FAIL  [move-mode3] move-mode3: same size, dest newer stays in the SOURCE content
-        expected=[SOLD!!] actual=[<missing>]
-  FAIL  [move-mode3] move-mode3: same size, dest newer stays in the SOURCE mtime
-        expected=[1700000000] actual=[missing]
-  FAIL  [move-mode2] move-mode2: source newer is moved content
-        expected=[SNEWER] actual=[sold!!]
-  FAIL  [move-mode2] move-mode2: source newer is moved mtime
-        expected=[1800000000] actual=[1700000000]
-  FAIL  [move-mode2] move-mode2: dest older is moved content
-        expected=[DDDDDDDD] actual=[zzz]
-  FAIL  [move-mode2] move-mode2: dest older is moved mtime
-        expected=[1750000000] actual=[1700000000]
-  FAIL  [move-mode2] move-mode2: moved source sn_same is gone
-        expected=[<missing>] actual=[SNEWER]
-  FAIL  [move-mode2] move-mode2: no mv error
-        unexpected pattern [cannot move] in output
-  FAIL  [move-mode1] move-mode1: dest newer + same size overwritten content
-        expected=[SOLD!!] actual=[DNEWER]
-  FAIL  [move-mode1] move-mode1: dest newer + same size overwritten mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode1] move-mode1: dest newer + size differs overwritten content
-        expected=[AAAAA] actual=[xxxxxxx]
-  FAIL  [move-mode1] move-mode1: dest newer + size differs overwritten mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [move-mode1] move-mode1: nested overwritten content
-        expected=[nested-src] actual=[nested-dst-longer]
-  FAIL  [move-mode1] move-mode1: nested overwritten mtime
-        expected=[1700000000] actual=[1800000000]
-cat: /tmp/nnn-cpmv-test.qCh8TK/move-mode1/src/proj: Is a directory
-  FAIL  [move-mode1] move-mode1: whole source tree is gone
-        expected=[<missing>] actual=[]
-  FAIL  [move-mode1] move-mode1: no mv error
-        unexpected pattern [cannot move] in output
-  FAIL  [apply-all] apply-all: first item uses mode 4 content
-        expected=[A-src] actual=[A-dst-longer]
-  FAIL  [apply-all] apply-all: first item uses mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all] apply-all: second item reuses mode 4 (apply to all) content
-        expected=[B-src] actual=[B-dst-longer]
-  FAIL  [apply-all] apply-all: second item reuses mode 4 (apply to all) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all] apply-all: plain file reuses mode 4 (apply to all) content
-        expected=[C-src] actual=[C-dst-longer]
-  FAIL  [apply-all] apply-all: plain file reuses mode 4 (apply to all) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-no] apply-no: first item uses mode 4 content
-        expected=[A-src] actual=[A-dst-longer]
-  FAIL  [apply-no] apply-no: first item uses mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all-move] apply-all-move: move: first item mode 4 content
-        expected=[A-src] actual=[A-dst-longer]
-  FAIL  [apply-all-move] apply-all-move: move: first item mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all-move] apply-all-move: move: second item mode 4 content
-        expected=[B-src] actual=[B-dst-longer]
-  FAIL  [apply-all-move] apply-all-move: move: second item mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [apply-all-move] apply-all-move: move: plain file mode 4 content
-        expected=[C-src] actual=[C-dst-longer]
-  FAIL  [apply-all-move] apply-all-move: move: plain file mode 4 mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [err-copy] err-copy: other files are still copied (best effort) content
-        expected=[AAAAA] actual=[xxxxxxx]
-  FAIL  [err-copy] err-copy: other files are still copied (best effort) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [err-copy] err-copy: non-zero exit so nnn pauses and keeps the selection
-        expected=[1] actual=[0]
-  FAIL  [err-copy] err-copy: the error is printed
-        pattern [Permission denied|failed|error] not in output:              21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=4/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|             21  45%   12.70kB/s    0:00:00 (xfr#3, to-chk=0/11)|
-  FAIL  [err-move] err-move: blocked file is NOT lost: it stays in the source content
-        expected=[nested-src] actual=[<missing>]
-  FAIL  [err-move] err-move: blocked file is NOT lost: it stays in the source mtime
-        expected=[1700000000] actual=[missing]
-  FAIL  [err-move] err-move: non-zero exit
-        expected=[1] actual=[0]
-  FAIL  [err-vanished] missing source gives a non-zero exit
-        expected=[1] actual=[0]
-  FAIL  [mismatch] file onto directory: modes that cannot work are rejected
-        pattern [invalid] not in output: cp -> /tmp/nnn-cpmv-test.qCh8TK/mismatch/dst   (1 item[s])|overwrite 'thing'? [y/N]:   - skipped thing|
-  FAIL  [mismatch-rename] mismatch-rename: rename keeps both content
-        expected=[i am a file] actual=[<missing>]
-  FAIL  [mismatch-allmode] mismatch-allmode: apply-to-all does not force a mode on a type clash content
-        expected=[A-src] actual=[A-dst-longer]
-  FAIL  [mismatch-allmode] mismatch-allmode: apply-to-all does not force a mode on a type clash mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [mismatch-allmode] type clash still a directory
-        expected=[yes] actual=[no]
-  FAIL  [names-copy-4] names-copy-4: with space.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: with space.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: -dash.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: -dash.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: quo'te.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: quo'te.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: dq"uote.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: dq"uote.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: glob*[x]?.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: glob*[x]?.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: back\slash.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: back\slash.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: back\#012x.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: back\#012x.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: new
-line.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: new
-line.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: tab	here.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: tab	here.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4:  leading.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4:  leading.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: ünï.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: ünï.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: ~tilde.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: ~tilde.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: $dollar.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: $dollar.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-copy-4] names-copy-4: --help content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-copy-4] names-copy-4: --help mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: with space.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: with space.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: -dash.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: -dash.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: quo'te.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: quo'te.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: dq"uote.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: dq"uote.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: glob*[x]?.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: glob*[x]?.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: back\slash.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: back\slash.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: back\#012x.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: back\#012x.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: new
-line.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: new
-line.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: tab	here.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: tab	here.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move:  leading.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move:  leading.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: ünï.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: ünï.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: ~tilde.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: ~tilde.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: $dollar.txt content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: $dollar.txt mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [names-move] names-move: move: --help content
-        expected=[src] actual=[dest-longer]
-  FAIL  [names-move] names-move: move: --help mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [dirlink] dirlink: a symlinked target directory is merged INTO (like cp does) content
-        expected=[SRC] actual=[dest-longer]
-  FAIL  [dirlink] dirlink: a symlinked target directory is merged INTO (like cp does) mtime
-        expected=[1700000000] actual=[1800000000]
-  FAIL  [dirlink] dirlink: the target symlink is kept
-        expected=[yes] actual=[no]
-  FAIL  [oracle-copy-4] oracle copy mode 4: proj/d3/f157.txt
-        expected=[s157] actual=[d157-longer]
-  FAIL  [oracle-copy-4] oracle copy mode 4: proj/d0/f43.txt
-        expected=[s43] actual=[d43-longer]
-  FAIL  [oracle-copy-4] oracle copy mode 4: proj/d1/f130.txt
-        expected=[s130] actual=[d130-longer]
-  FAIL  [oracle-copy-4] oracle copy mode 4: all 160 files match the policy
-        expected=[0] actual=[22]
-  FAIL  [oracle-move-4] oracle move mode 4: proj/d3/f157.txt
-        expected=[s157] actual=[d157-longer]
-  FAIL  [oracle-move-4] oracle move mode 4: proj/d0/f43.txt
-        expected=[s43] actual=[d43-longer]
-  FAIL  [oracle-move-4] oracle move mode 4: proj/d1/f130.txt
-        expected=[s130] actual=[d130-longer]
-  FAIL  [oracle-move-4] oracle move mode 4: all 160 files match the policy
-        expected=[0] actual=[22]
+Baseline: the final regression suite run against the plugin BEFORE the fix
 
-294 passed, 254 failed
+Command (2026-11-07):
+    git show d7b8f252:plugins/cpmv > /tmp/cpmv.orig && chmod +x /tmp/cpmv.orig
+    CPMV=/tmp/cpmv.orig misc/test/test-cpmv.sh
+
+Result: 1034 passed, 766 failed (plain cp/mv pass plus advcpmv pass), 84.90 s
+The same suite against the fixed plugin: 1794 passed, 0 failed.
+
+Failing checks per case (both passes together, 117 groups):
+    names-copy-4                 56
+    names-move                   56
+    move-mode4                   16
+    move-mode1                   16
+    candidate-names-3            16
+    clash-move-4                 14
+    clash-move-3                 14
+    clash-move-5                 14
+    copy-mode4                   12
+    move-mode2                   12
+    apply-all                    12
+    apply-all-move               12
+    clash-copy-4                 12
+    clash-copy-3                 12
+    clash-copy-5                 12
+    names-multi-escape-4         12
+    move-verify-3                12
+    move-verify-4                12
+    move-verify-5                12
+    move-mode3                   10
+    move-kept-file               10
+    typechange-mv-3              9
+    typechange-mv-4              9
+    typechange-mv-5              9
+    typechange-mvg-3             9
+    typechange-mvg-4             9
+    typechange-mvg-5             9
+    oracle-copy-4                8
+    oracle-move-4                8
+    sp ace's [dir                8
+    move-verify-2                8
+    typechange-cp-3              7
+    typechange-cp-4              7
+    typechange-cp-5              7
+    typechange-cpg-3             7
+    typechange-cpg-4             7
+    typechange-cpg-5             7
+    copy-mode3                   6
+    err-copy-4                   6
+    err-move-4                   6
+    mismatch-allmode             6
+    dirlink                      6
+    eof-apply-prompt             6
+    summary-move3                6
+    move-mode1-sametime          6
+    move-dirlink-1               6
+    move-dirlink-4               6
+    into-itself-mv-3             6
+    into-itself-mv-4             6
+    into-itself-mv-5             6
+    into-itself-mvg-3            6
+    into-itself-mvg-4            6
+    into-itself-mvg-5            6
+    into-itself-cp-3             5
+    into-itself-cp-4             5
+    into-itself-cp-5             5
+    into-itself-cpg-3            5
+    into-itself-cpg-4            5
+    into-itself-cpg-5            5
+    apply-no                     4
+    err-copy-3                   4
+    err-copy-1                   4
+    err-rename                   4
+    interrupt-transfer           4
+    rename-names                 4
+    summary-copy4                4
+    header-dir                   4
+    invalid-choice               4
+    compare-fails-cp-3           4
+    compare-fails-mv-3           4
+    compare-fails-d2             4
+    newer-only-subsecond         4
+    into-itself-cp-1             4
+    sparse-4                     4
+    newline-end                  4
+    compare-fails-cpg-3          4
+    compare-fails-mvg-3          4
+    into-itself-cpg-1            4
+    typechange-cp-2              3
+    newer-only-mv                3
+    typechange-cpg-2             3
+    newer-only-mvg               3
+    err-move-3                   2
+    err-move-1                   2
+    err-vanished                 2
+    mismatch                     2
+    mismatch-rename              2
+    clash-move-2                 2
+    clash-move-1                 2
+    clash-copy-1                 2
+    clash-copy-2                 2
+    clash-file-over-dir          2
+    dangling-rename              2
+    eof-main-menu                2
+    dangling-target              2
+    pause-move-kept              2
+    clash-menu                   2
+    compare-fails-cp-4           2
+    compare-fails-mv-4           2
+    no-rsync                     2
+    no-rsync-move                2
+    tmpdir-failure               2
+    typechange-mv-1              2
+    typechange-mv-2              2
+    move-perms-2                 2
+    move-perms-3                 2
+    move-perms-4                 2
+    into-itself-mv-1             2
+    sparse-1                     2
+    sparse-2                     2
+    sparse-5                     2
+    dir-then-child               2
+    compare-fails-cpg-4          2
+    compare-fails-mvg-4          2
+    typechange-mvg-1             2
+    typechange-mvg-2             2
+    into-itself-mvg-1            2
+
+First 40 failures, in suite order:
+    [copy-mode4] copy-mode4: dest newer + size differs (the reported bug) content
+    [copy-mode4] copy-mode4: dest newer + size differs (the reported bug) mtime
+    [copy-mode4] copy-mode4: nested dest newer + size differs content
+    [copy-mode4] copy-mode4: nested dest newer + size differs mtime
+    [copy-mode4] copy-mode4: compact plan line
+    [copy-mode4] copy-mode4: says why a file was kept
+    [copy-mode3] copy-mode3: same size, source newer is NOT touched (content and mtime) mtime
+    [copy-mode3] copy-mode3: same size, dest newer is NOT touched mtime
+    [copy-mode3] copy-mode3: mode 4 after mode 3 still refreshes the source-newer file content
+    [move-mode4] move-mode4: dest newer + size differs is moved over content
+    [move-mode4] move-mode4: dest newer + size differs is moved over mtime
+    [move-mode4] move-mode4: nested file is moved over content
+    [move-mode4] move-mode4: nested file is moved over mtime
+    [move-mode4] move-mode4: skipped file stays in the SOURCE (no data loss) content
+    [move-mode4] move-mode4: skipped file stays in the SOURCE (no data loss) mtime
+    [move-mode4] move-mode4: tells the user a file was kept
+    [move-mode4] move-mode4: names the kept file
+    [move-mode3] move-mode3: same size, source newer: target untouched mtime
+    [move-mode3] move-mode3: same size, source newer stays in the SOURCE content
+    [move-mode3] move-mode3: same size, source newer stays in the SOURCE mtime
+    [move-mode3] move-mode3: same size, dest newer stays in the SOURCE content
+    [move-mode3] move-mode3: same size, dest newer stays in the SOURCE mtime
+    [move-mode2] move-mode2: source newer is moved content
+    [move-mode2] move-mode2: source newer is moved mtime
+    [move-mode2] move-mode2: dest older is moved content
+    [move-mode2] move-mode2: dest older is moved mtime
+    [move-mode2] move-mode2: moved source sn_same is gone
+    [move-mode2] move-mode2: no mv error
+    [move-mode1] move-mode1: dest newer + same size overwritten content
+    [move-mode1] move-mode1: dest newer + same size overwritten mtime
+    [move-mode1] move-mode1: dest newer + size differs overwritten content
+    [move-mode1] move-mode1: dest newer + size differs overwritten mtime
+    [move-mode1] move-mode1: nested overwritten content
+    [move-mode1] move-mode1: nested overwritten mtime
+    [move-mode1] move-mode1: whole source tree is gone
+    [move-mode1] move-mode1: no mv error
+    [apply-all] apply-all: first item uses mode 4 content
+    [apply-all] apply-all: first item uses mode 4 mtime
+    [apply-all] apply-all: second item reuses mode 4 (apply to all) content
+    [apply-all] apply-all: second item reuses mode 4 (apply to all) mtime

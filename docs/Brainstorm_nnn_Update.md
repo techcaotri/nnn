@@ -1708,6 +1708,14 @@ For `mv`, the rsync-based modes (3/4/5) are an **emulated move**: rsync to the
 destination, then remove the source -- non-atomic and slower than a real `mv`
 (see the data-loss caveat in II.4.7).
 
+> **Correction, 2026-11-07 (Problem 16).** The table above was the first design. Two rows
+> turned out wrong in use. Mode 4 as `rsync -a --update` skips a newer target even when its
+> size differs, so it did not do what its label says. Mode 3 as `rsync -a --size-only` rewrites
+> the target's mtime for same-size files. Modes 3 and 4 now plan with rsync dry runs and copy
+> exactly the planned files with `--files-from`; a move removes only what reached the target.
+> The current behaviour is the table in the header of [plugins/cpmv](../plugins/cpmv) and in
+> Problem 16 of [nnn_Problems_And_Solutions.md](nnn_Problems_And_Solutions.md).
+
 #### II.4.5 Apply-to-all as a tiny state machine
 
 ```mermaid

@@ -951,8 +951,13 @@ sequenceDiagram
     loop each selected item
         PL->>PL: apply per-item policy (see 3.5.8.2)
     end
-    PL-->>SP: exit 0 (always)
-    Note over SP,PL: exit 0 -> nnn's F_CHKRTN "Press ENTER" never fires
+    alt a copy, move or compare failed
+        PL-->>SP: exit 1 after listing the problems
+        Note over SP,PL: F_CHKRTN makes nnn wait for ENTER, print failed! and keep the selection
+    else everything worked
+        PL-->>SP: exit 0
+        Note over SP,PL: nnn clears the selection
+    end
     SP-->>L: refresh listing
 ```
 
@@ -962,9 +967,11 @@ rewrites its one command line to invoke the `cpmv` plugin, passing nnn's `op`
 string (e.g. `cp -iRp --`) **quoted** so the helper receives it as one argument
 and derives cp-vs-mv (and advcpmv `cpg`/`mvg`) from its first token. Everything
 still flows through the standard `spawn()` path with `F_CLI | F_CHKRTN`, so
-terminal hand-off and return-code checking are unchanged. Because the helper
-**always exits 0**, nnn's own "Press ENTER" pause (triggered by `F_CHKRTN` on a
-non-zero status) never fires -- the plugin alone decides whether to pause.
+terminal hand-off and return-code checking are unchanged. When everything
+worked, the helper exits 0 and decides by itself whether to pause. When anything
+failed, it exits 1 after listing the problems, so `F_CHKRTN` makes nnn wait for ENTER,
+print `failed!` and **keep the selection** for a retry (Problem 16 in
+[nnn_Problems_And_Solutions.md](nnn_Problems_And_Solutions.md)).
 
 ##### 3.5.8.2 Conflict-Resolution Policy -- Flowchart
 
@@ -980,7 +987,9 @@ flowchart TD
     Exist -->|"no"| Copy["copy/move it (no prompt)"]
     Exist -->|"yes"| Same{"src is the same<br/>file as target?"}
     Same -->|"yes"| SkipSame["skip (same file)"]
-    Same -->|"no"| Glob{"GLOBAL_MODE<br/>already set?"}
+    Same -->|"no"| Clash{"file and directory<br/>share the name?"}
+    Clash -->|"yes"| ClashMenu["menu with 6 rename and 7 skip only"]
+    Clash -->|"no"| Glob{"GLOBAL_MODE<br/>already set?"}
     Glob -->|"yes"| Apply["apply GLOBAL_MODE"]
     Glob -->|"no"| Kind{"single regular FILE?<br/>(nfiles == 1 and not a dir)"}
     Kind -->|"yes"| YN["nnn-style simple prompt:<br/>overwrite 'name'? y/N"]
@@ -999,9 +1008,12 @@ flowchart TD
     Over --> NextItem
     SkipYN --> NextItem
     Lock --> NextItem
+    ClashMenu --> NextItem
     NextItem --> More{"more items?"}
     More -->|"yes"| Start
-    More -->|"no"| Pause{"a 7-option menu was<br/>shown AND multiple items?"}
+    More -->|"no"| Fail{"any problem?"}
+    Fail -->|"yes"| Exit1["list the problems, exit 1<br/>(nnn waits for ENTER, keeps the selection)"]
+    Fail -->|"no"| Pause{"conflicts across several items<br/>OR a move left files behind?"}
     Pause -->|"yes"| Wait["pause: 'Done. Press enter.'"]
     Pause -->|"no"| Auto["auto-return to nnn (no keypress)"]
 ```
@@ -1015,85 +1027,88 @@ flowchart TD
    a multi-item conflict and gets the 7-option menu, because reconciling a tree
    genuinely benefits from "different size", "newer only", "resume" and
    "rename/keep-both".
-3. **Apply-to-all only while items remain; pause only for multi-item conflicts.**
+3. **Apply-to-all only while items remain; pause only when there is something to review.**
    The "apply to all" question is skipped for the last/only item (so a single
    item never asks it), and the terminal **auto-returns to nnn with no keypress**
-   except after resolving conflicts across *several* items, where a moment to
-   review is useful.
+   except after resolving conflicts across *several* items, or after a move that
+   left files behind, where a moment to review is useful. A failure is different:
+   the plugin exits 1 and nnn itself waits for ENTER.
+4. **A file and a directory with the same name only offer rename and skip.** They
+   cannot be merged or overwritten, so "apply to all" never forces a mode on them.
 
 ##### 3.5.8.3 The Seven Modes
 
-```
-ASCII Table 3.5.8a: Conflict mode -> implementation
-+---+----------------------------+--------------------------------------------+
-| # | Menu entry                 | Implementation (cp/mv, or cpg/mvg, or rsync)|
-+---+----------------------------+--------------------------------------------+
-| 1 | overwrite                  | cp -f  /  mv -f                            |
-| 2 | newer only                 | cp -u  /  mv -u   (source mtime newer)     |
-| 3 | different size only        | rsync -a --size-only                       |
-| 4 | different size or newer    | rsync -a --update                          |
-| 5 | resume (interrupted)       | rsync -a --partial --append-verify         |
-| 6 | rename (keep both)         | copy to "stem (n)ext" -- next free suffix  |
-| 7 | skip                       | do nothing                                 |
-+---+----------------------------+--------------------------------------------+
-```
+Table 3.5.8a: what each mode does to a file that exists on both sides, and the tool that does it
 
-For a **move**, the rsync-based modes (3/4/5) are an emulated move: rsync to the
-destination, then remove the source **only on a successful transfer** (see
-3.5.8.5). The simple `y/N` "yes" maps to mode 1, "no" to mode 7.
+| # | Menu entry | Replace the target when | Copy | Move |
+|---|---|---|---|---|
+| 1 | overwrite | always | `cp -f` (`cpg -g`) | file: `mv -f`; directory: `rsync -I --remove-source-files` |
+| 2 | newer only | the source is newer, in whole seconds (size ignored) | plan, then `rsync --files-from` | same, with `--remove-source-files` |
+| 3 | different size only | the sizes differ (time ignored) | plan, then `rsync --files-from` | same, with `--remove-source-files` |
+| 4 | different size or newer | the sizes differ OR the source is newer | plan, then `rsync --files-from` | same, with `--remove-source-files` |
+| 5 | resume (interrupted) | an interrupted copy is completed | `rsync --partial --append-verify` | same, with `--remove-source-files` |
+| 6 | rename (keep both) | never; copy to `name (1)` | `cp` | `mv` |
+| 7 | skip | never | nothing | nothing |
+
+"Plan" means: rsync dry runs list what differs, and one `rsync --files-from` run copies
+exactly that list, so a file the mode keeps is never touched, not even its modification
+time or permissions. Mode 4 used to be `rsync -a --update`, which kept a newer target even
+when its size differed; mode 3 used to be `rsync -a --size-only`, which rewrote the mtime of
+same-size files; mode 2 used `cp -u` for a copy and `rsync --update` for a directory move,
+which disagree (Problem 16).
+
+A **move** removes from the source only: a file rsync transferred; a file that looked
+identical (same size, same time) whose **checksum** proves equal bytes; a link or special
+file that rsync found unchanged. Everything else, including a file the chosen mode kept,
+stays in the source, and the plugin says so (see 3.5.8.5). The simple `y/N` "yes" maps to
+mode 1, "no" to mode 7.
 
 ##### 3.5.8.4 Behaviour Matrix
 
-```
-ASCII Table 3.5.8b: What the user sees, by selection shape and conflict
-+--------------------------------+----------------------+-----------+-------------+
-| Scenario                       | Conflict prompt      | apply-to- | Return to   |
-|                                |                      | all asked | nnn         |
-+--------------------------------+----------------------+-----------+-------------+
-| No conflict (any count)        | none                 | no        | auto (no key)|
-| Single regular file, conflict  | simple y/N overwrite | no        | auto (no key)|
-| Single directory, conflict     | 7-option menu        | no        | auto (no key)|
-| Multiple items, >= 1 conflict  | 7-option menu / item | while     | pause        |
-|                                |                      | items     | (Press enter)|
-|                                |                      | remain    |             |
-+--------------------------------+----------------------+-----------+-------------+
-```
+Table 3.5.8b: what the user sees, by selection shape and outcome
+
+| Scenario | Conflict prompt | apply-to-all asked | Return to nnn |
+|---|---|---|---|
+| No conflict (any count) | none | no | automatic |
+| Single regular file, conflict | simple y/N overwrite | no | automatic |
+| Single directory, conflict | 7-option menu | no | automatic |
+| Multiple items, one or more conflicts | 7-option menu per item | while items remain | pause (`Done. Press enter.`) |
+| A move left files in the source | as above | as above | pause, with a `kept in the source` line |
+| A file and a directory share a name | menu with 6 and 7 only | never | as above |
+| Any copy, move or compare failed | as above | as above | exit 1: nnn waits for ENTER, prints `failed!`, keeps the selection |
 
 ##### 3.5.8.5 Helper Hardening and Correctness
 
 The plugin guards several subtle failure modes discovered while integrating with
 nnn's real selection format and cross-platform tools:
 
-```
-ASCII Table 3.5.8c: cpmv plugin correctness guards
-+----------------------------+------------------------------------------------+
-| Concern                    | Handling in plugins/cpmv                        |
-+----------------------------+------------------------------------------------+
-| NUL-truncated selection    | nnn writes the selection with the trailing NUL  |
-|                            | truncated (writesel(buf, selbufpos-1),         |
-|                            | src/nnn.c:2065), so the LAST path is not        |
-|                            | NUL-terminated. The parse loop uses             |
-|                            | `read -r -d '' f || [ -n "$f" ]` so the final   |
-|                            | unterminated path is not dropped (a single-file |
-|                            | selection would otherwise yield 0 items).      |
-| Move data-loss             | rsync MOVE modes run `rsync ... && rm_src`      |
-|                            | (never `;`) so the source is removed ONLY on a  |
-|                            | successful transfer.                           |
-| stat(1) portability        | GNU `stat -c` vs BSD `stat -f` are detected at  |
-|                            | startup (nnn runs on Linux and *BSD/macOS).    |
-| Copy onto self             | items where `src -ef target` are skipped.      |
-| rsync absent               | size/resume modes (3/4/5) skip with a message  |
-|                            | rather than silently overwriting.              |
-| Return code                | always `exit 0` so nnn's F_CHKRTN pause is not  |
-|                            | triggered -- the plugin owns the pause policy.  |
-| advcpmv progress           | uses cpg/mvg for a progress bar when present.   |
-+----------------------------+------------------------------------------------+
-```
+Table 3.5.8c: cpmv plugin correctness guards
+
+| Concern | Handling in `plugins/cpmv` |
+|---|---|
+| NUL-truncated selection | nnn writes the selection with the trailing NUL truncated (`writesel(buf, selbufpos-1)`, `src/nnn.c:2065`), so the LAST path is not NUL-terminated. The parse loop uses `read -r -d '' f \|\| [ -n "$f" ]` so the final unterminated path is not dropped. |
+| Move data loss | A move runs rsync with `--remove-source-files` for what it transfers. A file rsync skipped as "identical" (same size and time) leaves the source only after a checksum run proves equal bytes; two different files written in the same second look identical. A file the mode skipped stays, and the plugin reports it. Before Problem 16 it ran `rsync ... && rm -rf <source>` and deleted skipped files too. |
+| Directory move in modes 1 and 2 | `mv` cannot merge into an existing directory (`Directory not empty`), so a directory goes through `rsync -I` or `--update` with `--remove-source-files`. |
+| Modes 2, 3 and 4 | A dry-run plan, then `rsync --files-from`. A kept file is never touched, so a size-only run cannot rewrite a target mtime and hide a stale file from a later run. |
+| Type change over a target file | rsync lists a directory, link or special file over a regular file as a new item and then deletes that file silently. The dry run is checked first; the item is refused with "nothing was copied". A directory or link in the way is replaced (no file data is lost). |
+| Folder into itself | The physical destination path is compared with the physical source path; `cp`, `mv` and the rsync paths all refuse it. |
+| Ctrl-C | rsync handles SIGINT itself and exits with status 20, so the plugin traps INT, prints `interrupted` and exits 130. Nothing is lost: rsync removes a source file only after it was transferred. |
+| File versus directory with the same name | Only rename and skip are offered; "apply to all" does not force a mode on them. |
+| Failures | Every failed `cp`, `mv` or `rsync` is counted. The plugin lists the problems and exits 1, so nnn waits for ENTER and keeps the selection. |
+| stat(1) portability | GNU `stat -c` and BSD `stat -f` are detected at startup (nnn runs on Linux and BSD/macOS). |
+| Copy onto self | Items where `src -ef target` are skipped. |
+| rsync absent | Modes 2 to 5 and the directory move are reported as a problem and skipped, never replaced by a guess. |
+| Symlink to a directory in the target | Merged into by the rsync paths (`rsync -K`); copy mode 1 (`cp -R`) refuses it with a visible error. |
+| Sparse files | The planned transfers and the merge-move use `rsync -S`, so a sparse file (a VM image) stays sparse, as `cp` keeps it. Mode 5 resumes with `-S --append-verify`, byte-identical and still sparse. |
+| End of input at a prompt | Treated as "skip" instead of looping forever. |
+| advcpmv progress | `cpg` and `mvg` are used for a progress bar when present. |
 
 **Explanation.** These guards are the difference between a demo script and a
-shippable plugin. The NUL-truncation and the `&&` move-fix in particular are
+shippable plugin. The NUL-truncation and the move rules in particular are
 non-obvious: the first is a quirk of how nnn flushes its in-memory selection to
-disk; the second prevents data loss if a transfer fails mid-move. All conflict
+disk; the second prevents data loss when a mode skips a file or a transfer fails
+mid-move. The tests are `misc/test/test-cpmv.sh` (the plugin) and
+`misc/test/test-cpmv-e2e.sh` (the real nnn in an isolated tmux server). All conflict
 logic lives in the plugin ([plugins/cpmv](../plugins/cpmv)), keeping the C change
 to the single gated line in `opstr()`.
 
