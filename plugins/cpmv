@@ -19,12 +19,38 @@
 # is used. For a single DIRECTORY conflict or any MULTIPLE-item conflict, the
 # full FileZilla overwrite options plus a "resume" mode are shown, with an
 # "apply to ALL remaining conflicts" prompt offered only while items still
-# remain. Returns to nnn automatically (no keypress) when there is no conflict or
-# only a single item; pauses for review only after resolving conflicts across
-# several items.
+# remain.
 #
-# Requires: bash, coreutils. rsync is needed for the size-based and resume
-#           modes (3/4/5); without it those modes skip rather than guess.
+# What each mode does to a file that exists on both sides (a directory is
+# merged file by file; files that exist only on one side are never deleted):
+#
+#   1 overwrite            always replace the target
+#   2 newer only           replace when the source is newer (size is ignored)
+#   3 different size only  replace when the sizes differ (time is ignored)
+#   4 different size or    replace when the sizes differ OR the source is newer;
+#     newer                keep a target of the same size that is not older
+#   5 resume               append to an interrupted copy, verify with a checksum
+#   6 rename (keep both)   copy/move to "name (1)"
+#   7 skip
+#
+# Modes 3 and 4 first ask rsync (dry run) what differs, then copy exactly those
+# files (rsync --files-from). Files the mode keeps are never touched, not even
+# their modification time.
+#
+# MOVE removes from the source only what reached the target (or was already
+# there, identical). Anything the chosen mode kept stays in the source and is
+# reported; it is never deleted.
+#
+# Return to nnn:
+#   - exit 1 when anything failed: nnn then waits for ENTER and keeps the
+#     selection so the paste can be retried;
+#   - exit 0 right away for no conflict or a single item;
+#   - exit 0 after "Done. Press enter." when conflicts were resolved across
+#     several items, or when a move left files behind.
+#
+# Requires: bash, coreutils, find. rsync (3.1 or newer) is needed for modes 3-5
+#           and for moving a directory onto an existing one; without it those
+#           operations are reported and skipped rather than guessed.
 #
 # Shell version: ENGLISH
 #
@@ -53,6 +79,9 @@ else
 fi
 
 have_rsync=1; command -v rsync >/dev/null 2>&1 || have_rsync=0
+# -a archive, -K treat a symlink to a directory on the target as that directory
+# (the way cp does), -8 keep non-ASCII names readable in rsync's output.
+RS=(-a -K -8)
 
 # stat(1) is GNU (-c) on Linux but BSD (-f) on *BSD/macOS, where nnn also runs.
 if stat -c '%s' . >/dev/null 2>&1; then
@@ -75,51 +104,219 @@ while IFS= read -r -d '' f || [ -n "${f:-}" ]; do
     files+=("$f"); f=
 done < "$sel"
 
-GLOBAL_MODE=""
+# Scratch space for the modes 3/4 plan; removed on exit.
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/cpmv.XXXXXX" 2>/dev/null) || TMPD=""
+trap '[ -n "$TMPD" ] && rm -rf "$TMPD"' EXIT
 
-rm_src()      { [ "$ACT" = mv ] && rm -rf -- "$1"; }
-needs_rsync() { case "$1" in 3|4|5) return 0 ;; *) return 1 ;; esac; }
+GLOBAL_MODE=""
+errors=0             # failed operations; any failure makes the plugin exit 1
+err_msgs=()
+kept_in_src=0        # source files a MOVE left behind on purpose
+
+note_err() { errors=$((errors + 1)); err_msgs+=("$1"); printf '  ! %s\n' "$1"; }
+
+# try <label> <command...>: run a command, count a failure with its label.
+try() {
+    local label="$1" rc; shift
+    "$@"; rc=$?
+    [ "$rc" -eq 0 ] || note_err "$label: '$1' failed (status $rc)"
+    return "$rc"
+}
+
+need_rsync() {
+    [ "$have_rsync" -eq 1 ] && return 0
+    note_err "rsync missing; skipped $(basename -- "$1")"
+    return 1
+}
+
+is_realdir() { [ -d "$1" ] && [ ! -L "$1" ]; }
+
+# rsync prints control characters, and a backslash followed by '#', as \#ooo
+# (three octal digits). Turn such a name back into its real bytes (result in $REPLY).
+rs_unescape() {
+    local s="$1" out="" pre oct
+    while :; do
+        case "$s" in *'\#'[0-7][0-7][0-7]*) ;; *) break ;; esac
+        pre=${s%%'\#'[0-7][0-7][0-7]*}
+        oct=${s:${#pre}+2:3}
+        printf -v oct '%b' "\\0$oct"
+        out+="$pre$oct"
+        s=${s:${#pre}+5}
+    done
+    REPLY="$out$s"
+}
+
+# plan_xfer <mode 3|4> <src>: decide, per file, what mode 3 or 4 copies.
+# rsync dry runs list the differences; nothing is copied here. Result:
+#   PLAN_LIST   NUL-separated names (relative to dirname of src) to hand to
+#               rsync --files-from; for a move it also holds files already
+#               identical at the target, so rsync can remove their source.
+#   PLAN_FILES  regular files to copy      PLAN_OTHER  new dirs/links to create
+#   PLAN_KEEP   files kept by the mode     PLAN_SAME   files already identical
+plan_xfer() {
+    local mode="$1" src="$2" d1 d2 cand xesc nm line y x it name rc n
+    PLAN_FILES=0; PLAN_OTHER=0; PLAN_KEEP=0; PLAN_SAME=0
+    if [ -z "$TMPD" ]; then note_err "no temp directory; cannot compare $(basename -- "$src")"; return 1; fi
+    d1="$TMPD/d1"; d2="$TMPD/d2"; cand="$TMPD/cand"; xesc="$TMPD/xfer.esc"; nm="$TMPD/d2.names"
+    PLAN_LIST="$TMPD/xfer.list"
+
+    # D1: plain quick check (size + mtime), -ii also lists unchanged items.
+    # Item flags: YXcstpoguax. Y '>' = data would be sent, '.' = unchanged, 'c' = created.
+    # X f/d/L = file/dir/link. 's' = size differs, '+++++++++' = missing at the target.
+    rsync "${RS[@]}" -n -ii --out-format='%i %n' -- "$src" "$dest/" >"$d1" 2>"$TMPD/e1"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        note_err "$(basename -- "$src"): compare failed (rsync status $rc) $(head -c 300 "$TMPD/e1" | tr '\n' ' ')"
+        return 1
+    fi
+    exec 3>"$cand"
+    while IFS= read -r line; do
+        y=${line:0:1}; x=${line:1:1}; it=${line:2:9}; name=${line:12}
+        case "$x" in
+        f)  if [ "$y" = ">" ]; then
+                if [ "$it" = "+++++++++" ] || [ "${it:1:1}" = "s" ]; then
+                    PLAN_FILES=$((PLAN_FILES + 1)); printf '%s\n' "$name"      # missing or size differs
+                elif [ "$mode" = 4 ]; then
+                    printf '%s\n' "$name" >&3                                  # only the time differs: ask D2
+                else
+                    PLAN_KEEP=$((PLAN_KEEP + 1))                               # mode 3 ignores time
+                fi
+            else
+                PLAN_SAME=$((PLAN_SAME + 1)); [ "$ACT" = mv ] && printf '%s\n' "$name"
+            fi ;;
+        d)  case "$y" in c|">") PLAN_OTHER=$((PLAN_OTHER + 1)); printf '%s\n' "$name" ;; esac ;;
+        *)  case "$y" in                                                       # links, devices, specials
+            c|">") PLAN_OTHER=$((PLAN_OTHER + 1)); printf '%s\n' "$name" ;;
+            .)     [ "$ACT" = mv ] && printf '%s\n' "$name" ;;
+            esac ;;
+        esac
+    done <"$d1" >"$xesc"
+    exec 3>&-
+
+    # Mode 4, files whose size matches but whose time differs: copy only when the
+    # SOURCE is newer. D2 (--update) lists exactly the files rsync would send
+    # because the source is newer; a newer target is skipped by --update.
+    if [ "$mode" = 4 ] && [ -s "$cand" ]; then
+        rsync "${RS[@]}" -n -i --update --out-format='%i %n' -- "$src" "$dest/" >"$d2" 2>"$TMPD/e2"; rc=$?
+        if [ "$rc" -ne 0 ]; then
+            note_err "$(basename -- "$src"): compare failed (rsync status $rc) $(head -c 300 "$TMPD/e2" | tr '\n' ' ')"
+            return 1
+        fi
+        LC_ALL=C grep -a '^>f' "$d2" | LC_ALL=C cut -c13- >"$nm"
+        n=$(LC_ALL=C grep -aFxf "$nm" "$cand" | tee -a "$xesc" | wc -l)
+        PLAN_FILES=$((PLAN_FILES + n))
+        PLAN_KEEP=$((PLAN_KEEP + $(wc -l <"$cand") - n))
+    fi
+
+    # Escaped text -> NUL-separated real names (directories lose their trailing '/').
+    while IFS= read -r name; do
+        name=${name%/}
+        case "$name" in *'\#'*) rs_unescape "$name"; name=$REPLY ;; esac
+        printf '%s\0' "$name"
+    done <"$xesc" >"$PLAN_LIST"
+    return 0
+}
+
+# After a move: drop source directories that are now empty and report what is
+# still there (files the mode kept). Nothing that still holds a file is removed.
+finish_move() {
+    local src="$1" left
+    is_realdir "$src" && find "$src" -depth -type d -exec rmdir -- {} + 2>/dev/null
+    if [ -e "$src" ] || [ -L "$src" ]; then
+        if is_realdir "$src"; then left=$(find "$src" ! -type d 2>/dev/null | wc -l); else left=1; fi
+        left=$((left + 0))
+        if [ "$left" -gt 0 ]; then
+            kept_in_src=$((kept_in_src + left))
+            printf '  - kept in the source: %d file(s) of %s (not replaced by this mode)\n' "$left" "$(basename -- "$src")"
+        fi
+    fi
+}
+
+# Modes 3 and 4 (copy and move): plan with rsync dry runs, then copy exactly the plan.
+xfer_policy() {
+    local src="$1" mode="$2" name verb rm=() why
+    name=$(basename -- "$src")
+    need_rsync "$src" || return 1
+    printf '  comparing %s ...\n' "$name"
+    plan_xfer "$mode" "$src" || return 1
+    if [ "$ACT" = mv ]; then verb=move; rm=(--remove-source-files); else verb=copy; fi
+    if [ "$mode" = 3 ]; then why="same size"; else why="same size, target not older"; fi
+    printf '  %s: %d file(s) to %s, %d kept (%s), %d identical\n' \
+        "$name" "$PLAN_FILES" "$verb" "$PLAN_KEEP" "$why" "$PLAN_SAME"
+    if [ -s "$PLAN_LIST" ]; then
+        try "$name" rsync "${RS[@]}" --no-r -d --info=progress2 ${rm[@]+"${rm[@]}"} \
+            --from0 --files-from="$PLAN_LIST" -- "$(dirname -- "$src")/" "$dest/" || return 1
+    fi
+    [ "$ACT" = mv ] && finish_move "$src"
+    return 0
+}
+
+# Merge a directory into an existing one by MOVING (mv cannot merge directories):
+# rsync with --remove-source-files removes only what it transferred.
+move_merge() {
+    local src="$1"; shift
+    need_rsync "$src" || return 1
+    try "$(basename -- "$src")" rsync "${RS[@]}" --info=progress2 --remove-source-files "$@" -- "$src" "$dest/" || return 1
+    finish_move "$src"
+}
 
 rename_one() {
     local src="$1" base stem ext target n
     base=$(basename -- "$src"); target="$dest/$base"
     if [ -e "$target" ]; then
-        case "$base" in
-            ?*.*) stem="${base%.*}"; ext=".${base##*.}" ;;
-            *)    stem="$base";      ext="" ;;
-        esac
-        [ -z "$stem" ] && { stem="$base"; ext=""; }
-        n=1; while [ -e "$dest/$stem ($n)$ext" ]; do n=$((n + 1)); done
+        stem="$base"; ext=""
+        if [ ! -d "$src" ]; then            # "name (1).ext" for files, "dir.v2 (1)" for directories
+            case "$base" in
+                ?*.*) stem="${base%.*}"; ext=".${base##*.}" ;;
+            esac
+        fi
+        n=1; while [ -e "$dest/$stem ($n)$ext" ] || [ -L "$dest/$stem ($n)$ext" ]; do n=$((n + 1)); done
         target="$dest/$stem ($n)$ext"
     fi
     # shellcheck disable=SC2086
-    $CMD $BASE -- "$src" "$target"
+    try "$base" $CMD $BASE -- "$src" "$target"
 }
 
 do_one() {                                # $1=src  $2=mode(1-7)
-    local src="$1" mode="$2"
-    if needs_rsync "$mode" && [ "$have_rsync" -eq 0 ]; then
-        printf '  ! rsync missing; skipped %s\n' "$(basename -- "$src")"; return
-    fi
-    # NOTE: for the rsync-based MOVE modes the source is removed ONLY on a
-    # successful transfer ('&&', never ';') so a failed rsync cannot lose data.
+    local src="$1" mode="$2" name
+    name=$(basename -- "$src")
     # shellcheck disable=SC2086
     case "$mode" in
-        1) $CMD $BASE -f -- "$src" "$dest/" ;;                                              # overwrite
-        2) $CMD $BASE -u -- "$src" "$dest/" ;;                                              # newer only
-        3) rsync -a --size-only --info=progress2 -- "$src" "$dest/" && rm_src "$src" ;;     # different size
-        4) rsync -a --update    --info=progress2 -- "$src" "$dest/" && rm_src "$src" ;;     # diff size or newer
-        5) rsync -a --partial --append-verify --info=progress2 -- "$src" "$dest/" && rm_src "$src" ;; # resume
-        6) rename_one "$src" ;;                                                             # rename (keep both)
-        7) printf '  - skipped %s\n' "$(basename -- "$src")" ;;                             # skip
+        1)  # overwrite
+            if [ "$ACT" = mv ] && is_realdir "$src" && [ -d "$dest/$name" ]; then
+                move_merge "$src" -I            # -I: send everything, even when size and time match
+            else
+                try "$name" $CMD $BASE -f -- "$src" "$dest/"
+            fi ;;
+        2)  # newer only
+            if [ "$ACT" = mv ] && is_realdir "$src" && [ -d "$dest/$name" ]; then
+                move_merge "$src" --update
+            else
+                try "$name" $CMD $BASE -u -- "$src" "$dest/"
+            fi ;;
+        3|4) xfer_policy "$src" "$mode" ;;
+        5)  # resume an interrupted copy
+            need_rsync "$src" || return
+            local rm=(); [ "$ACT" = mv ] && rm=(--remove-source-files)
+            if try "$name" rsync "${RS[@]}" --partial --append-verify --info=progress2 \
+                    ${rm[@]+"${rm[@]}"} -- "$src" "$dest/"; then
+                [ "$ACT" = mv ] && finish_move "$src"
+            fi ;;
+        6)  rename_one "$src" ;;                                            # rename (keep both)
+        7)  printf '  - skipped %s\n' "$name" ;;                            # skip
     esac
+}
+
+# describe <label> <path>: one line of the conflict header.
+describe() {
+    if [ -d "$2" ]; then printf '    %-7s: %12s   %s\n' "$1" "(directory)" "$(fmtime "$2")"
+    else printf '    %-7s: %12s bytes   %s\n' "$1" "$(fsize "$2")" "$(fmtime "$2")"; fi
 }
 
 show_conflict() {
     local src="$1" tgt="$2"
     printf '\n  CONFLICT: %s\n' "$(basename -- "$tgt")"
-    printf '    source : %12s bytes   %s\n' "$(fsize "$src")" "$(fmtime "$src")"
-    printf '    target : %12s bytes   %s\n' "$(fsize "$tgt")" "$(fmtime "$tgt")"
+    describe source "$src"
+    describe target "$tgt"
     cat <<'MENU'
     1) overwrite          2) newer only        3) different size only
     4) different size or newer                 5) resume (interrupted)
@@ -137,13 +334,36 @@ for src in "${files[@]}"; do
     idx=$((idx + 1))
     target="$dest/$(basename -- "$src")"
 
+    if [ ! -e "$src" ] && [ ! -L "$src" ]; then
+        note_err "not found: $src"
+        continue
+    fi
+
     # Never copy/move an item onto itself.
     if [ -e "$target" ] && [ "$src" -ef "$target" ]; then
         printf '  - skipped (same file) %s\n' "$(basename -- "$src")"
         continue
     fi
 
-    if [ ! -e "$target" ]; then do_one "$src" 1; continue; fi
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then do_one "$src" 1; continue; fi
+
+    # A directory and a non-directory with the same name cannot be merged or
+    # overwritten: only rename or skip make sense, whatever "apply to all" says.
+    clash=0
+    if is_realdir "$src"; then [ -d "$target" ] || clash=1; else [ ! -d "$target" ] || clash=1; fi
+    if [ "$clash" -eq 1 ]; then
+        conflicts=$((conflicts + 1))
+        while :; do
+            show_conflict "$src" "$target" | sed '/^    [1-5]) /d; /^    4) /d'
+            printf '    ! a file and a directory share this name: they cannot be merged.\n'
+            printf '    6) rename (keep both)   7) skip\n    choose [6-7]: '
+            read -r choice || choice=7
+            case "$choice" in 6|7) break ;; *) printf '    invalid.\n' ;; esac
+        done
+        do_one "$src" "$choice"
+        continue
+    fi
+
     if [ -n "$GLOBAL_MODE" ]; then do_one "$src" "$GLOBAL_MODE"; continue; fi
 
     # A single regular-FILE conflict keeps nnn's original simple y/N prompt.
@@ -160,7 +380,7 @@ for src in "${files[@]}"; do
     conflicts=$((conflicts + 1))
     while :; do
         show_conflict "$src" "$target"
-        printf '    choose [1-7]: '; read -r choice
+        printf '    choose [1-7]: '; read -r choice || choice=7
         case "$choice" in 1|2|3|4|5|6|7) break ;; *) printf '    invalid.\n' ;; esac
     done
     do_one "$src" "$choice"
@@ -173,10 +393,18 @@ for src in "${files[@]}"; do
     fi
 done
 
+# Failure: list every problem and exit 1. nnn then waits for ENTER (so the
+# messages stay readable) and keeps the selection so the paste can be retried.
+if [ "$errors" -gt 0 ]; then
+    printf '\ncpmv: %d problem(s):\n' "$errors"
+    for m in "${err_msgs[@]}"; do printf '  - %s\n' "$m"; done
+    exit 1
+fi
+
 # Return to nnn without a keypress, EXCEPT when conflicts were resolved across
-# multiple items (then pause so the user can review the outcome). No conflict,
-# or a single item -> exit immediately.
-if [ "$conflicts" -gt 0 ] && [ "$nfiles" -gt 1 ]; then
+# multiple items or a move left files behind (then pause so the user can review
+# the outcome). No conflict, or a single item -> exit immediately.
+if { [ "$conflicts" -gt 0 ] && [ "$nfiles" -gt 1 ]; } || [ "$kept_in_src" -gt 0 ]; then
     printf '\nDone. Press enter.'; read -r _
 fi
 exit 0
